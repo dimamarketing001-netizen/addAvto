@@ -91,13 +91,16 @@ function getProjectPayload(form) {
 }
 byId("projectForm").addEventListener("submit", async (event) => {
   event.preventDefault();
+  // currentTarget is only guaranteed during synchronous event dispatch.
+  // Keep a stable reference before awaiting the API request.
+  const form = event.currentTarget;
   const button = event.submitter;
   const msg = byId("formMessage");
   try {
-    const payload = getProjectPayload(event.currentTarget);
+    const payload = getProjectPayload(form);
     button.disabled = true;
     await api("/api/projects", {method:"POST", body:JSON.stringify(payload)});
-    event.currentTarget.reset();
+    form.reset();
     showMessage(msg, "Проект сохранён. Откройте «План», чтобы проверить выбранную структуру кампаний.", "success");
     await loadProjects();
   } catch (error) {
