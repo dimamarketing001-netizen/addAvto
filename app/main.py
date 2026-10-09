@@ -132,12 +132,12 @@ async def get_projects(_: AuthUser):
 
 @app.post("/api/projects", status_code=201)
 async def create_project(project: ProjectIn, _: AuthUser):
-    return db.create_project(project.model_dump())
+    return db.create_project(project.model_dump(mode="json"))
 
 
 @app.put("/api/projects/{project_id}")
 async def update_project(project_id: int, project: ProjectIn, _: AuthUser):
-    item = db.update_project(project_id, project.model_dump())
+    item = db.update_project(project_id, project.model_dump(mode="json"))
     if item is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
     return item
