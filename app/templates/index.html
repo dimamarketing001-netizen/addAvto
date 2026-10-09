@@ -59,6 +59,16 @@
       <div class="notice notice-warning">Токен, ранее отправленный в переписку, нужно отозвать и выпустить заново. Новый токен добавь только в серверный <code>.env</code>; он не сохраняется в этом интерфейсе и не должен попадать в Git.</div>
       <div id="connectionMessage" class="connection-message">Нажмите «Проверить Click.ru», чтобы получить список интеграций и рекламных аккаунтов.</div>
       <div class="connection-grid"><div><h3>Яндекс ID / интеграции</h3><div id="integrationsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div><div><h3>Рекламные кабинеты</h3><div id="accountsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div></div>
+      <div class="account-create">
+        <h3>Создать рекламный аккаунт Яндекс Директа</h3>
+        <p class="muted small">Создаёт аккаунт через Click.ru и привязывает его к выбранной интеграции Яндекс ID. Запуск рекламы не выполняется.</p>
+        <form id="accountCreateForm" class="account-create-form">
+          <label class="field">Название кабинета<input name="name" required minlength="2" maxlength="120" placeholder="Например, БФЛ — Казань — 01"></label>
+          <label class="field">Подключённый Яндекс ID<select name="integration_id" id="directIntegrationId" required><option value="">Сначала проверьте Click.ru</option></select></label>
+          <button class="button button-primary" type="submit">Создать аккаунт</button>
+        </form>
+        <div id="accountCreateMessage" class="form-message" role="status"></div>
+      </div>
     </section>
     <section id="reports" class="panel">
       <div class="panel-heading"><div><div class="eyebrow">СТАТИСТИКА</div><h2>Отчёт по расходам и трафику</h2></div><span class="chip">Click.ru API</span></div>
