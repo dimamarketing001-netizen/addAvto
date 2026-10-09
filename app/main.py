@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 
 from . import db
 from .click_client import ClickRUClient, ClickRUError
-from .schemas import CampaignPlan, PlanItem, ProjectIn
+from .schemas import CampaignPlan, DirectAccountCreate, PlanItem, ProjectIn
 
 
 security = HTTPBasic()
@@ -123,6 +123,35 @@ def _safe_integration(item: dict[str, Any]) -> dict[str, Any]:
 def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
     allowed = ("id", "name", "service", "status", "state", "currency")
     return {key: item.get(key) for key in allowed if item.get(key) is not None}
+
+
+@app.post("/api/accounts/direct", status_code=201)
+async def create_direct_account(payload: DirectAccountCreate, _: AuthUser):
+    client = ClickRUClient()
+    if not client.configured:
+        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+    try:
+        integrations = await client.integrations()
+        allowed_ids = {
+            int(item["id"]) for item in integrations
+            if item.get("id") is not None and str(item["id"]).isdigit()
+        }
+        if payload.integration_id not in allowed_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="Выбранная интеграция Яндекс Директа не найдена. Обновите список интеграций.",
+            )
+        result = await client.create_direct_account(payload.name.strip(), payload.integration_id)
+        account_id = result.get("accountId") or result.get("account_id")
+        return {
+            "created": True,
+            "account_id": account_id,
+            "name": payload.name.strip(),
+            "integration_id": payload.integration_id,
+            "message": "Запрос на создание аккаунта отправлен в Click.ru.",
+        }
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/projects")
