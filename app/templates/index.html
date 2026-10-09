@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Direct Campaign Manager</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">D</div><div><strong>Direct Manager</strong><small>Click.ru · Яндекс Директ</small></div></div>
+    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Аккаунты и доступы</a><a class="nav-link" href="#reports">Отчётность</a></nav>
+    <div class="sidebar-foot"><span class="status-dot"></span> Локальная панель<small>Не запускает рекламу без проверки</small></div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><div><div class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div><h1>Рекламные кампании</h1><p class="muted">Создание шаблонов для нескольких кабинетов и единая статистика.</p></div><button class="button button-ghost" id="refreshAll">Обновить данные ↻</button></header>
+    <section id="overview" class="metrics-grid">
+      <article class="metric-card"><div class="metric-label">Проекты</div><div class="metric-value" id="metricProjects">—</div><div class="metric-foot">Сохранённые шаблоны</div></article>
+      <article class="metric-card"><div class="metric-label">Аккаунты Click.ru</div><div class="metric-value" id="metricAccounts">—</div><div class="metric-foot" id="accountsFoot">Подключение не проверено</div></article>
+      <article class="metric-card"><div class="metric-label">Кампании по планам</div><div class="metric-value" id="metricPlanned">—</div><div class="metric-foot">Предпросмотр, не запуск</div></article>
+      <article class="metric-card"><div class="metric-label">Подключение</div><div class="metric-value metric-status" id="metricConnection">Не проверено</div><div class="metric-foot">Click.ru API</div></article>
+    </section>
+    <section id="projects" class="panel">
+      <div class="panel-heading"><div><div class="eyebrow">ШАБЛОН КАМПАНИИ</div><h2>Новый рекламный проект</h2></div><span class="chip">Настройки сохраняются</span></div>
+      <div class="notice notice-info">Выбери структуру размещения: раздельные кампании Поиск и РСЯ либо одна ЕПК, где включены оба места показа. На этом этапе приложение сохраняет проект и готовит план — не публикует объявления и не расходует бюджет.</div>
+      <form id="projectForm">
+        <div class="form-grid">
+          <label class="field field-wide">Название проекта<input name="name" placeholder="Например, БФЛ — Казань" required maxlength="120"></label>
+          <label class="field field-wide">Домен / посадочная страница<input name="domain" placeholder="https://example.ru/" required></label>
+          <fieldset class="field field-wide mode-picker"><legend>Структура рекламных кампаний</legend>
+            <label class="mode-option"><input type="radio" name="campaign_mode" value="separate" checked><span class="mode-icon">Ⅱ</span><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ. Раздельные бюджеты и отчёты.</small></span></label>
+            <label class="mode-option"><input type="radio" name="campaign_mode" value="single_epk"><span class="mode-icon">▣</span><span><strong>Одна ЕПК</strong><small>Одна Единая перфоманс-кампания с включёнными Поиском и РСЯ.</small></span></label>
+          </fieldset>
+          <label class="field">Стратегия<select name="strategy"><option value="AVERAGE_CRR">ДРР, оплата за клики (AVERAGE_CRR)</option><option value="PAY_FOR_CONVERSION_CRR">ДРР, оплата за конверсии (PAY_FOR_CONVERSION_CRR)</option></select><small>Доступность стратегии зависит от требований Яндекса к аккаунту и конверсиям.</small></label>
+          <label class="field">Целевой ДРР, %<input name="target_drr" type="number" min="0.1" max="1000" step="0.1" value="30" required></label>
+          <label class="field">Бюджет, ₽<input name="budget" type="number" min="0" step="100" value="20000" required></label>
+          <label class="field">Ценность лида, ₽<input name="lead_value" type="number" min="0" step="100" value="0"><small>Нужно для расчёта и оптимизации по денежной ценности конверсии.</small></label>
+          <label class="field">Заголовок<input name="headline" maxlength="200" placeholder="Заголовок объявления"></label>
+          <label class="field field-wide">Текст объявления<textarea name="ad_text" rows="3" maxlength="2000" placeholder="Текст, который будет использоваться в объявлении"></textarea></label>
+          <label class="field field-wide">Ключевые фразы — по одной на строку<textarea name="keywords" rows="3" placeholder="юрист по банкротству&#10;списание долгов"></textarea></label>
+          <label class="field field-wide">Минус-фразы — по одной на строку<textarea name="negative_keywords" rows="2" placeholder="бесплатно&#10;вакансии"></textarea></label>
+          <label class="field field-wide">Ссылки на изображения — по одной на строку<textarea name="image_urls" rows="2" placeholder="https://example.ru/banner.jpg"></textarea></label>
+          <label class="field field-wide">ID аккаунтов Click.ru — через запятую<input name="account_ids" placeholder="100001, 100002"><small>Можно выбрать любые кабинеты после проверки подключения. ID должны быть из вашего Click.ru.</small></label>
+          <label class="field">ID счётчика Метрики<input name="counter_id" type="number" min="1" placeholder="Необязательно"></label>
+          <label class="field">ID цели lead<input name="goal_id" type="number" min="1" placeholder="Необязательно"></label>
+          <label class="field field-wide">ID регионов Яндекса — через запятую<input name="region_ids" placeholder="Например, 213"></label>
+        </div>
+        <div class="form-actions"><span class="muted small">Реальные изменения в Директе пока выключены.</span><button class="button button-primary" type="submit">Сохранить проект</button></div>
+        <div id="formMessage" class="form-message" role="status"></div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><div><div class="eyebrow">СОХРАНЁННЫЕ НАСТРОЙКИ</div><h2>Проекты</h2></div><button class="button button-ghost button-small" id="reloadProjects">Обновить список</button></div>
+      <div class="table-wrap"><table><thead><tr><th>Проект / домен</th><th>Режим</th><th>Стратегия</th><th>ДРР</th><th>Бюджет</th><th>Аккаунты</th><th></th></tr></thead><tbody id="projectsRows"><tr><td colspan="7" class="empty">Загрузка…</td></tr></tbody></table></div>
+      <div id="planOutput" class="plan-output hidden"></div>
+    </section>
+    <section id="connection" class="panel">
+      <div class="panel-heading"><div><div class="eyebrow">ИНТЕГРАЦИИ</div><h2>Аккаунты и доступы</h2></div><button id="checkConnection" class="button button-primary">Проверить Click.ru</button></div>
+      <div class="notice notice-warning">Токен, ранее отправленный в переписку, нужно отозвать и выпустить заново. Новый токен добавь только в серверный <code>.env</code>; он не сохраняется в этом интерфейсе и не должен попадать в Git.</div>
+      <div id="connectionMessage" class="connection-message">Нажмите «Проверить Click.ru», чтобы получить список интеграций и рекламных аккаунтов.</div>
+      <div class="connection-grid"><div><h3>Яндекс ID / интеграции</h3><div id="integrationsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div><div><h3>Рекламные кабинеты</h3><div id="accountsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div></div>
+    </section>
+    <section id="reports" class="panel">
+      <div class="panel-heading"><div><div class="eyebrow">СТАТИСТИКА</div><h2>Отчёт по расходам и трафику</h2></div><span class="chip">Click.ru API</span></div>
+      <form id="reportForm" class="report-controls"><label class="field">Дата с<input name="date_from" type="date" required></label><label class="field">Дата по<input name="date_to" type="date" required></label><label class="field field-account-filter">ID аккаунтов (необязательно)<input name="account_ids" placeholder="100001, 100002"></label><button type="submit" class="button button-primary">Сформировать отчёт</button></form>
+      <div id="reportMessage" class="form-message"></div><div id="reportTotals" class="report-totals"></div><div id="reportNote" class="notice notice-info hidden"></div>
+      <div class="table-wrap"><table><thead><tr><th>Дата</th><th>Аккаунт</th><th>Кампания</th><th>Показы</th><th>Клики</th><th>Расход без НДС</th><th>Цена клика</th><th>Lead</th></tr></thead><tbody id="reportRows"><tr><td colspan="8" class="empty">Выберите период для получения статистики.</td></tr></tbody></table></div>
+    </section>
+    <footer>Direct Campaign Manager · MVP 0.1 · Не запускает и не включает рекламу</footer>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
