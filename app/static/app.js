@@ -157,6 +157,12 @@ async function checkConnection() {
     byId("accountsList").innerHTML = data.accounts.length ? data.accounts.map((a) => {
       return '<div class="list-item"><strong>' + esc(a.name || "Рекламный аккаунт") + ' · #' + esc(a.id) + '</strong><small>' + esc(a.service || "SERVICE не указан") + ' · ' + esc(a.status || a.state || "") + '</small></div>';
     }).join("") : '<div class="empty">Рекламные аккаунты не найдены.</div>';
+    const integrationSelect = byId("directIntegrationId");
+    if (integrationSelect) {
+      integrationSelect.innerHTML = '<option value="">Выберите Яндекс ID</option>' + data.integrations.map((i) =>
+        '<option value="' + esc(i.id) + '">' + esc(i.name || i.title || i.login || i.service || "Яндекс ID") + ' · #' + esc(i.id) + '</option>'
+      ).join("");
+    }
   } catch (error) {
     msg.className = "connection-message error";
     msg.textContent = error.message;
@@ -212,3 +218,33 @@ byId("reportForm").addEventListener("submit", async (event) => {
   }
 });
 loadProjects();
+
+byId("accountCreateForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = event.submitter;
+  const message = byId("accountCreateMessage");
+  const formData = new FormData(form);
+  const name = String(formData.get("name") || "").trim();
+  const integrationId = Number(formData.get("integration_id"));
+  if (!name || !Number.isInteger(integrationId) || integrationId <= 0) {
+    showMessage(message, "Укажите название кабинета и выберите подключённый Яндекс ID.", "error");
+    return;
+  }
+  if (!confirm("Создать новый рекламный аккаунт Яндекс Директа в Click.ru? Реклама не будет запущена.")) return;
+  try {
+    button.disabled = true;
+    showMessage(message, "Создаю аккаунт через Click.ru…");
+    const result = await api("/api/accounts/direct", {
+      method:"POST",
+      body:JSON.stringify({name:name, integration_id:integrationId})
+    });
+    showMessage(message, "Запрос выполнен. ID нового аккаунта Click.ru: " + (result.account_id || "ожидается в ответе") + ".", "success");
+    form.elements.name.value = "";
+    await checkConnection();
+  } catch (error) {
+    showMessage(message, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
