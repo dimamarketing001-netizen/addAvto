@@ -8,6 +8,11 @@ CampaignMode = Literal["separate", "single_epk"]
 StrategyType = Literal["AVERAGE_CRR", "PAY_FOR_CONVERSION_CRR"]
 
 
+class DirectAccountCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    integration_id: int = Field(ge=1)
+
+
 class ProjectIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     domain: str = Field(min_length=8, max_length=2048)
