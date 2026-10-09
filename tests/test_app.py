@@ -46,3 +46,35 @@ def test_project_routes_and_plan(tmp_path, monkeypatch):
         plan = client.post(f"/api/projects/{project['id']}/plan", auth=auth).json()
         assert len(plan["items"]) == 1
         assert plan["items"][0]["placement"] == "SEARCH_AND_NETWORK"
+
+
+
+def test_direct_account_creation_uses_selected_integration(tmp_path, monkeypatch):
+    from app.click_client import ClickRUClient
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "account-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    async def fake_integrations(self):
+        return [{"id": 321, "service": "YANDEX_DIRECT"}]
+
+    async def fake_create_direct_account(self, name, integration_id):
+        assert name == "Test Direct account"
+        assert integration_id == 321
+        return {"accountId": 98765}
+
+    monkeypatch.setattr(ClickRUClient, "integrations", fake_integrations)
+    monkeypatch.setattr(ClickRUClient, "create_direct_account", fake_create_direct_account)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/accounts/direct",
+            auth=("test-admin", "test-password-long-enough"),
+            json={"name": "Test Direct account", "integration_id": 321},
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["account_id"] == 98765
+        assert response.json()["created"] is True
