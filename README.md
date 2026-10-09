@@ -27,7 +27,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # Заполните .env уникальным паролем администратора и токеном Click.ru
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+uvicorn --env-file .env app.main:app --host "${APP_HOST:-127.0.0.1}" --port "${APP_PORT:-8000}"
 ```
 
 Откройте `http://127.0.0.1:8000`. Не публикуйте приложение в интернет без HTTPS и уникального пароля администратора. Для внешнего доступа используйте reverse proxy с TLS.
