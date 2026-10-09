@@ -115,3 +115,14 @@ class ClickRUClient:
             normalized = {str(key).strip(): value for key, value in row.items() if key is not None}
             rows.append(normalized)
         return rows
+
+
+    async def create_direct_account(self, name: str, integration_id: int) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/accounts",
+            json={"service": "DIRECT", "name": name, "integrationId": integration_id},
+        )
+        data = response.json()
+        envelope = data.get("response", data)
+        return envelope if isinstance(envelope, dict) else {"result": envelope}
