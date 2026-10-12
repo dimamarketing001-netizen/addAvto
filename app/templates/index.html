@@ -69,6 +69,39 @@
         </form>
         <div id="accountCreateMessage" class="form-message" role="status"></div>
       </div>
+
+      <div class="metrika-setup">
+        <div class="panel-heading">
+          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Интеграция выбирается через Click.ru. Токен Метрики остаётся на сервере и не показывается в браузере.</p></div>
+          <button id="loadMetrikaIntegrations" class="button button-ghost button-small" type="button">Загрузить интеграции Метрики</button>
+        </div>
+        <form id="metrikaSetupForm" class="metrika-setup-form">
+          <label class="field">Рекламный проект
+            <select name="project_id" id="metrikaProjectId" required><option value="">Сначала создайте проект</option></select>
+          </label>
+          <label class="field">Интеграция Яндекс.Метрики
+            <select name="integration_id" id="metrikaIntegrationId" required><option value="">Сначала загрузите интеграции</option></select>
+          </label>
+          <label class="field">Счётчик
+            <select name="counter_id" id="metrikaCounterId">
+              <option value="">Автоматически найти по домену проекта или создать новый</option>
+            </select>
+            <small>Если оставить автоматический вариант, приложение найдёт счётчик нужного домена или создаст его, если не найдёт.</small>
+          </label>
+          <div class="metrika-buttons">
+            <button id="loadMetrikaCounters" class="button button-ghost" type="button">Загрузить счётчики</button>
+            <button class="button button-primary" type="submit">Настроить счётчик и цель lead</button>
+          </div>
+        </form>
+        <div id="metrikaMessage" class="form-message" role="status"></div>
+        <div id="metrikaResult" class="metrika-result hidden">
+          <div id="metrikaResultSummary" class="metrika-result-summary"></div>
+          <label class="field">Код события после успешной отправки заявки
+            <div class="snippet-row"><code id="metrikaSnippet"></code><button id="copyMetrikaSnippet" class="button button-ghost button-small" type="button">Копировать</button></div>
+          </label>
+          <p id="metrikaInstructions" class="muted small"></p>
+        </div>
+      </div>
     </section>
     <section id="reports" class="panel">
       <div class="panel-heading"><div><div class="eyebrow">СТАТИСТИКА</div><h2>Отчёт по расходам и трафику</h2></div><span class="chip">Click.ru API</span></div>
