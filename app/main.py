@@ -14,7 +14,8 @@ from fastapi.templating import Jinja2Templates
 
 from . import db
 from .click_client import ClickRUClient, ClickRUError
-from .schemas import CampaignPlan, DirectAccountCreate, PlanItem, ProjectIn
+from .metrika_client import MetrikaAPIError, YandexMetrikaClient
+from .schemas import CampaignPlan, DirectAccountCreate, MetrikaSetupRequest, PlanItem, ProjectIn
 
 
 security = HTTPBasic()
@@ -123,6 +124,226 @@ def _safe_integration(item: dict[str, Any]) -> dict[str, Any]:
 def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
     allowed = ("id", "name", "service", "status", "state", "currency")
     return {key: item.get(key) for key in allowed if item.get(key) is not None}
+
+
+def _safe_metrika_integration(item: dict[str, Any]) -> dict[str, Any]:
+    allowed = ("id", "service", "owner", "login", "email", "firstName", "lastName", "status")
+    return {key: item.get(key) for key in allowed if item.get(key) is not None}
+
+
+async def _metrika_context(
+    click_client: ClickRUClient,
+    integration_id: int,
+) -> tuple[YandexMetrikaClient, dict[str, Any]]:
+    integrations = await click_client.integrations(
+        service="YANDEX_METRIKA",
+        with_access_token=True,
+    )
+    selected = next(
+        (
+            item for item in integrations
+            if str(item.get("id", "")) == str(integration_id)
+            and item.get("service") == "YANDEX_METRIKA"
+        ),
+        None,
+    )
+    if selected is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Интеграция Яндекс.Метрики не найдена. Обновите список интеграций.",
+        )
+    access_token = selected.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ClickRUError(
+            "Click.ru не вернул access_token для выбранной интеграции Метрики. "
+            "Проверьте её статус, права API и доступ к токенам интеграций."
+        )
+    return YandexMetrikaClient(access_token), selected
+
+
+def _normalize_site(value: str | None) -> str:
+    if not value:
+        return ""
+    from urllib.parse import urlsplit
+
+    raw = value.strip()
+    parsed = urlsplit(raw if "://" in raw else "//" + raw)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _counter_site(counter: dict[str, Any]) -> str:
+    site = counter.get("site")
+    if not site and isinstance(counter.get("site2"), dict):
+        site = counter["site2"].get("site") or counter["site2"].get("domain")
+    return str(site or "")
+
+
+def _is_lead_goal(goal: dict[str, Any]) -> bool:
+    if str(goal.get("name", "")).strip().casefold() != "lead":
+        return False
+    if str(goal.get("type", "")).strip().casefold() != "action":
+        return False
+    conditions = goal.get("conditions") or []
+    return any(
+        isinstance(condition, dict)
+        and str(condition.get("type", "")).strip().casefold() == "exact"
+        and str(condition.get("url", "")).strip() == "lead"
+        for condition in conditions
+    )
+
+
+@app.get("/api/metrika/integrations")
+async def get_metrika_integrations(_: AuthUser):
+    client = ClickRUClient()
+    if not client.configured:
+        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+    try:
+        items = await client.integrations(service="YANDEX_METRIKA")
+        return {
+            "items": [_safe_metrika_integration(item) for item in items],
+            "message": "Список интеграций Метрики получен. OAuth-токены остаются на сервере.",
+        }
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/metrika/counters")
+async def get_metrika_counters(
+    _: AuthUser,
+    integration_id: int = Query(ge=1),
+):
+    client = ClickRUClient()
+    if not client.configured:
+        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+    try:
+        metrika, _integration = await _metrika_context(client, integration_id)
+        counters = await metrika.list_counters()
+        return {
+            "items": [
+                {
+                    "id": counter.get("id"),
+                    "name": counter.get("name"),
+                    "site": _counter_site(counter),
+                    "permission": counter.get("permission"),
+                    "code_status": counter.get("code_status"),
+                }
+                for counter in counters
+                if counter.get("id") is not None
+            ]
+        }
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except MetrikaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/metrika/setup")
+async def setup_project_metrika(
+    project_id: int,
+    payload: MetrikaSetupRequest,
+    _: AuthUser,
+):
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+
+    from urllib.parse import urlsplit
+    project_host = (urlsplit(project["domain"]).hostname or "").strip().lower().rstrip(".")
+    if not project_host:
+        raise HTTPException(status_code=422, detail="Не удалось определить домен проекта")
+
+    click_client = ClickRUClient()
+    if not click_client.configured:
+        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+
+    created_counter = False
+    try:
+        metrika, _integration = await _metrika_context(click_client, payload.integration_id)
+        counters = await metrika.list_counters()
+        chosen: dict[str, Any] | None = None
+
+        if payload.counter_id is not None:
+            chosen = next(
+                (counter for counter in counters if str(counter.get("id", "")) == str(payload.counter_id)),
+                None,
+            )
+            if chosen is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Выбранный счётчик не найден в этой интеграции Метрики.",
+                )
+            if _normalize_site(_counter_site(chosen)) != _normalize_site(project_host):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Домен выбранного счётчика не совпадает с доменом проекта.",
+                )
+        else:
+            chosen = next(
+                (
+                    counter for counter in counters
+                    if _normalize_site(_counter_site(counter)) == _normalize_site(project_host)
+                ),
+                None,
+            )
+            if chosen is None:
+                if not payload.create_if_missing:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Счётчик для домена проекта не найден. Выберите счётчик или разрешите создание нового.",
+                    )
+                chosen = await metrika.create_counter(project["name"], project_host)
+                created_counter = True
+
+        counter_id = int(chosen["id"])
+        goals = await metrika.list_goals(counter_id)
+        named_lead_goals = [
+            goal for goal in goals
+            if str(goal.get("name", "")).strip().casefold() == "lead"
+        ]
+        matching_goal = next((goal for goal in named_lead_goals if _is_lead_goal(goal)), None)
+        if matching_goal is not None:
+            goal = matching_goal
+            created_goal = False
+        elif named_lead_goals:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "В этом счётчике уже есть цель с именем lead, но её тип/условие отличается. "
+                    "Измените её вручную в Метрике или выберите другой счётчик."
+                ),
+            )
+        else:
+            goal = await metrika.create_goal(counter_id)
+            created_goal = True
+
+        updated = db.update_project(
+            project_id,
+            {"counter_id": counter_id, "goal_id": int(goal["id"])},
+        )
+        if updated is None:
+            raise HTTPException(status_code=500, detail="Не удалось сохранить ID счётчика и цели в проекте.")
+
+        return {
+            "project_id": project_id,
+            "counter_id": counter_id,
+            "counter_name": chosen.get("name") or project["name"],
+            "counter_site": _counter_site(chosen) or project_host,
+            "goal_id": int(goal["id"]),
+            "goal_name": goal.get("name", "lead"),
+            "created_counter": created_counter,
+            "created_goal": created_goal,
+            "tracking_snippet": f"ym({counter_id}, 'reachGoal', 'lead');",
+            "instructions": (
+                "Установите код счётчика Метрики на сайт и вызывайте событие reachGoal "
+                "только после подтверждённой успешной отправки заявки. Само создание счётчика "
+                "не устанавливает код на сайт."
+            ),
+        }
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except MetrikaAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/accounts/direct", status_code=201)
