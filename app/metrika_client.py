@@ -76,6 +76,13 @@ class YandexMetrikaClient:
         items = data.get("counters", [])
         return items if isinstance(items, list) else []
 
+    async def list_goals(self, counter_id: int) -> list[dict[str, Any]]:
+        data = await self._request(
+            "GET", f"/management/v1/counter/{counter_id}/goals"
+        )
+        items = data.get("goals", [])
+        return items if isinstance(items, list) else []
+
     async def create_counter(self, name: str, site: str) -> dict[str, Any]:
         data = await self._request(
             "POST",
