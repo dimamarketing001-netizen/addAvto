@@ -13,6 +13,12 @@ class DirectAccountCreate(BaseModel):
     integration_id: int = Field(ge=1)
 
 
+class MetrikaSetupRequest(BaseModel):
+    integration_id: int = Field(ge=1)
+    counter_id: int | None = Field(default=None, ge=1)
+    create_if_missing: bool = True
+
+
 class ProjectIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     domain: str = Field(min_length=8, max_length=2048)
