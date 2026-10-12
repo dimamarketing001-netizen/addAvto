@@ -68,8 +68,18 @@ class ClickRUClient:
         data = response.json()
         return data.get("response", data)
 
-    async def integrations(self) -> list[dict[str, Any]]:
-        response = await self._request("GET", "/integrations", params={"service": "YANDEX_DIRECT"})
+    async def integrations(
+        self,
+        service: str = "YANDEX_DIRECT",
+        with_access_token: bool = False,
+    ) -> list[dict[str, Any]]:
+        # Click.ru documents access_token for YANDEX_METRIKA only when
+        # withAccessToken=true. The token remains server-side and is never
+        # returned through an application endpoint.
+        params: dict[str, Any] = {"service": service}
+        if with_access_token:
+            params["withAccessToken"] = "true"
+        response = await self._request("GET", "/integrations", params=params)
         data = response.json()
         envelope = data.get("response", data)
         if isinstance(envelope, dict):
