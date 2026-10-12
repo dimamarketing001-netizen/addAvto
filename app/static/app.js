@@ -48,6 +48,16 @@ async function loadProjects() {
     const projects = data.items || [];
     byId("metricProjects").textContent = num(projects.length);
     byId("metricPlanned").textContent = num(projects.reduce((sum,p) => sum + (p.campaign_mode === "single_epk" ? 1 : 2),0));
+    const metrikaProjectSelect = byId("metrikaProjectId");
+    if (metrikaProjectSelect) {
+      const previousProjectId = metrikaProjectSelect.value;
+      metrikaProjectSelect.innerHTML = projects.length
+        ? projects.map((p) => '<option value="' + p.id + '">' + esc(p.name) + ' — ' + esc(p.domain) + '</option>').join("")
+        : '<option value="">Сначала создайте проект</option>';
+      if (projects.some((p) => String(p.id) === previousProjectId)) {
+        metrikaProjectSelect.value = previousProjectId;
+      }
+    }
     if (!projects.length) {
       body.innerHTML = '<tr><td colspan="7" class="empty">Проектов пока нет. Создайте первый шаблон выше.</td></tr>';
       return;
@@ -249,5 +259,143 @@ byId("accountCreateForm").addEventListener("submit", async (event) => {
     showMessage(message, error.message, "error");
   } finally {
     button.disabled = false;
+  }
+});
+
+
+let metrikaIntegrationsLoaded = false;
+
+async function loadMetrikaIntegrations() {
+  const button = byId("loadMetrikaIntegrations");
+  const message = byId("metrikaMessage");
+  button.disabled = true;
+  showMessage(message, "Загружаю интеграции Яндекс.Метрики из Click.ru…");
+  try {
+    const result = await api("/api/metrika/integrations");
+    const items = result.items || [];
+    const select = byId("metrikaIntegrationId");
+    select.innerHTML = items.length
+      ? '<option value="">Выберите интеграцию</option>' + items.map((item) => {
+          const label = item.email || item.login || item.owner || ("Интеграция #" + item.id);
+          return '<option value="' + esc(item.id) + '">' + esc(label) + ' · #' + esc(item.id) + ' · ' + esc(item.status || "статус не указан") + '</option>';
+        }).join("")
+      : '<option value="">Интеграции Метрики не найдены</option>';
+    metrikaIntegrationsLoaded = items.length > 0;
+    byId("metrikaCounterId").innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>';
+    showMessage(
+      message,
+      items.length
+        ? "Найдено интеграций Метрики: " + items.length + ". Выберите нужный Яндекс ID."
+        : "Click.ru не вернул интеграции Яндекс.Метрики. Подключите нужный Яндекс ID в Click.ru.",
+      items.length ? "success" : "error"
+    );
+  } catch (error) {
+    metrikaIntegrationsLoaded = false;
+    showMessage(message, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadMetrikaCounters() {
+  const integrationId = Number(byId("metrikaIntegrationId").value);
+  const select = byId("metrikaCounterId");
+  const button = byId("loadMetrikaCounters");
+  const message = byId("metrikaMessage");
+  if (!Number.isInteger(integrationId) || integrationId <= 0) {
+    showMessage(message, "Сначала выберите интеграцию Яндекс.Метрики.", "error");
+    return;
+  }
+  button.disabled = true;
+  showMessage(message, "Получаю список счётчиков выбранной интеграции…");
+  try {
+    const result = await api("/api/metrika/counters?integration_id=" + encodeURIComponent(integrationId));
+    const items = result.items || [];
+    const previousCounterId = select.value;
+    select.innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>' +
+      items.map((item) => {
+        const label = (item.name || "Счётчик") + " · " + (item.site || "домен не указан") + " · #" + item.id;
+        return '<option value="' + esc(item.id) + '">' + esc(label) + '</option>';
+      }).join("");
+    if (items.some((item) => String(item.id) === previousCounterId)) select.value = previousCounterId;
+    showMessage(
+      message,
+      "Счётчиков найдено: " + items.length + ". Можно выбрать существующий или оставить автоматический подбор по домену.",
+      "success"
+    );
+  } catch (error) {
+    showMessage(message, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+byId("loadMetrikaIntegrations").addEventListener("click", loadMetrikaIntegrations);
+byId("loadMetrikaCounters").addEventListener("click", loadMetrikaCounters);
+byId("metrikaIntegrationId").addEventListener("change", () => {
+  byId("metrikaCounterId").innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>';
+});
+byId("metrikaSetupForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = event.submitter;
+  const message = byId("metrikaMessage");
+  const projectId = Number(form.elements.project_id.value);
+  const integrationId = Number(form.elements.integration_id.value);
+  const rawCounterId = form.elements.counter_id.value;
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    showMessage(message, "Выберите сохранённый рекламный проект.", "error");
+    return;
+  }
+  if (!Number.isInteger(integrationId) || integrationId <= 0) {
+    showMessage(message, "Выберите интеграцию Яндекс.Метрики.", "error");
+    return;
+  }
+  const confirmText = rawCounterId
+    ? "Создать или проверить цель lead в выбранном счётчике? Изменения затронут только этот счётчик."
+    : "Найти счётчик для домена проекта, а если он не найден — создать новый, затем создать или проверить цель lead? Код на сайт автоматически не устанавливается.";
+  if (!confirm(confirmText)) return;
+  const payload = {
+    integration_id: integrationId,
+    counter_id: rawCounterId ? Number(rawCounterId) : null,
+    create_if_missing: true
+  };
+  button.disabled = true;
+  byId("metrikaResult").classList.add("hidden");
+  showMessage(message, "Настраиваю счётчик и цель lead…");
+  try {
+    const result = await api("/api/projects/" + projectId + "/metrika/setup", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    const actions = [];
+    actions.push(result.created_counter ? "Создан новый счётчик" : "Используется существующий счётчик");
+    actions.push(result.created_goal ? "создана цель lead" : "цель lead уже существовала");
+    showMessage(
+      message,
+      "Готово: " + actions.join(", ") + ". ID счётчика: " + result.counter_id + ", ID цели: " + result.goal_id + ".",
+      "success"
+    );
+    byId("metrikaResultSummary").textContent =
+      "Счётчик: " + result.counter_name + " (" + result.counter_id + "), домен: " + result.counter_site +
+      ". Цель: " + result.goal_name + " (" + result.goal_id + "). Идентификаторы сохранены в проект.";
+    byId("metrikaSnippet").textContent = result.tracking_snippet;
+    byId("metrikaInstructions").textContent = result.instructions;
+    byId("metrikaResult").classList.remove("hidden");
+    await loadProjects();
+  } catch (error) {
+    showMessage(message, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+byId("copyMetrikaSnippet").addEventListener("click", async () => {
+  const snippet = byId("metrikaSnippet").textContent;
+  const button = byId("copyMetrikaSnippet");
+  try {
+    await navigator.clipboard.writeText(snippet);
+    button.textContent = "Скопировано";
+  } catch (_) {
+    showMessage(byId("metrikaMessage"), "Автокопирование не поддерживается — выделите код и скопируйте вручную.", "error");
   }
 });
