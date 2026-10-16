@@ -263,18 +263,81 @@ byId("accountCreateForm").addEventListener("submit", async (event) => {
 });
 
 
+let metrikaLegacyTokenConfigured = false;
+let metrikaOAuthConfigured = false;
+
+function selectedMetrikaConnectionId() {
+  const raw = byId("metrikaConnectionId").value;
+  return raw ? Number(raw) : null;
+}
+
+function updateMetrikaConnectionControls() {
+  const id = selectedMetrikaConnectionId();
+  const isSavedConnection = Number.isInteger(id) && id > 0;
+  byId("disconnectMetrikaConnection").disabled = !isSavedConnection;
+  const hasCredential = isSavedConnection || metrikaLegacyTokenConfigured;
+  byId("loadMetrikaCounters").disabled = !hasCredential;
+}
+
+async function loadMetrikaConnections() {
+  const select = byId("metrikaConnectionId");
+  const statusMessage = byId("metrikaConnectionsStatus");
+  const previous = select.value;
+  try {
+    const result = await api("/api/metrika/connections");
+    const items = result.items || [];
+    metrikaLegacyTokenConfigured = Boolean(result.legacy_token_configured);
+    metrikaOAuthConfigured = Boolean(result.oauth_configured);
+    let options = '<option value="">Выберите подключение…</option>';
+    options += items.map((item) => {
+      const label = (item.label || "Яндекс ID") + " · #" + item.id +
+        (item.status && item.status !== "connected" ? " · требуется переподключение" : "");
+      return '<option value="' + esc(item.id) + '">' + esc(label) + '</option>';
+    }).join("");
+    if (metrikaLegacyTokenConfigured) {
+      options += '<option value="">Старый токен из .env</option>';
+    } else if (!items.length) {
+      options = '<option value="">Нет подключённых Яндекс ID</option>';
+    }
+    select.innerHTML = options;
+    if (items.some((item) => String(item.id) === previous)) {
+      select.value = previous;
+    } else if (items.length) {
+      select.value = String(items[0].id);
+    } else if (metrikaLegacyTokenConfigured) {
+      select.value = "";
+    }
+    updateMetrikaConnectionControls();
+    if (items.length) {
+      showMessage(statusMessage, "Подключено Яндекс ID: " + items.length + ". Можно подключить дополнительные аккаунты.", "success");
+    } else if (!metrikaOAuthConfigured) {
+      showMessage(statusMessage, "Сначала настройте Client ID, Client Secret, Redirect URI и ключ шифрования в .env.", "error");
+    } else if (metrikaLegacyTokenConfigured) {
+      showMessage(statusMessage, "Используется совместимый токен из .env. Для нескольких аккаунтов подключите Яндекс ID через OAuth.", "");
+    } else {
+      showMessage(statusMessage, "Яндекс ID пока не подключён. Нажмите «Подключить Яндекс ID».", "");
+    }
+  } catch (error) {
+    showMessage(statusMessage, error.message, "error");
+  }
+}
+
 async function loadMetrikaCounters() {
   const button = byId("loadMetrikaCounters");
-  const topButton = byId("loadMetrikaAccess");
   const message = byId("metrikaMessage");
   const select = byId("metrikaCounterId");
-  if (button) button.disabled = true;
-  if (topButton) topButton.disabled = true;
-  showMessage(message, "Проверяю OAuth-доступ к Яндекс.Метрике и загружаю счётчики…");
+  if (!selectedMetrikaConnectionId() && !metrikaLegacyTokenConfigured) {
+    showMessage(message, "Сначала подключите Яндекс ID с доступом к Метрике.", "error");
+    return;
+  }
+  button.disabled = true;
+  showMessage(message, "Проверяю доступ и загружаю счётчики выбранного Яндекс ID…");
   try {
-    const result = await api("/api/metrika/counters");
-    const items = result.items || [];
     const previousCounterId = select.value;
+    const connectionId = selectedMetrikaConnectionId();
+    const query = connectionId ? "?connection_id=" + encodeURIComponent(connectionId) : "";
+    const result = await api("/api/metrika/counters" + query);
+    const items = result.items || [];
     select.innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>' +
       items.map((item) => {
         const label = (item.name || "Счётчик") + " · " + (item.site || "домен не указан") + " · #" + item.id;
@@ -283,20 +346,57 @@ async function loadMetrikaCounters() {
     if (items.some((item) => String(item.id) === previousCounterId)) select.value = previousCounterId;
     showMessage(
       message,
-      "Доступ к Метрике работает. Доступных счётчиков: " + items.length +
+      "Доступ работает. У выбранного Яндекс ID найдено счётчиков: " + items.length +
       ". Можно выбрать существующий или оставить автоматический подбор по домену.",
       "success"
     );
   } catch (error) {
     showMessage(message, error.message, "error");
   } finally {
-    if (button) button.disabled = false;
-    if (topButton) topButton.disabled = false;
+    updateMetrikaConnectionControls();
   }
 }
 
-byId("loadMetrikaAccess").addEventListener("click", loadMetrikaCounters);
-byId("loadMetrikaCounters").addEventListener("click", loadMetrikaCounters);
+byId("connectMetrika").addEventListener("click", () => {
+  if (!metrikaOAuthConfigured) {
+    showMessage(
+      byId("metrikaConnectionsStatus"),
+      "Сначала задайте METRIKA_OAUTH_CLIENT_ID, METRIKA_OAUTH_CLIENT_SECRET, METRIKA_OAUTH_REDIRECT_URI и METRIKA_TOKEN_ENCRYPTION_KEY в .env, затем перезапустите приложение.",
+      "error"
+    );
+    return;
+  }
+  const suggested = "Яндекс ID " + new Date().toLocaleDateString("ru-RU");
+  const entered = prompt("Название подключения, чтобы различать аккаунты:", suggested);
+  if (entered === null) return;
+  const label = entered.trim() || suggested;
+  window.location.href = "/oauth/yandex/start?label=" + encodeURIComponent(label);
+});
+
+byId("refreshMetrikaConnections").addEventListener("click", loadMetrikaConnections);
+byId("metrikaConnectionId").addEventListener("change", () => {
+  byId("metrikaCounterId").innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>';
+  updateMetrikaConnectionControls();
+  showMessage(byId("metrikaMessage"), "");
+});
+
+byId("disconnectMetrikaConnection").addEventListener("click", async () => {
+  const connectionId = selectedMetrikaConnectionId();
+  if (!connectionId) return;
+  if (!confirm("Отключить этот Яндекс ID? Приложение удалит локальное подключение и запросит отзыв токена у Яндекса.")) return;
+  const button = byId("disconnectMetrikaConnection");
+  button.disabled = true;
+  try {
+    await api("/api/metrika/connections/" + connectionId, {method:"DELETE"});
+    showMessage(byId("metrikaConnectionsStatus"), "Яндекс ID отключён.", "success");
+    await loadMetrikaConnections();
+    byId("metrikaCounterId").innerHTML = '<option value="">Автоматически найти по домену проекта или создать новый</option>';
+  } catch (error) {
+    showMessage(byId("metrikaConnectionsStatus"), error.message, "error");
+    updateMetrikaConnectionControls();
+  }
+});
+
 byId("metrikaSetupForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -304,8 +404,13 @@ byId("metrikaSetupForm").addEventListener("submit", async (event) => {
   const message = byId("metrikaMessage");
   const projectId = Number(form.elements.project_id.value);
   const rawCounterId = form.elements.counter_id.value;
+  const connectionId = selectedMetrikaConnectionId();
   if (!Number.isInteger(projectId) || projectId <= 0) {
     showMessage(message, "Выберите сохранённый рекламный проект.", "error");
+    return;
+  }
+  if (!connectionId && !metrikaLegacyTokenConfigured) {
+    showMessage(message, "Сначала подключите Яндекс ID с доступом к Метрике.", "error");
     return;
   }
   const confirmText = rawCounterId
@@ -313,6 +418,7 @@ byId("metrikaSetupForm").addEventListener("submit", async (event) => {
     : "Найти счётчик для домена проекта, а если он не найден — создать новый, затем создать или проверить цель lead? Код на сайт автоматически не устанавливается.";
   if (!confirm(confirmText)) return;
   const payload = {
+    connection_id: connectionId,
     counter_id: rawCounterId ? Number(rawCounterId) : null,
     create_if_missing: true
   };
@@ -355,3 +461,21 @@ byId("copyMetrikaSnippet").addEventListener("click", async () => {
     showMessage(byId("metrikaMessage"), "Автокопирование не поддерживается — выделите код и скопируйте вручную.", "error");
   }
 });
+
+function handleMetrikaOAuthReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const result = params.get("metrika_oauth");
+  if (!result) return;
+  const messages = {
+    connected: ["Яндекс ID успешно подключён. Токен сохранён зашифрованным на сервере.", "success"],
+    denied: ["Доступ к Метрике не был разрешён. Можно повторить подключение и подтвердить права.", "error"],
+    invalid_state: ["Состояние OAuth не найдено или истекло. Запустите подключение ещё раз.", "error"],
+    permissions: ["Токен получен, но Метрика отклонила доступ. Проверьте права metrika:read / metrika:write и доступ аккаунта к счётчикам.", "error"],
+    failed: ["Не удалось завершить OAuth. Проверьте Client ID, Client Secret, Redirect URI и логи приложения без публикации секретов.", "error"]
+  };
+  const item = messages[result] || messages.failed;
+  showMessage(byId("metrikaConnectionsStatus"), item[0], item[1]);
+  history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+}
+handleMetrikaOAuthReturn();
+loadMetrikaConnections();
