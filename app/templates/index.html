@@ -72,10 +72,20 @@
 
       <div class="metrika-setup">
         <div class="panel-heading">
-          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Доступ к Метрике проверяется напрямую по OAuth-токену из серверного .env. Токен не передаётся в браузер.</p></div>
-          <button id="loadMetrikaAccess" class="button button-ghost button-small" type="button">Проверить доступ к Метрике</button>
+          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Подключи один или несколько Яндекс ID через OAuth. Токены хранятся зашифрованными на сервере и не передаются браузеру.</p></div>
+          <button id="connectMetrika" class="button button-primary" type="button">+ Подключить Яндекс ID</button>
         </div>
-        <div class="notice notice-info">Нужен OAuth-токен Яндекса с правами <code>metrika:read</code> и <code>metrika:write</code>. Добавьте его в <code>METRIKA_OAUTH_TOKEN</code> в серверном <code>.env</code> и перезапустите приложение. Токен Click.ru используется отдельно для рекламных аккаунтов.</div>
+        <div class="notice notice-info">Первичная настройка OAuth-приложения Яндекса выполняется один раз. На сервере должны быть заданы Client ID, Client Secret, точный Redirect URI и ключ шифрования. Запрашиваются только права <code>metrika:read</code> и <code>metrika:write</code>.</div>
+        <div class="metrika-connections">
+          <label class="field">Подключённый Яндекс ID
+            <select id="metrikaConnectionId"><option value="">Загружаю подключения…</option></select>
+          </label>
+          <div class="metrika-connection-actions">
+            <button id="refreshMetrikaConnections" class="button button-ghost button-small" type="button">Обновить список</button>
+            <button id="disconnectMetrikaConnection" class="button button-ghost button-small" type="button" disabled>Отключить выбранный ID</button>
+          </div>
+        </div>
+        <div id="metrikaConnectionsStatus" class="form-message" role="status"></div>
         <form id="metrikaSetupForm" class="metrika-setup-form">
           <label class="field field-wide">Рекламный проект
             <select name="project_id" id="metrikaProjectId" required><option value="">Сначала создайте проект</option></select>
