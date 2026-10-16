@@ -131,7 +131,7 @@ def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item.get(key) for key in allowed if item.get(key) is not None}
 
 
-def _metrika_context(
+async def _metrika_context(
     connection_id: int | None = None,
     owner_username: str | None = None,
 ) -> YandexMetrikaClient:
@@ -181,7 +181,7 @@ def _metrika_context(
                 oauth = YandexOAuthClient.from_env()
                 refreshed = None
                 try:
-                    refreshed = _run_oauth_refresh(oauth, decrypt_secret(refresh_enc))
+                    refreshed = await oauth.refresh(decrypt_secret(refresh_enc))
                 except YandexOAuthError as exc:
                     db.update_metrika_connection_status(connection_id, owner_username, "reconnect_required")
                     raise HTTPException(
@@ -207,10 +207,6 @@ def _metrika_context(
         ) from exc
     except YandexOAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
-async def _run_oauth_refresh(oauth: YandexOAuthClient, refresh_token: str) -> dict[str, Any]:
-    return await oauth.refresh(refresh_token)
 
 
 def _oauth_expiry(token_response: dict[str, Any]) -> str | None:
@@ -367,7 +363,7 @@ async def get_metrika_counters(
     username: AuthUser,
     connection_id: int | None = Query(default=None, ge=1),
 ):
-    metrika = _metrika_context(connection_id, username)
+    metrika = await _metrika_context(connection_id, username)
     try:
         counters = await metrika.list_counters()
         return {
@@ -402,7 +398,7 @@ async def setup_project_metrika(
     if not project_host:
         raise HTTPException(status_code=422, detail="Не удалось определить домен проекта")
 
-    metrika = _metrika_context(payload.connection_id, username)
+    metrika = await _metrika_context(payload.connection_id, username)
     created_counter = False
     try:
         counters = await metrika.list_counters()
