@@ -18,6 +18,10 @@ Set at least:
 - `APP_USERNAME` to your chosen login
 - `APP_PASSWORD` to a unique random password of 16+ characters
 - `CLICKRU_API_TOKEN` to a newly rotated token (never use a token posted in chat)
+- `METRIKA_OAUTH_TOKEN` to an OAuth token from a Yandex app with `metrika:read` and `metrika:write` scopes, for an account that can manage the target Metrica counters
+
+Create a Yandex OAuth app for API access, grant `metrika:read` and `metrika:write`, authorize the Yandex account that has owner/guest-write access to the counters, and copy the token into `.env`. Official guide: https://yandex.com/dev/metrika/en/intro/authorization.
+
 - `CLICKRU_USER_ID` only when required for your Click.ru account context
 
 Protect the file: `chmod 600 .env`.
