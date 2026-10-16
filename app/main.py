@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
+import secrets
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -16,6 +19,8 @@ from . import db
 from .click_client import ClickRUClient, ClickRUError
 from .metrika_client import MetrikaAPIError, YandexMetrikaClient
 from .schemas import CampaignPlan, DirectAccountCreate, MetrikaSetupRequest, PlanItem, ProjectIn
+from .token_crypto import TokenCryptoError, decrypt_secret, encrypt_secret
+from .yandex_oauth import YandexOAuthClient, YandexOAuthError
 
 
 security = HTTPBasic()
@@ -126,20 +131,96 @@ def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item.get(key) for key in allowed if item.get(key) is not None}
 
 
-def _metrika_context() -> YandexMetrikaClient:
-    access_token = os.getenv("METRIKA_OAUTH_TOKEN", "").strip()
-    if not access_token:
+def _metrika_context(
+    connection_id: int | None = None,
+    owner_username: str | None = None,
+) -> YandexMetrikaClient:
+    # Legacy single-token support is retained during migration. New users should connect
+    # each Yandex ID with the authorization-code flow and select its saved connection.
+    if connection_id is None:
+        access_token = os.getenv("METRIKA_OAUTH_TOKEN", "").strip()
+        if not access_token:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Сначала нажмите «Подключить Яндекс ID» и разрешите доступ к Метрике. "
+                    "Либо временно задайте METRIKA_OAUTH_TOKEN в серверном .env."
+                ),
+            )
+        return YandexMetrikaClient(access_token)
+
+    if not owner_username:
+        raise HTTPException(status_code=401, detail="Не удалось определить владельца подключения.")
+    connection = db.get_metrika_connection(connection_id, owner_username)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Подключение Яндекс ID не найдено.")
+    if connection.get("status") != "connected":
+        raise HTTPException(
+            status_code=409,
+            detail="Подключение Яндекс ID требует повторной авторизации. Подключите аккаунт заново.",
+        )
+
+    try:
+        access_token = decrypt_secret(connection["access_token_enc"])
+        refresh_enc = connection.get("refresh_token_enc") or ""
+        expires_at = connection.get("expires_at")
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(expires_at)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+            except ValueError:
+                expiry = datetime.min.replace(tzinfo=timezone.utc)
+            if expiry <= datetime.now(timezone.utc) + timedelta(minutes=2):
+                if not refresh_enc:
+                    db.update_metrika_connection_status(connection_id, owner_username, "reconnect_required")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Срок действия токена закончился. Подключите Яндекс ID заново.",
+                    )
+                oauth = YandexOAuthClient.from_env()
+                refreshed = None
+                try:
+                    refreshed = _run_oauth_refresh(oauth, decrypt_secret(refresh_enc))
+                except YandexOAuthError as exc:
+                    db.update_metrika_connection_status(connection_id, owner_username, "reconnect_required")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Не удалось обновить токен. Подключите Яндекс ID заново.",
+                    ) from exc
+                access_token = str(refreshed["access_token"])
+                new_refresh = str(refreshed.get("refresh_token") or decrypt_secret(refresh_enc))
+                new_expiry = _oauth_expiry(refreshed)
+                db.update_metrika_connection_tokens(
+                    connection_id,
+                    owner_username,
+                    encrypt_secret(access_token),
+                    encrypt_secret(new_refresh) if new_refresh else "",
+                    new_expiry,
+                    str(refreshed.get("scope") or connection.get("scopes") or ""),
+                )
+        return YandexMetrikaClient(access_token)
+    except TokenCryptoError as exc:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Не задан METRIKA_OAUTH_TOKEN в серверном .env. Создайте OAuth-приложение "
-                "Яндекса с доступами metrika:read и metrika:write, получите токен и перезапустите приложение."
-            ),
-        )
-    try:
-        return YandexMetrikaClient(access_token)
-    except MetrikaAPIError as exc:
+            detail="Не удалось прочитать зашифрованный токен. Проверьте METRIKA_TOKEN_ENCRYPTION_KEY.",
+        ) from exc
+    except YandexOAuthError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+async def _run_oauth_refresh(oauth: YandexOAuthClient, refresh_token: str) -> dict[str, Any]:
+    return await oauth.refresh(refresh_token)
+
+
+def _oauth_expiry(token_response: dict[str, Any]) -> str | None:
+    try:
+        seconds = int(token_response.get("expires_in"))
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def _normalize_site(value: str | None) -> str:
@@ -174,9 +255,119 @@ def _is_lead_goal(goal: dict[str, Any]) -> bool:
     )
 
 
+@app.get("/api/metrika/connections")
+async def get_metrika_connections(username: AuthUser):
+    return {
+        "items": db.list_metrika_connections(username),
+        "legacy_token_configured": bool(os.getenv("METRIKA_OAUTH_TOKEN", "").strip()),
+        "oauth_configured": all(
+            os.getenv(key, "").strip()
+            for key in ("METRIKA_OAUTH_CLIENT_ID", "METRIKA_OAUTH_CLIENT_SECRET", "METRIKA_OAUTH_REDIRECT_URI")
+        ),
+    }
+
+
+@app.delete("/api/metrika/connections/{connection_id}")
+async def disconnect_metrika_connection(connection_id: int, username: AuthUser):
+    connection = db.get_metrika_connection(connection_id, username)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Подключение Яндекс ID не найдено.")
+    try:
+        access_token = decrypt_secret(connection["access_token_enc"])
+        oauth = YandexOAuthClient.from_env()
+        await oauth.revoke(access_token)
+    except TokenCryptoError as exc:
+        raise HTTPException(status_code=503, detail="Не удалось расшифровать токен для отключения.") from exc
+    except YandexOAuthError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not db.delete_metrika_connection(connection_id, username):
+        raise HTTPException(status_code=500, detail="Не удалось удалить подключение.")
+    return {"deleted": True, "connection_id": connection_id}
+
+
+@app.get("/oauth/yandex/start")
+async def yandex_oauth_start(
+    username: AuthUser,
+    label: str = Query(default="Яндекс ID", min_length=1, max_length=80),
+):
+    try:
+        oauth = YandexOAuthClient.from_env()
+        # Validate the persistent encryption key before redirecting the user to Yandex.
+        encrypt_secret("oauth-key-check")
+        state = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(48)
+        state_hash = hashlib.sha256(state.encode("utf-8")).hexdigest()
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(timespec="seconds")
+        clean_label = " ".join(label.split()).strip() or "Яндекс ID"
+        db.save_metrika_oauth_state(
+            state_hash=state_hash,
+            owner_username=username,
+            label=clean_label,
+            code_verifier_enc=encrypt_secret(code_verifier),
+            expires_at=expires_at,
+        )
+        return RedirectResponse(
+            oauth.authorization_url(state, code_verifier),
+            status_code=status.HTTP_302_FOUND,
+        )
+    except (YandexOAuthError, TokenCryptoError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/oauth/yandex/callback")
+async def yandex_oauth_callback(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+):
+    def finish(result: str) -> RedirectResponse:
+        return RedirectResponse(url=f"/?metrika_oauth={result}", status_code=status.HTTP_303_SEE_OTHER)
+
+    if not state:
+        return finish("invalid_state")
+    state_hash = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    oauth_state = db.consume_metrika_oauth_state(state_hash)
+    if oauth_state is None:
+        return finish("invalid_state")
+    if error:
+        return finish("denied" if error == "access_denied" else "failed")
+    if not code:
+        return finish("failed")
+
+    try:
+        code_verifier = decrypt_secret(oauth_state["code_verifier_enc"])
+        oauth = YandexOAuthClient.from_env()
+        token_data = await oauth.exchange_code(code, code_verifier)
+        access_token = str(token_data["access_token"])
+        # Verify the granted token against Metrica before storing it.
+        metrika = YandexMetrikaClient(access_token)
+        await metrika.list_counters()
+        refresh_token = str(token_data.get("refresh_token") or "")
+        scopes = str(token_data.get("scope") or "metrika:read metrika:write")
+        connection = db.create_metrika_connection(
+            owner_username=oauth_state["owner_username"],
+            label=oauth_state["label"],
+            access_token_enc=encrypt_secret(access_token),
+            refresh_token_enc=encrypt_secret(refresh_token) if refresh_token else "",
+            expires_at=_oauth_expiry(token_data),
+            scopes=scopes,
+        )
+        return RedirectResponse(
+            url=f"/?metrika_oauth=connected&connection_id={int(connection['id'])}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    except MetrikaAPIError as exc:
+        return finish("permissions" if exc.status_code in (401, 403) else "failed")
+    except (YandexOAuthError, TokenCryptoError, HTTPException):
+        return finish("failed")
+
+
 @app.get("/api/metrika/counters")
-async def get_metrika_counters(_: AuthUser):
-    metrika = _metrika_context()
+async def get_metrika_counters(
+    username: AuthUser,
+    connection_id: int | None = Query(default=None, ge=1),
+):
+    metrika = _metrika_context(connection_id, username)
     try:
         counters = await metrika.list_counters()
         return {
@@ -200,7 +391,7 @@ async def get_metrika_counters(_: AuthUser):
 async def setup_project_metrika(
     project_id: int,
     payload: MetrikaSetupRequest,
-    _: AuthUser,
+    username: AuthUser,
 ):
     project = db.get_project(project_id)
     if project is None:
@@ -211,7 +402,7 @@ async def setup_project_metrika(
     if not project_host:
         raise HTTPException(status_code=422, detail="Не удалось определить домен проекта")
 
-    metrika = _metrika_context()
+    metrika = _metrika_context(payload.connection_id, username)
     created_counter = False
     try:
         counters = await metrika.list_counters()
