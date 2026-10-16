@@ -126,39 +126,20 @@ def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item.get(key) for key in allowed if item.get(key) is not None}
 
 
-def _safe_metrika_integration(item: dict[str, Any]) -> dict[str, Any]:
-    allowed = ("id", "service", "owner", "login", "email", "firstName", "lastName", "status")
-    return {key: item.get(key) for key in allowed if item.get(key) is not None}
-
-
-async def _metrika_context(
-    click_client: ClickRUClient,
-    integration_id: int,
-) -> tuple[YandexMetrikaClient, dict[str, Any]]:
-    integrations = await click_client.integrations(
-        service="YANDEX_METRIKA",
-        with_access_token=True,
-    )
-    selected = next(
-        (
-            item for item in integrations
-            if str(item.get("id", "")) == str(integration_id)
-            and item.get("service") == "YANDEX_METRIKA"
-        ),
-        None,
-    )
-    if selected is None:
+def _metrika_context() -> YandexMetrikaClient:
+    access_token = os.getenv("METRIKA_OAUTH_TOKEN", "").strip()
+    if not access_token:
         raise HTTPException(
-            status_code=422,
-            detail="Интеграция Яндекс.Метрики не найдена. Обновите список интеграций.",
+            status_code=503,
+            detail=(
+                "Не задан METRIKA_OAUTH_TOKEN в серверном .env. Создайте OAuth-приложение "
+                "Яндекса с доступами metrika:read и metrika:write, получите токен и перезапустите приложение."
+            ),
         )
-    access_token = selected.get("access_token")
-    if not isinstance(access_token, str) or not access_token.strip():
-        raise ClickRUError(
-            "Click.ru не вернул access_token для выбранной интеграции Метрики. "
-            "Проверьте её статус, права API и доступ к токенам интеграций."
-        )
-    return YandexMetrikaClient(access_token), selected
+    try:
+        return YandexMetrikaClient(access_token)
+    except MetrikaAPIError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _normalize_site(value: str | None) -> str:
@@ -193,31 +174,10 @@ def _is_lead_goal(goal: dict[str, Any]) -> bool:
     )
 
 
-@app.get("/api/metrika/integrations")
-async def get_metrika_integrations(_: AuthUser):
-    client = ClickRUClient()
-    if not client.configured:
-        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
-    try:
-        items = await client.integrations(service="YANDEX_METRIKA")
-        return {
-            "items": [_safe_metrika_integration(item) for item in items],
-            "message": "Список интеграций Метрики получен. OAuth-токены остаются на сервере.",
-        }
-    except ClickRUError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @app.get("/api/metrika/counters")
-async def get_metrika_counters(
-    _: AuthUser,
-    integration_id: int = Query(ge=1),
-):
-    client = ClickRUClient()
-    if not client.configured:
-        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+async def get_metrika_counters(_: AuthUser):
+    metrika = _metrika_context()
     try:
-        metrika, _integration = await _metrika_context(client, integration_id)
         counters = await metrika.list_counters()
         return {
             "items": [
@@ -232,8 +192,6 @@ async def get_metrika_counters(
                 if counter.get("id") is not None
             ]
         }
-    except ClickRUError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except MetrikaAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -253,13 +211,9 @@ async def setup_project_metrika(
     if not project_host:
         raise HTTPException(status_code=422, detail="Не удалось определить домен проекта")
 
-    click_client = ClickRUClient()
-    if not click_client.configured:
-        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
-
+    metrika = _metrika_context()
     created_counter = False
     try:
-        metrika, _integration = await _metrika_context(click_client, payload.integration_id)
         counters = await metrika.list_counters()
         chosen: dict[str, Any] | None = None
 
@@ -271,7 +225,7 @@ async def setup_project_metrika(
             if chosen is None:
                 raise HTTPException(
                     status_code=422,
-                    detail="Выбранный счётчик не найден в этой интеграции Метрики.",
+                    detail="Выбранный счётчик не найден среди доступных счётчиков для OAuth-токена Метрики.",
                 )
             if _normalize_site(_counter_site(chosen)) != _normalize_site(project_host):
                 raise HTTPException(
