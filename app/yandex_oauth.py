@@ -110,3 +110,24 @@ class YandexOAuthClient:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         })
+
+    async def revoke(self, access_token: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                response = await client.post(
+                    "https://oauth.yandex.ru/revoke_token",
+                    data={
+                        "access_token": access_token,
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                    },
+                    headers={"Accept": "application/json"},
+                )
+        except httpx.HTTPError as exc:
+            raise YandexOAuthError(
+                f"Ошибка соединения при отзыве токена: {type(exc).__name__}"
+            ) from exc
+        if response.status_code >= 400:
+            raise YandexOAuthError(
+                f"Яндекс OAuth не подтвердил отзыв токена (HTTP {response.status_code})."
+            )
