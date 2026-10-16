@@ -82,24 +82,16 @@ def test_direct_account_creation_uses_selected_integration(tmp_path, monkeypatch
 
 
 def test_metrika_setup_creates_counter_and_lead_goal_once(tmp_path, monkeypatch):
-    from app.click_client import ClickRUClient
     from app.metrika_client import YandexMetrikaClient
 
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "metrika-test.db"))
     monkeypatch.setenv("APP_USERNAME", "test-admin")
     monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
     monkeypatch.setenv("APP_ENV", "test")
-    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "")
+    monkeypatch.setenv("METRIKA_OAUTH_TOKEN", "test-metrika-token")
 
     state = {"counters": [], "goals": []}
-
-    async def fake_integrations(self, service="YANDEX_DIRECT", with_access_token=False):
-        if service == "YANDEX_METRIKA":
-            row = {"id": 456, "service": "YANDEX_METRIKA", "email": "metrika@example.ru"}
-            if with_access_token:
-                row["access_token"] = "mock-metrika-token"
-            return [row]
-        return []
 
     async def fake_list_counters(self):
         return list(state["counters"])
@@ -123,7 +115,6 @@ def test_metrika_setup_creates_counter_and_lead_goal_once(tmp_path, monkeypatch)
         state["goals"].append(row)
         return row
 
-    monkeypatch.setattr(ClickRUClient, "integrations", fake_integrations)
     monkeypatch.setattr(YandexMetrikaClient, "list_counters", fake_list_counters)
     monkeypatch.setattr(YandexMetrikaClient, "create_counter", fake_create_counter)
     monkeypatch.setattr(YandexMetrikaClient, "list_goals", fake_list_goals)
@@ -153,7 +144,7 @@ def test_metrika_setup_creates_counter_and_lead_goal_once(tmp_path, monkeypatch)
         response = client.post(
             f"/api/projects/{project_id}/metrika/setup",
             auth=auth,
-            json={"integration_id": 456, "create_if_missing": True},
+            json={"create_if_missing": True},
         )
         assert response.status_code == 200, response.text
         body = response.json()
@@ -166,3 +157,19 @@ def test_metrika_setup_creates_counter_and_lead_goal_once(tmp_path, monkeypatch)
         updated = client.get("/api/projects", auth=auth).json()["items"][0]
         assert updated["counter_id"] == 12345
         assert updated["goal_id"] == 98765
+
+
+def test_metrika_counters_requires_oauth_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "metrika-no-token.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("METRIKA_OAUTH_TOKEN", "")
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/metrika/counters",
+            auth=("test-admin", "test-password-long-enough"),
+        )
+        assert response.status_code == 503
+        assert "METRIKA_OAUTH_TOKEN" in response.json()["detail"]
