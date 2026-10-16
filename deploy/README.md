@@ -18,11 +18,19 @@ Set at least:
 - `APP_USERNAME` to your chosen login
 - `APP_PASSWORD` to a unique random password of 16+ characters
 - `CLICKRU_API_TOKEN` to a newly rotated token (never use a token posted in chat)
-- `METRIKA_OAUTH_TOKEN` to an OAuth token from a Yandex app with `metrika:read` and `metrika:write` scopes, for an account that can manage the target Metrica counters
-
-Create a Yandex OAuth app for API access, grant `metrika:read` and `metrika:write`, authorize the Yandex account that has owner/guest-write access to the counters, and copy the token into `.env`. Official guide: https://yandex.com/dev/metrika/en/intro/authorization.
-
+- `METRIKA_OAUTH_CLIENT_ID` and `METRIKA_OAUTH_CLIENT_SECRET` from your Yandex OAuth app
+- `METRIKA_OAUTH_REDIRECT_URI` exactly as registered in Yandex OAuth:
+  `https://xn--80aanufhx.xn--b1ajdba5acbodeeeaj1qb.xn--p1ai/oauth/yandex/callback`
+- `METRIKA_TOKEN_ENCRYPTION_KEY` to a persistent Fernet key generated once and backed up securely
 - `CLICKRU_USER_ID` only when required for your Click.ru account context
+
+Create a Yandex OAuth app for API access and grant `metrika:read` and `metrika:write`. Register the exact callback URL above. After deploying the app, generate an encryption key by temporarily running:
+
+```bash
+sudo docker compose exec app python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Copy the printed key into `METRIKA_TOKEN_ENCRYPTION_KEY` in `.env`, keep a secure backup, and restart the app. **Do not regenerate this key later:** all saved OAuth credentials use it for encryption. Then use the «Подключить Яндекс ID» button inside the authenticated web cabinet; the user authorizes access at Yandex, the server exchanges the code, verifies Metrica access, and stores the credentials encrypted in SQLite. Do not paste OAuth tokens into chat, source code, or browser fields. Official guides: https://yandex.com/dev/metrika/en/intro/authorization and https://yandex.ru/dev/id/doc/ru/codes/code-url.
 
 Protect the file: `chmod 600 .env`.
 
