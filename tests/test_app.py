@@ -172,4 +172,4 @@ def test_metrika_counters_requires_oauth_token(tmp_path, monkeypatch):
             auth=("test-admin", "test-password-long-enough"),
         )
         assert response.status_code == 503
-        assert "METRIKA_OAUTH_TOKEN" in response.json()["detail"]
+        assert "Подключить Яндекс ID" in response.json()["detail"]
