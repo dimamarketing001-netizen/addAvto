@@ -72,21 +72,19 @@
 
       <div class="metrika-setup">
         <div class="panel-heading">
-          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Интеграция выбирается через Click.ru. Токен Метрики остаётся на сервере и не показывается в браузере.</p></div>
-          <button id="loadMetrikaIntegrations" class="button button-ghost button-small" type="button">Загрузить интеграции Метрики</button>
+          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Доступ к Метрике проверяется напрямую по OAuth-токену из серверного .env. Токен не передаётся в браузер.</p></div>
+          <button id="loadMetrikaAccess" class="button button-ghost button-small" type="button">Проверить доступ к Метрике</button>
         </div>
+        <div class="notice notice-info">Нужен OAuth-токен Яндекса с правами <code>metrika:read</code> и <code>metrika:write</code>. Добавьте его в <code>METRIKA_OAUTH_TOKEN</code> в серверном <code>.env</code> и перезапустите приложение. Токен Click.ru используется отдельно для рекламных аккаунтов.</div>
         <form id="metrikaSetupForm" class="metrika-setup-form">
-          <label class="field">Рекламный проект
+          <label class="field field-wide">Рекламный проект
             <select name="project_id" id="metrikaProjectId" required><option value="">Сначала создайте проект</option></select>
           </label>
-          <label class="field">Интеграция Яндекс.Метрики
-            <select name="integration_id" id="metrikaIntegrationId" required><option value="">Сначала загрузите интеграции</option></select>
-          </label>
-          <label class="field">Счётчик
+          <label class="field field-wide">Счётчик
             <select name="counter_id" id="metrikaCounterId">
               <option value="">Автоматически найти по домену проекта или создать новый</option>
             </select>
-            <small>Если оставить автоматический вариант, приложение найдёт счётчик нужного домена или создаст его, если не найдёт.</small>
+            <small>После проверки доступа можно загрузить существующие счётчики. Если оставить автоматический вариант, приложение найдёт счётчик нужного домена или создаст его, если не найдёт.</small>
           </label>
           <div class="metrika-buttons">
             <button id="loadMetrikaCounters" class="button button-ghost" type="button">Загрузить счётчики</button>
