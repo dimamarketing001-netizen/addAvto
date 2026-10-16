@@ -253,13 +253,19 @@ def _is_lead_goal(goal: dict[str, Any]) -> bool:
 
 @app.get("/api/metrika/connections")
 async def get_metrika_connections(username: AuthUser):
+    try:
+        encrypt_secret("oauth-config-check")
+        encryption_ready = True
+    except TokenCryptoError:
+        encryption_ready = False
+    oauth_configured = encryption_ready and all(
+        os.getenv(key, "").strip()
+        for key in ("METRIKA_OAUTH_CLIENT_ID", "METRIKA_OAUTH_CLIENT_SECRET", "METRIKA_OAUTH_REDIRECT_URI")
+    )
     return {
         "items": db.list_metrika_connections(username),
         "legacy_token_configured": bool(os.getenv("METRIKA_OAUTH_TOKEN", "").strip()),
-        "oauth_configured": all(
-            os.getenv(key, "").strip()
-            for key in ("METRIKA_OAUTH_CLIENT_ID", "METRIKA_OAUTH_CLIENT_SECRET", "METRIKA_OAUTH_REDIRECT_URI")
-        ),
+        "oauth_configured": bool(oauth_configured),
     }
 
 
