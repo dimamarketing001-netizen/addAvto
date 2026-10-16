@@ -14,7 +14,6 @@ class DirectAccountCreate(BaseModel):
 
 
 class MetrikaSetupRequest(BaseModel):
-    integration_id: int = Field(ge=1)
     counter_id: int | None = Field(default=None, ge=1)
     create_if_missing: bool = True
 
