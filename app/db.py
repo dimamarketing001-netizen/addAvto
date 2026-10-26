@@ -11,7 +11,7 @@ from typing import Any
 PROJECT_FIELDS = [
     "name", "domain", "campaign_mode", "strategy", "target_drr", "budget", "lead_value",
     "headline", "ad_text", "keywords", "negative_keywords", "image_urls", "account_ids",
-    "counter_id", "goal_id", "region_ids",
+    "counter_id", "goal_id", "region_ids", "metrika_pool_login",
 ]
 
 
@@ -52,6 +52,9 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             )
         """)
+        existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
+        if "metrika_pool_login" not in existing_columns:
+            db.execute("ALTER TABLE projects ADD COLUMN metrika_pool_login TEXT")
         db.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,

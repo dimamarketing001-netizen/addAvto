@@ -15,8 +15,17 @@ class DirectAccountCreate(BaseModel):
 
 class MetrikaSetupRequest(BaseModel):
     connection_id: int | None = Field(default=None, ge=1)
+    # Alternative to connection_id: a Yandex login already present in
+    # ParsYa's shared pool (yandex_accounts, MySQL), with its own Metrika
+    # OAuth token obtained there. See ADS_MANAGER_OVERVIEW.md in ParsYa.
+    pool_login: str | None = Field(default=None, min_length=3, max_length=255)
     counter_id: int | None = Field(default=None, ge=1)
     create_if_missing: bool = True
+
+    @field_validator("pool_login")
+    @classmethod
+    def normalize_pool_login(cls, value: str | None) -> str | None:
+        return value.strip().casefold() if value else value
 
 
 class ProjectIn(BaseModel):
@@ -36,6 +45,7 @@ class ProjectIn(BaseModel):
     counter_id: int | None = Field(default=None, ge=1)
     goal_id: int | None = Field(default=None, ge=1)
     region_ids: list[int] = Field(default_factory=list, max_length=300)
+    metrika_pool_login: str | None = Field(default=None, max_length=255)
 
     @field_validator("domain")
     @classmethod

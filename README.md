@@ -71,6 +71,17 @@ docker compose up --build -d
 
 Яндекс требует разрешение пользователя на первоначальный доступ и права на целевые счётчики. См. [официальную документацию Яндекс Метрики по авторизации](https://yandex.com/dev/metrika/en/intro/authorization), [код авторизации](https://yandex.ru/dev/id/doc/ru/codes/code-url) и [обновление токенов](https://yandex.ru/dev/id/doc/ru/tokens/refresh-client). Поддержан старый `METRIKA_OAUTH_TOKEN` в `.env` только для обратной совместимости; для нескольких аккаунтов используйте OAuth-кнопку.
 
+## Аккаунты из пула ParsYa (опционально)
+
+Вместо (или в дополнение к) кнопке «Подключить Яндекс ID» проект можно привязать
+к Yandex-аккаунту из общего пула другого проекта, ParsYa (`yandex_accounts` в
+MySQL) — укажите `pool_login` вместо `connection_id` при вызове
+`POST /api/projects/{id}/metrika/setup`. Токен Метрики для такого аккаунта
+читается на лету через read-only API `parsya-control` (переменные
+`PARSYA_POOL_API_URL`/`PARSYA_POOL_API_TOKEN` в `.env`) — не сохраняется в
+собственной SQLite этого приложения. Список доступных аккаунтов пула:
+`GET /api/parsya-pool/accounts`.
+
 ## Что уже подключено и что осталось
 
 Уже реализованы:

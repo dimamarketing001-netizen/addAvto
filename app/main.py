@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from . import db
 from .click_client import ClickRUClient, ClickRUError
 from .metrika_client import MetrikaAPIError, YandexMetrikaClient
+from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from .schemas import CampaignPlan, DirectAccountCreate, MetrikaSetupRequest, PlanItem, ProjectIn
 from .token_crypto import TokenCryptoError, decrypt_secret, encrypt_secret
 from .yandex_oauth import YandexOAuthClient, YandexOAuthError
@@ -134,7 +135,27 @@ def _safe_account(item: dict[str, Any]) -> dict[str, Any]:
 async def _metrika_context(
     connection_id: int | None = None,
     owner_username: str | None = None,
+    pool_login: str | None = None,
 ) -> YandexMetrikaClient:
+    # Pool accounts (ParsYa's shared yandex_accounts in MySQL) already carry
+    # their own Metrika OAuth token, obtained outside addAvto's own OAuth
+    # flow (see ADS_MANAGER_OVERVIEW.md in ParsYa) — read it live each call
+    # rather than mirroring it into metrika_connections, so there's exactly
+    # one place that token can go stale.
+    if pool_login:
+        pool = ParsYaPoolClient()
+        if not pool.configured:
+            raise HTTPException(
+                status_code=503,
+                detail="PARSYA_POOL_API_TOKEN не задан в .env — пул ParsYa недоступен.",
+            )
+        try:
+            account = await pool.get_account(pool_login)
+        except ParsYaPoolError as exc:
+            status_code = exc.status_code if exc.status_code and exc.status_code < 500 else 502
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        return YandexMetrikaClient(account["metrika_access_token"])
+
     # Legacy single-token support is retained during migration. New users should connect
     # each Yandex ID with the authorization-code flow and select its saved connection.
     if connection_id is None:
@@ -249,6 +270,19 @@ def _is_lead_goal(goal: dict[str, Any]) -> bool:
         and str(condition.get("url", "")).strip() == "lead"
         for condition in conditions
     )
+
+
+@app.get("/api/parsya-pool/accounts")
+async def list_parsya_pool_accounts(_: AuthUser):
+    pool = ParsYaPoolClient()
+    if not pool.configured:
+        return {"configured": False, "items": []}
+    try:
+        items = await pool.list_accounts()
+    except ParsYaPoolError as exc:
+        status_code = exc.status_code if exc.status_code and exc.status_code < 500 else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {"configured": True, "items": items}
 
 
 @app.get("/api/metrika/connections")
@@ -368,8 +402,9 @@ async def yandex_oauth_callback(
 async def get_metrika_counters(
     username: AuthUser,
     connection_id: int | None = Query(default=None, ge=1),
+    pool_login: str | None = Query(default=None),
 ):
-    metrika = await _metrika_context(connection_id, username)
+    metrika = await _metrika_context(connection_id, username, pool_login)
     try:
         counters = await metrika.list_counters()
         return {
@@ -404,7 +439,7 @@ async def setup_project_metrika(
     if not project_host:
         raise HTTPException(status_code=422, detail="Не удалось определить домен проекта")
 
-    metrika = await _metrika_context(payload.connection_id, username)
+    metrika = await _metrika_context(payload.connection_id, username, payload.pool_login)
     created_counter = False
     try:
         counters = await metrika.list_counters()
@@ -464,10 +499,10 @@ async def setup_project_metrika(
             goal = await metrika.create_goal(counter_id)
             created_goal = True
 
-        updated = db.update_project(
-            project_id,
-            {"counter_id": counter_id, "goal_id": int(goal["id"])},
-        )
+        update_fields: dict[str, Any] = {"counter_id": counter_id, "goal_id": int(goal["id"])}
+        if payload.pool_login:
+            update_fields["metrika_pool_login"] = payload.pool_login
+        updated = db.update_project(project_id, update_fields)
         if updated is None:
             raise HTTPException(status_code=500, detail="Не удалось сохранить ID счётчика и цели в проекте.")
 
