@@ -5,7 +5,13 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "127.0.0.1:8000:8000"
+    # The ParsYa pool API is only reachable via the host's own 127.0.0.1
+    # (a reverse SSH tunnel bound to loopback, deliberately not exposed on
+    # any other interface) — host.docker.internal/extra_hosts can't reach a
+    # loopback-only service through the bridge network, so share the host's
+    # network namespace directly instead. The app itself now binds to
+    # 127.0.0.1 inside the container (see Dockerfile), so this doesn't widen
+    # its own exposure despite dropping the port-mapping's IP restriction.
+    network_mode: host
     volumes:
       - ./data:/app/data

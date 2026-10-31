@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Конверсии в Метрику</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/lk.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">D</div><div><strong>Direct Manager</strong><small>Конверсии в Метрику</small></div></div>
+    <nav>
+      {% if is_admin %}<a class="nav-link" href="/">← Рекламные кампании</a>{% endif %}
+      <a class="nav-link active" href="#accounts">Яндекс ID</a>
+      <a class="nav-link" href="#sources">Источники Б24</a>
+      <a class="nav-link" href="#campaigns">Кампании и счётчики</a>
+      <a class="nav-link" href="#log">Журнал</a>
+      {% if is_admin %}<a class="nav-link" href="#users">Пользователи</a>{% endif %}
+    </nav>
+    <div class="sidebar-foot"><span class="status-dot"></span> {{ user }}<small>Проверка лидов каждые <span id="pollMinutes">10</span> мин</small></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">ЛК</div>
+        <h1>Конверсии в Яндекс Метрику</h1>
+        <p class="muted">Лиды из Битрикс24 попадают в цель <code>lead</code> того счётчика, который привязан к рекламной кампании.</p>
+      </div>
+      <button class="button button-ghost" id="reloadAll" type="button">Обновить ↻</button>
+    </header>
+
+    <section class="metrics-grid" id="stats">
+      <article class="metric-card"><div class="metric-label">Отправлено за 24 ч</div><div class="metric-value" id="stOk">—</div><div class="metric-foot">в Метрику</div></article>
+      <article class="metric-card"><div class="metric-label">Пробно</div><div class="metric-value" id="stDry">—</div><div class="metric-foot">не отправлялись</div></article>
+      <article class="metric-card"><div class="metric-label">Ошибки</div><div class="metric-value" id="stFail">—</div><div class="metric-foot">за 24 ч</div></article>
+      <article class="metric-card"><div class="metric-label">Кампании без счётчика</div><div class="metric-value" id="stUnmapped">—</div><div class="metric-foot">нужно привязать</div></article>
+    </section>
+
+    <section id="accounts" class="panel">
+      <div class="panel-heading">
+        <div><div class="eyebrow">ШАГ 1</div><h2>Кабинеты Яндекса</h2><p class="muted small">Подключите Яндекс ID, у которого есть доступ к счётчикам Метрики. Токен хранится зашифрованным и в браузер не передаётся.</p></div>
+        <button class="button button-primary" id="connectYandex" type="button">+ Подключить Яндекс ID</button>
+      </div>
+      <div id="accountsMsg" class="form-message" role="status"></div>
+      <div class="table-wrap"><table><thead><tr><th>Название</th><th>Статус</th><th>Токен действует до</th><th></th></tr></thead><tbody id="accountsRows"><tr><td colspan="4" class="empty">Загрузка…</td></tr></tbody></table></div>
+    </section>
+
+    <section id="sources" class="panel">
+      <div class="panel-heading">
+        <div><div class="eyebrow">ШАГ 2</div><h2>Источники лидов — Битрикс24</h2><p class="muted small">Можно подключить несколько порталов. Лиды из всех проверяются по очереди.</p></div>
+        <button class="button button-primary" id="addSourceBtn" type="button">+ Добавить Б24</button>
+      </div>
+      <form id="sourceForm" class="hidden lk-form">
+        <input type="hidden" name="id">
+        <div class="form-grid">
+          <label class="field">Название<input name="name" required maxlength="80" placeholder="Например, Б24 — Москва"></label>
+          <label class="field">Автопроверка за последние, часов<input name="lookback_hours" type="number" min="1" max="168" value="24"><small class="muted">Для ручного запуска период выбирается кнопкой в списке</small></label>
+          <label class="field field-wide">Входящий вебхук Б24<input name="webhook" placeholder="https://portal.bitrix24.ru/rest/1/xxxxxxxxxxxx" autocomplete="off"><small class="muted">Б24 → Разработчикам → Другое → Входящий вебхук, право «CRM». При правке оставьте пустым, чтобы не менять.</small></label>
+          <label class="field field-wide">Что отправлять
+            <select name="mode">
+              <option value="simple">Каждый лид один раз (без суммы)</option>
+              <option value="score_field">Со скорингом: сумма из поля лида, повторно при изменении</option>
+            </select>
+          </label>
+          <label class="field score-only">Поле со скорингом<input name="score_field" placeholder="UF_CRM_1786470518869"></label>
+          <label class="field score-only">Поле «скоринг посчитан»<input name="scored_flag_field" placeholder="UF_CRM_1786470227303"><small class="muted">Пока там пусто — лид не отправляется</small></label>
+          <label class="field field-wide lk-check"><span><input type="checkbox" name="send_backlog"> Отправить и лиды, которые уже есть за период проверки</span><small class="muted">По умолчанию они только запоминаются, чтобы не задвоить то, что уже ушло в Метрику.</small></label>
+        </div>
+        <div class="form-actions"><span id="sourceMsg" class="form-message"></span><span><button class="button button-ghost" id="cancelSource" type="button">Отмена</button> <button class="button button-primary" type="submit">Сохранить</button></span></div>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>Источник</th><th>Режим</th><th>Последняя проверка</th><th>Отправка</th><th></th></tr></thead><tbody id="sourcesRows"><tr><td colspan="5" class="empty">Загрузка…</td></tr></tbody></table></div>
+    </section>
+
+    <section id="campaigns" class="panel">
+      <div class="panel-heading">
+        <div><div class="eyebrow">ШАГ 3</div><h2>Кампании → счётчик Метрики</h2><p class="muted small">ID кампании Директа берётся из UTM_CAMPAIGN лида. При привязке цель <code>lead</code> создаётся в счётчике автоматически, если её ещё нет.</p></div>
+      </div>
+      <div id="unmappedBox" class="notice notice-warning hidden"></div>
+      <form id="mapForm" class="lk-form">
+        <div class="form-grid">
+          <label class="field">Яндекс ID<select name="connection_id" id="mapConn" required><option value="">—</option></select></label>
+          <label class="field">Счётчик<select name="counter_id" id="mapCounter" required><option value="">Сначала выберите Яндекс ID</option></select></label>
+          <label class="field field-wide">ID кампаний Директа — через запятую или с новой строки<textarea name="campaign_keys" id="mapKeys" rows="2" required placeholder="713904508, 713988705"></textarea></label>
+          <label class="field field-wide">Заметка<input name="note" maxlength="120" placeholder="Необязательно"></label>
+        </div>
+        <div class="form-actions"><span id="mapMsg" class="form-message"></span><button class="button button-primary" type="submit">Привязать и создать цель lead</button></div>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>Кампания</th><th>Счётчик</th><th>Яндекс ID</th><th>Заметка</th><th></th></tr></thead><tbody id="mapRows"><tr><td colspan="5" class="empty">Загрузка…</td></tr></tbody></table></div>
+    </section>
+
+    <section id="log" class="panel">
+      <div class="panel-heading">
+        <div><div class="eyebrow">КОНТРОЛЬ</div><h2>Журнал отправки</h2></div>
+        <select id="logFilter" class="lk-select"><option value="">Все</option><option value="ok">Отправлено</option><option value="dry">Пробно</option><option value="failed">Ошибки</option><option value="skipped_no_id">Нет идентификатора</option></select>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>Время</th><th>Источник</th><th>Лид</th><th>Кампания</th><th>Счётчик</th><th>ID</th><th>Сумма</th><th>Результат</th></tr></thead><tbody id="logRows"><tr><td colspan="8" class="empty">Загрузка…</td></tr></tbody></table></div>
+    </section>
+
+    {% if is_admin %}
+    <section id="users" class="panel">
+      <div class="panel-heading"><div><div class="eyebrow">АДМИНИСТРАТОР</div><h2>Пользователи ЛК</h2><p class="muted small">Пользователь видит только свои кабинеты, источники и привязки. К остальным разделам приложения доступа у него нет.</p></div></div>
+      <form id="userForm" class="lk-form">
+        <div class="form-grid">
+          <label class="field">Логин<input name="username" required pattern="[A-Za-z0-9_.\-]{3,40}" autocomplete="off"></label>
+          <label class="field">Пароль, от 10 символов<input name="password" type="password" required minlength="10" autocomplete="new-password"></label>
+        </div>
+        <div class="form-actions"><span id="userMsg" class="form-message"></span><button class="button button-primary" type="submit">Создать пользователя</button></div>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>Логин</th><th>Создан</th><th></th></tr></thead><tbody id="userRows"><tr><td colspan="3" class="empty">Загрузка…</td></tr></tbody></table></div>
+    </section>
+    {% endif %}
+  </main>
+  <script>window.LK = {isAdmin: {{ 'true' if is_admin else 'false' }}};</script>
+  <script src="/static/lk.js" defer></script>
+</body>
+</html>

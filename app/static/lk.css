@@ -1,0 +1,19 @@
+.lk-form{margin:0 0 20px;padding:16px;border:1px solid #e4ebf3;border-radius:12px;background:#fafcff}
+.lk-form .field input,.lk-form .field select,.lk-form .field textarea,.lk-select{font:inherit;font-size:13px;padding:10px 11px;border:1px solid #d6e0ec;border-radius:8px;background:#fff;color:#182b45;width:100%}
+.lk-select{width:auto}
+.lk-form textarea{resize:vertical}
+.lk-check span{display:flex;gap:8px;align-items:center;font-weight:650}
+.lk-check input{width:auto}
+.lk-form small{font-weight:400}
+.lk-tag{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:650;background:#edf2f8;color:#34516f;white-space:nowrap}
+.lk-tag.ok{background:#e4f7ee;color:#12825b}
+.lk-tag.warn{background:#fff3da;color:#8b5a16}
+.lk-tag.err{background:#fde8e9;color:#bb3d44}
+.lk-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+.lk-status{max-width:340px;font-size:11px;color:#536f8e;margin-top:4px;word-break:break-word}
+.lk-unmapped button{margin:3px 4px 0 0}
+table code{font-size:11px;background:#f1f5fa;padding:1px 5px;border-radius:4px}
+.metrics-grid{margin-bottom:6px}
+
+.lk-run{display:inline-flex;align-items:center;gap:6px}
+.lk-hours{width:64px;padding:4px 6px}

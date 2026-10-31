@@ -2,3 +2,25 @@
 .metrika-setup{border-top:1px solid #e8eef5;margin-top:24px;padding-top:22px}.metrika-setup .panel-heading{align-items:flex-start;margin-bottom:14px}.metrika-setup h3{font-size:14px;margin:0 0 6px}.metrika-setup .panel-heading p{margin:0;max-width:640px;line-height:1.5}.metrika-setup-form{display:grid;grid-template-columns:1fr 1fr;gap:14px 16px}.metrika-setup-form .field:nth-child(3),.metrika-buttons{grid-column:1/-1}.metrika-buttons{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}.metrika-result{background:#f6fbf8;border:1px solid #d7eee1;border-radius:10px;padding:14px;margin-top:13px}.metrika-result-summary{font-size:12px;color:#1b6848;line-height:1.6;margin-bottom:14px}.snippet-row{display:flex;gap:8px;align-items:center}.snippet-row code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f1f5fa;border:1px solid #dfe7f0;border-radius:7px;padding:11px;display:block;overflow:auto;white-space:nowrap;flex:1;color:#2c4868;font-size:12px}.snippet-row .button{flex-shrink:0}.metrika-result .field{margin-top:6px}.metrika-result p{margin:12px 0 0;line-height:1.5}@media(max-width:760px){.metrika-setup .panel-heading{flex-direction:column}.metrika-setup-form{grid-template-columns:1fr}.metrika-setup-form .field:nth-child(3),.metrika-buttons{grid-column:auto}.metrika-buttons{flex-direction:column}.metrika-buttons .button{width:100%}.snippet-row{align-items:stretch;flex-direction:column}.snippet-row .button{width:100%}}
 
 .metrika-connections{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end;border:1px solid #e2eaf3;border-radius:10px;background:#fafcff;padding:14px;margin:14px 0 8px}.metrika-connection-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.metrika-connections .field{min-width:0}.metrika-connections select{max-width:100%}.metrika-connection-actions button:disabled{opacity:.45;cursor:not-allowed}.metrika-connection-actions .button{white-space:nowrap}@media(max-width:760px){.metrika-connections{grid-template-columns:1fr}.metrika-connection-actions{display:grid;grid-template-columns:1fr 1fr}.metrika-connection-actions button{white-space:normal}}
+.plan-item.error{background:#fff4f4}.plan-item.error strong{color:#a73542}.plan-item.error p{color:#a73542}.modal-overlay{position:fixed;inset:0;background:rgba(16,32,58,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px}
+.modal-box{background:#fff;border-radius:16px;max-width:640px;width:100%;max-height:88vh;overflow-y:auto;box-shadow:0 20px 60px rgba(10,25,50,.35)}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;border-bottom:1px solid #edf1f6;position:sticky;top:0;background:#fff;border-radius:16px 16px 0 0}
+.modal-head h2{margin:0;font-size:16px}
+.modal-close{border:0;background:transparent;font-size:22px;line-height:1;cursor:pointer;color:#8295ac;padding:4px 8px}
+.modal-body{padding:20px 22px}
+.wizard-steps{display:flex;gap:6px;margin-bottom:16px;font-size:10px;color:#9aabc0}
+.wizard-steps span{padding:4px 9px;border-radius:12px;background:#f1f5fa}
+.wizard-steps span.active{background:#286fdb;color:#fff;font-weight:700}
+.wizard-list{display:grid;gap:8px;margin-bottom:14px;max-height:260px;overflow-y:auto}
+.wizard-radio{display:flex;align-items:center;gap:10px;border:1px solid #e0e8f3;border-radius:9px;padding:11px 13px;cursor:pointer;font-size:12px}
+.wizard-radio:has(input:checked){border-color:#438cf2;background:#f4f8ff}
+.wizard-radio input{accent-color:#2878e7}
+.wizard-radio .muted{display:block;font-size:10px;margin-top:3px}
+.wizard-add{border:1px dashed #d9e2ed;border-radius:9px;padding:10px 13px;margin-bottom:14px}
+.wizard-add summary{cursor:pointer;font-size:12px;font-weight:650;color:#2767b5}
+.wizard-add .field{margin-top:10px}
+.wizard-actions{display:flex;justify-content:space-between;gap:10px;margin-top:18px}
+.wizard-creative-set{border:1px solid #e4ecf6;border-radius:9px;padding:12px;margin-bottom:10px}
+.wizard-creative-set h4{margin:0 0 8px;font-size:12px}
+.wizard-creative-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:600px){.wizard-creative-grid{grid-template-columns:1fr}.wizard-actions{flex-direction:column-reverse}.wizard-actions button{width:100%}}

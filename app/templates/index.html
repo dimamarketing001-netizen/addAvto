@@ -9,20 +9,20 @@
 <body>
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">D</div><div><strong>Direct Manager</strong><small>Click.ru · Яндекс Директ</small></div></div>
-    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Аккаунты и доступы</a><a class="nav-link" href="#reports">Отчётность</a></nav>
-    <div class="sidebar-foot"><span class="status-dot"></span> Локальная панель<small>Не запускает рекламу без проверки</small></div>
+    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Подключение Click.ru</a><a class="nav-link" href="#reports">Отчётность</a><a class="nav-link" href="/lk">Конверсии в Метрику</a></nav>
+    <div class="sidebar-foot"><span class="status-dot"></span> Локальная панель<small>Массовый запуск создаёт только черновики</small></div>
   </aside>
   <main class="main">
-    <header class="topbar"><div><div class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div><h1>Рекламные кампании</h1><p class="muted">Создание шаблонов для нескольких кабинетов и единая статистика.</p></div><button class="button button-ghost" id="refreshAll">Обновить данные ↻</button></header>
+    <header class="topbar"><div><div class="eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div><h1>Рекламные кампании</h1><p class="muted">Шаблон проекта → массовый запуск на новых аккаунтах из пула ParsYa.</p></div><button class="button button-ghost" id="refreshAll">Обновить данные ↻</button></header>
     <section id="overview" class="metrics-grid">
       <article class="metric-card"><div class="metric-label">Проекты</div><div class="metric-value" id="metricProjects">—</div><div class="metric-foot">Сохранённые шаблоны</div></article>
-      <article class="metric-card"><div class="metric-label">Аккаунты Click.ru</div><div class="metric-value" id="metricAccounts">—</div><div class="metric-foot" id="accountsFoot">Подключение не проверено</div></article>
-      <article class="metric-card"><div class="metric-label">Кампании по планам</div><div class="metric-value" id="metricPlanned">—</div><div class="metric-foot">Предпросмотр, не запуск</div></article>
-      <article class="metric-card"><div class="metric-label">Подключение</div><div class="metric-value metric-status" id="metricConnection">Не проверено</div><div class="metric-foot">Click.ru API</div></article>
+      <article class="metric-card"><div class="metric-label">Кампаний создано (пул)</div><div class="metric-value" id="metricBulkCreated">—</div><div class="metric-foot">Через массовый запуск</div></article>
+      <article class="metric-card"><div class="metric-label">Пул ParsYa</div><div class="metric-value metric-status" id="metricPoolStatus">—</div><div class="metric-foot" id="poolFoot">Не проверено</div></article>
+      <article class="metric-card"><div class="metric-label">Аккаунты Click.ru</div><div class="metric-value metric-status" id="metricConnection">—</div><div class="metric-foot">Подключено</div></article>
     </section>
     <section id="projects" class="panel">
       <div class="panel-heading"><div><div class="eyebrow">ШАБЛОН КАМПАНИИ</div><h2>Новый рекламный проект</h2></div><span class="chip">Настройки сохраняются</span></div>
-      <div class="notice notice-info">Выбери структуру размещения: раздельные кампании Поиск и РСЯ либо одна ЕПК, где включены оба места показа. На этом этапе приложение сохраняет проект и готовит план — не публикует объявления и не расходует бюджет.</div>
+      <div class="notice notice-info">Выбери структуру размещения: раздельные кампании Поиск и РСЯ либо одна ЕПК, где включены оба места показа. Счётчик Метрики, цель lead и сам рекламный аккаунт создаются автоматически для КАЖДОГО запуска из пула ParsYa — вручную их указывать не нужно.</div>
       <form id="projectForm">
         <div class="form-grid">
           <label class="field field-wide">Название проекта<input name="name" placeholder="Например, БФЛ — Казань" required maxlength="120"></label>
@@ -40,76 +40,31 @@
           <label class="field field-wide">Ключевые фразы — по одной на строку<textarea name="keywords" rows="3" placeholder="юрист по банкротству&#10;списание долгов"></textarea></label>
           <label class="field field-wide">Минус-фразы — по одной на строку<textarea name="negative_keywords" rows="2" placeholder="бесплатно&#10;вакансии"></textarea></label>
           <label class="field field-wide">Ссылки на изображения — по одной на строку<textarea name="image_urls" rows="2" placeholder="https://example.ru/banner.jpg"></textarea></label>
-          <label class="field field-wide">ID аккаунтов Click.ru — через запятую<input name="account_ids" placeholder="100001, 100002"><small>Можно выбрать любые кабинеты после проверки подключения. ID должны быть из вашего Click.ru.</small></label>
-          <label class="field">ID счётчика Метрики<input name="counter_id" type="number" min="1" placeholder="Необязательно"></label>
-          <label class="field">ID цели lead<input name="goal_id" type="number" min="1" placeholder="Необязательно"></label>
           <label class="field field-wide">ID регионов Яндекса — через запятую<input name="region_ids" placeholder="Например, 213"></label>
+          <label class="field">Корректировка ставки для мобильных, % (необязательно)<input name="mobile_bid_adjustment_percent" type="number" min="-100" max="1200" placeholder="например, -50"><small>-50 снизит ставку на мобильных на 50%, 200 — повысит в 2 раза. Пусто — без корректировки.</small></label>
         </div>
-        <div class="form-actions"><span class="muted small">Реальные изменения в Директе пока выключены.</span><button class="button button-primary" type="submit">Сохранить проект</button></div>
+        <div class="form-actions"><span class="muted small">Реальный запуск показов выполняется отдельным явным подтверждением.</span><button class="button button-primary" type="submit">Сохранить проект</button></div>
         <div id="formMessage" class="form-message" role="status"></div>
       </form>
     </section>
     <section class="panel">
       <div class="panel-heading"><div><div class="eyebrow">СОХРАНЁННЫЕ НАСТРОЙКИ</div><h2>Проекты</h2></div><button class="button button-ghost button-small" id="reloadProjects">Обновить список</button></div>
-      <div class="table-wrap"><table><thead><tr><th>Проект / домен</th><th>Режим</th><th>Стратегия</th><th>ДРР</th><th>Бюджет</th><th>Аккаунты</th><th></th></tr></thead><tbody id="projectsRows"><tr><td colspan="7" class="empty">Загрузка…</td></tr></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Проект / домен</th><th>Режим</th><th>Стратегия</th><th>ДРР</th><th>Бюджет</th><th></th></tr></thead><tbody id="projectsRows"><tr><td colspan="6" class="empty">Загрузка…</td></tr></tbody></table></div>
       <div id="planOutput" class="plan-output hidden"></div>
+      <div id="bulkOutput" class="plan-output hidden"></div>
     </section>
     <section id="connection" class="panel">
-      <div class="panel-heading"><div><div class="eyebrow">ИНТЕГРАЦИИ</div><h2>Аккаунты и доступы</h2></div><button id="checkConnection" class="button button-primary">Проверить Click.ru</button></div>
-      <div class="notice notice-warning">Токен, ранее отправленный в переписку, нужно отозвать и выпустить заново. Новый токен добавь только в серверный <code>.env</code>; он не сохраняется в этом интерфейсе и не должен попадать в Git.</div>
-      <div id="connectionMessage" class="connection-message">Нажмите «Проверить Click.ru», чтобы получить список интеграций и рекламных аккаунтов.</div>
-      <div class="connection-grid"><div><h3>Яндекс ID / интеграции</h3><div id="integrationsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div><div><h3>Рекламные кабинеты</h3><div id="accountsList" class="stack-list"><div class="empty">Пока нет данных</div></div></div></div>
-      <div class="account-create">
-        <h3>Создать рекламный аккаунт Яндекс Директа</h3>
-        <p class="muted small">Создаёт аккаунт через Click.ru и привязывает его к выбранной интеграции Яндекс ID. Запуск рекламы не выполняется.</p>
-        <form id="accountCreateForm" class="account-create-form">
-          <label class="field">Название кабинета<input name="name" required minlength="2" maxlength="120" placeholder="Например, БФЛ — Казань — 01"></label>
-          <label class="field">Подключённый Яндекс ID<select name="integration_id" id="directIntegrationId" required><option value="">Сначала проверьте Click.ru</option></select></label>
-          <button class="button button-primary" type="submit">Создать аккаунт</button>
-        </form>
-        <div id="accountCreateMessage" class="form-message" role="status"></div>
-      </div>
-
-      <div class="metrika-setup">
-        <div class="panel-heading">
-          <div><h3>Настройка Яндекс Метрики и цели lead</h3><p class="muted small">Подключи один или несколько Яндекс ID через OAuth. Токены хранятся зашифрованными на сервере и не передаются браузеру.</p></div>
-          <button id="connectMetrika" class="button button-primary" type="button">+ Подключить Яндекс ID</button>
-        </div>
-        <div class="notice notice-info">Первичная настройка OAuth-приложения Яндекса выполняется один раз. На сервере должны быть заданы Client ID, Client Secret, точный Redirect URI и ключ шифрования. Запрашиваются только права <code>metrika:read</code> и <code>metrika:write</code>.</div>
-        <div class="metrika-connections">
-          <label class="field">Подключённый Яндекс ID
-            <select id="metrikaConnectionId"><option value="">Загружаю подключения…</option></select>
-          </label>
-          <div class="metrika-connection-actions">
-            <button id="refreshMetrikaConnections" class="button button-ghost button-small" type="button">Обновить список</button>
-            <button id="disconnectMetrikaConnection" class="button button-ghost button-small" type="button" disabled>Отключить выбранный ID</button>
-          </div>
-        </div>
-        <div id="metrikaConnectionsStatus" class="form-message" role="status"></div>
-        <form id="metrikaSetupForm" class="metrika-setup-form">
-          <label class="field field-wide">Рекламный проект
-            <select name="project_id" id="metrikaProjectId" required><option value="">Сначала создайте проект</option></select>
-          </label>
-          <label class="field field-wide">Счётчик
-            <select name="counter_id" id="metrikaCounterId">
-              <option value="">Автоматически найти по домену проекта или создать новый</option>
-            </select>
-            <small>После проверки доступа можно загрузить существующие счётчики. Если оставить автоматический вариант, приложение найдёт счётчик нужного домена или создаст его, если не найдёт.</small>
-          </label>
-          <div class="metrika-buttons">
-            <button id="loadMetrikaCounters" class="button button-ghost" type="button">Загрузить счётчики</button>
-            <button class="button button-primary" type="submit">Настроить счётчик и цель lead</button>
-          </div>
-        </form>
-        <div id="metrikaMessage" class="form-message" role="status"></div>
-        <div id="metrikaResult" class="metrika-result hidden">
-          <div id="metrikaResultSummary" class="metrika-result-summary"></div>
-          <label class="field">Код события после успешной отправки заявки
-            <div class="snippet-row"><code id="metrikaSnippet"></code><button id="copyMetrikaSnippet" class="button button-ghost button-small" type="button">Копировать</button></div>
-          </label>
-          <p id="metrikaInstructions" class="muted small"></p>
-        </div>
-      </div>
+      <div class="panel-heading"><div><div class="eyebrow">ИНТЕГРАЦИИ</div><h2>Аккаунты Click.ru</h2></div></div>
+      <div class="notice notice-info">Можно подключить НЕСКОЛЬКО аккаунтов Click.ru (разные токены) — при массовом запуске проекта выбираешь, под каким из них создавать аккаунты и кампании. Токены хранятся на сервере, не показываются целиком после сохранения.</div>
+      <form id="connAddForm" class="account-create-form">
+        <label class="field">Название<input name="label" placeholder="Например, Основной кабинет" required minlength="2" maxlength="120"></label>
+        <label class="field">API-токен Click.ru<input name="token" type="password" required minlength="10"></label>
+        <label class="field">User ID (необязательно)<input name="user_id" placeholder="Для дочернего пользователя"></label>
+        <button class="button button-primary" type="submit">Добавить и проверить</button>
+      </form>
+      <div id="connAddMessage" class="form-message" role="status"></div>
+      <div class="table-wrap" style="margin-top:14px"><table><thead><tr><th>Название</th><th>Токен</th><th>User ID</th><th></th></tr></thead><tbody id="connRows"><tr><td colspan="4" class="empty">Загрузка…</td></tr></tbody></table></div>
+      <div class="notice notice-info" style="margin-top:16px">Рекламные аккаунты и подключение Яндекс ID/Метрики создаются автоматически внутри «Массового запуска» на каждый проект — отдельно создавать их здесь не нужно.</div>
     </section>
     <section id="reports" class="panel">
       <div class="panel-heading"><div><div class="eyebrow">СТАТИСТИКА</div><h2>Отчёт по расходам и трафику</h2></div><span class="chip">Click.ru API</span></div>
@@ -119,6 +74,12 @@
     </section>
     <footer>Direct Campaign Manager · MVP 0.1 · Не запускает и не включает рекламу</footer>
   </main>
+  <div id="wizardOverlay" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-head"><h2 id="wizardTitle">Массовый запуск</h2><button class="modal-close" id="wizardClose" type="button" aria-label="Закрыть">×</button></div>
+      <div id="wizardBody" class="modal-body"></div>
+    </div>
+  </div>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

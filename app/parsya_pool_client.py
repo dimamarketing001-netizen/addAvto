@@ -62,3 +62,35 @@ class ParsYaPoolClient:
         from urllib.parse import quote
 
         return await self._request(f"/api/addavto/yandex-pool-accounts/{quote(login, safe='')}")
+
+    async def provision_direct_account(self, account_name_prefix: str | None = None) -> dict[str, Any]:
+        """Claims one fresh pool login and runs the Selenium-driven
+        connect-to-Click.ru + create-Direct-account pipeline on WSL (see
+        connect_direct_account.py / provision_next_direct_account.py in
+        ParsYa). Slow — real browser automation, not a quick DB read like
+        the other methods here — budget up to ~3 minutes per call.
+        """
+        if not self.token:
+            raise ParsYaPoolError("PARSYA_POOL_API_TOKEN не задан в .env")
+        payload: dict[str, Any] = {}
+        if account_name_prefix:
+            payload["account_name_prefix"] = account_name_prefix
+        try:
+            async with httpx.AsyncClient(timeout=200.0, follow_redirects=False) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/addavto/provision-direct-account",
+                    headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise ParsYaPoolError("Провижининг аккаунта не успел завершиться вовремя.") from exc
+        except httpx.HTTPError as exc:
+            raise ParsYaPoolError(f"Ошибка соединения с ParsYa pool API: {type(exc).__name__}") from exc
+
+        if response.status_code >= 400:
+            try:
+                detail = str(response.json().get("detail"))
+            except ValueError:
+                detail = f"HTTP {response.status_code}"
+            raise ParsYaPoolError(detail, response.status_code)
+        return response.json()

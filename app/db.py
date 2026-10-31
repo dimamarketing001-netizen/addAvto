@@ -10,9 +10,15 @@ from typing import Any
 
 PROJECT_FIELDS = [
     "name", "domain", "campaign_mode", "strategy", "target_drr", "budget", "lead_value",
-    "headline", "ad_text", "keywords", "negative_keywords", "image_urls", "account_ids",
-    "counter_id", "goal_id", "region_ids", "metrika_pool_login",
+    "headline", "ad_text", "keywords", "negative_keywords", "image_urls",
+    "region_ids", "headlines", "ad_texts", "sitelinks_pool", "callouts_pool",
+    "mobile_bid_adjustment_percent",
 ]
+
+_JSON_PROJECT_FIELDS = (
+    "image_urls", "region_ids", "headlines", "ad_texts",
+    "sitelinks_pool", "callouts_pool",
+)
 
 
 def _db_path() -> Path:
@@ -44,17 +50,34 @@ def init_db() -> None:
                 keywords TEXT NOT NULL DEFAULT '',
                 negative_keywords TEXT NOT NULL DEFAULT '',
                 image_urls TEXT NOT NULL DEFAULT '[]',
-                account_ids TEXT NOT NULL DEFAULT '[]',
-                counter_id INTEGER,
-                goal_id INTEGER,
                 region_ids TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
         existing_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)")}
-        if "metrika_pool_login" not in existing_columns:
-            db.execute("ALTER TABLE projects ADD COLUMN metrika_pool_login TEXT")
+        for json_field in ("headlines", "ad_texts", "sitelinks_pool", "callouts_pool"):
+            if json_field not in existing_columns:
+                db.execute(f"ALTER TABLE projects ADD COLUMN {json_field} TEXT NOT NULL DEFAULT '[]'")
+        if "mobile_bid_adjustment_percent" not in existing_columns:
+            db.execute("ALTER TABLE projects ADD COLUMN mobile_bid_adjustment_percent INTEGER")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_campaigns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                pool_login TEXT,
+                account_id INTEGER,
+                campaign_id INTEGER,
+                connection_id INTEGER,
+                payer_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
+        bulk_columns = {row["name"] for row in db.execute("PRAGMA table_info(bulk_campaigns)")}
+        if "connection_id" not in bulk_columns:
+            db.execute("ALTER TABLE bulk_campaigns ADD COLUMN connection_id INTEGER")
+        if "payer_id" not in bulk_columns:
+            db.execute("ALTER TABLE bulk_campaigns ADD COLUMN payer_id INTEGER")
         db.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -62,6 +85,33 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS clickru_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                token TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS bulk_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                requested INTEGER NOT NULL,
+                created INTEGER NOT NULL DEFAULT 0,
+                items TEXT NOT NULL DEFAULT '[]',
+                error TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+        """)
+        # Per-user Yandex OAuth connections — NOT used by this app's own
+        # admin bulk-create flow (that's pool_login-only, see
+        # _metrika_context in main.py), but needed by the /lk "Конверсии в
+        # Метрику" module: each lk member connects their OWN Yandex ID here
+        # to pick a Metrika counter for Bitrix24 lead uploads (see lk.py).
         db.execute("""
             CREATE TABLE IF NOT EXISTS metrika_connections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +137,8 @@ def init_db() -> None:
                 label TEXT NOT NULL,
                 code_verifier_enc TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                return_to TEXT NOT NULL DEFAULT '/'
             )
         """)
 
@@ -98,7 +149,7 @@ def _now() -> str:
 
 def _dump_project(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
-    for key in ("image_urls", "account_ids", "region_ids"):
+    for key in _JSON_PROJECT_FIELDS:
         item[key] = json.loads(item[key] or "[]")
     return item
 
@@ -121,7 +172,7 @@ def create_project(data: dict[str, Any]) -> dict[str, Any]:
     values: list[Any] = []
     for field in fields:
         value = data.get(field)
-        if field in ("image_urls", "account_ids", "region_ids"):
+        if field in _JSON_PROJECT_FIELDS:
             value = json.dumps(value or [], ensure_ascii=False)
         values.append(value)
     placeholders = ", ".join("?" for _ in fields)
@@ -146,7 +197,7 @@ def update_project(project_id: int, data: dict[str, Any]) -> dict[str, Any] | No
         if field not in data:
             continue
         value = data[field]
-        if field in ("image_urls", "account_ids", "region_ids"):
+        if field in _JSON_PROJECT_FIELDS:
             value = json.dumps(value or [], ensure_ascii=False)
         assignments.append(f"{field} = ?")
         values.append(value)
@@ -157,6 +208,30 @@ def update_project(project_id: int, data: dict[str, Any]) -> dict[str, Any] | No
     with connect() as db:
         db.execute(f"UPDATE projects SET {', '.join(assignments)} WHERE id = ?", values)
     return get_project(project_id)
+
+
+def record_bulk_campaign(
+    project_id: int,
+    pool_login: str | None,
+    account_id: int | None,
+    campaign_id: int | None,
+    connection_id: int | None = None,
+    payer_id: int | None = None,
+) -> None:
+    with connect() as db:
+        db.execute(
+            "INSERT INTO bulk_campaigns(project_id, pool_login, account_id, campaign_id, "
+            "connection_id, payer_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, pool_login, account_id, campaign_id, connection_id, payer_id, _now()),
+        )
+
+
+def list_bulk_campaigns(project_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM bulk_campaigns WHERE project_id = ? ORDER BY id DESC", (project_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def delete_project(project_id: int) -> bool:
@@ -180,6 +255,104 @@ def set_setting(key: str, value: Any) -> None:
         )
 
 
+# --- Click.ru connections: multiple master-account API tokens, selectable
+# per launch (see main.py's ClickRUClient(token=...) override). Tokens are
+# stored in plain SQLite, same trust level as CLICKRU_API_TOKEN already had
+# in plain .env — not Fernet-encrypted (that machinery was removed with the
+# old Metrika OAuth flow, see TASKS.md 2026-10-31).
+
+def create_clickru_connection(label: str, token: str, user_id: str = "") -> dict[str, Any]:
+    with connect() as db:
+        cursor = db.execute(
+            "INSERT INTO clickru_connections(label, token, user_id, created_at) VALUES (?, ?, ?, ?)",
+            (label, token, user_id, _now()),
+        )
+        connection_id = int(cursor.lastrowid)
+        row = db.execute("SELECT * FROM clickru_connections WHERE id = ?", (connection_id,)).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def list_clickru_connections() -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute("SELECT * FROM clickru_connections ORDER BY id DESC").fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_clickru_connection(connection_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT * FROM clickru_connections WHERE id = ?", (connection_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_clickru_connection(connection_id: int) -> bool:
+    with connect() as db:
+        cursor = db.execute("DELETE FROM clickru_connections WHERE id = ?", (connection_id,))
+        return cursor.rowcount > 0
+
+
+# --- Bulk-create runs as a background job (2026-10-31) rather than inside
+# the request/response cycle: provisioning N accounts one at a time through
+# a real browser plus the Click.ru API can take many minutes, which risked
+# a client/proxy timeout losing the final response even though the server
+# kept working and persisting bulk_campaigns rows regardless. The job row
+# here is what the UI polls for progress instead.
+
+def _dump_job(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["items"] = json.loads(item["items"] or "[]")
+    return item
+
+
+def create_bulk_job(project_id: int, requested: int) -> int:
+    with connect() as db:
+        cursor = db.execute(
+            "INSERT INTO bulk_jobs(project_id, status, requested, created, items, started_at) "
+            "VALUES (?, 'running', ?, 0, '[]', ?)",
+            (project_id, requested, _now()),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_running_bulk_job(project_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute(
+            "SELECT * FROM bulk_jobs WHERE project_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    return _dump_job(row) if row else None
+
+
+def get_bulk_job(job_id: int) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT * FROM bulk_jobs WHERE id = ?", (job_id,)).fetchone()
+    return _dump_job(row) if row else None
+
+
+def append_bulk_job_item(job_id: int, item: dict[str, Any]) -> None:
+    job = get_bulk_job(job_id)
+    if job is None:
+        return
+    items = job["items"]
+    items.append(item)
+    created = sum(1 for entry in items if entry.get("status") == "created")
+    with connect() as db:
+        db.execute(
+            "UPDATE bulk_jobs SET items = ?, created = ? WHERE id = ?",
+            (json.dumps(items, ensure_ascii=False), created, job_id),
+        )
+
+
+def finish_bulk_job(job_id: int, status: str, error: str | None = None) -> None:
+    with connect() as db:
+        db.execute(
+            "UPDATE bulk_jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?",
+            (status, error, _now(), job_id),
+        )
+
+
+# --- Per-user Yandex OAuth connections, used by /lk (see init_db() above
+# for why this exists alongside the pool-only admin flow).
 
 def save_metrika_oauth_state(
     state_hash: str,
@@ -187,14 +360,15 @@ def save_metrika_oauth_state(
     label: str,
     code_verifier_enc: str,
     expires_at: str,
+    return_to: str = "/",
 ) -> None:
     with connect() as db:
         db.execute("DELETE FROM metrika_oauth_states WHERE expires_at < ?", (_now(),))
         db.execute(
             """INSERT INTO metrika_oauth_states
-               (state_hash, owner_username, label, code_verifier_enc, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (state_hash, owner_username, label, code_verifier_enc, expires_at, _now()),
+               (state_hash, owner_username, label, code_verifier_enc, expires_at, created_at, return_to)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (state_hash, owner_username, label, code_verifier_enc, expires_at, _now(), return_to),
         )
 
 
@@ -299,3 +473,4 @@ def delete_metrika_connection(connection_id: int, owner_username: str) -> bool:
             (connection_id, owner_username),
         )
     return cursor.rowcount > 0
+

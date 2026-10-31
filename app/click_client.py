@@ -16,12 +16,19 @@ class ClickRUError(RuntimeError):
 
 
 class ClickRUClient:
-    """Minimal Click.ru API client. Secrets are read only from environment variables."""
+    """Minimal Click.ru API client. By default reads the token from
+    CLICKRU_API_TOKEN in .env (back-compat — ParsYa's connect_direct_account.py
+    always calls this through addAvto's HTTP API, never constructs this
+    class itself, so that caller is unaffected either way). An explicit
+    `token` overrides it — used when the operator picked a specific stored
+    Click.ru connection (see db.py's clickru_connections table) instead of
+    the single env-configured master account.
+    """
 
-    def __init__(self) -> None:
+    def __init__(self, token: str | None = None, user_id: str | None = None) -> None:
         self.base_url = os.getenv("CLICKRU_API_BASE_URL", "https://api.click.ru/V0").rstrip("/")
-        self.token = os.getenv("CLICKRU_API_TOKEN", "").strip()
-        self.user_id = os.getenv("CLICKRU_USER_ID", "").strip()
+        self.token = (token if token is not None else os.getenv("CLICKRU_API_TOKEN", "")).strip()
+        self.user_id = (user_id if user_id is not None else os.getenv("CLICKRU_USER_ID", "")).strip()
         self.timeout = float(os.getenv("CLICKRU_TIMEOUT_SECONDS", "30"))
 
     @property
@@ -127,12 +134,425 @@ class ClickRUClient:
         return rows
 
 
-    async def create_direct_account(self, name: str, integration_id: int) -> dict[str, Any]:
-        response = await self._request(
-            "POST",
-            "/accounts",
-            json={"service": "DIRECT", "name": name, "integrationId": integration_id},
-        )
+    async def payers(self) -> list[dict[str, Any]]:
+        """GET /users/payers — legal entities (юрлица) available under this
+        Click.ru master account, with their balance. Needed before any real
+        campaign launch: Russian ad-marking law (ОРД/маркировка, ERID)
+        requires ads to be tied to a registered payer/legal entity.
+        Юрлица/реквизиты/договоры themselves are set up manually in the
+        Click.ru dashboard, not through this API — this call is read-only.
+        """
+        response = await self._request("GET", "/users/payers")
+        data = response.json()
+        envelope = data.get("response", data)
+        if isinstance(envelope, dict):
+            return envelope.get("payers", []) or envelope.get("items", [])
+        return envelope if isinstance(envelope, list) else []
+
+    async def marking_schema(self, account_id: int) -> dict[str, Any]:
+        """GET /markings/schemas/account?accountId=<id> — whether this
+        Direct account has a marking (ОРД/ERID) scheme configured, and
+        what it requires. MUST be checked and confirmed configured before
+        any real campaign launch (activating a DRAFT campaign) — creating
+        a DRAFT itself doesn't need this, only actually serving ads does.
+        """
+        response = await self._request("GET", "/markings/schemas/account", params={"accountId": account_id})
         data = response.json()
         envelope = data.get("response", data)
         return envelope if isinstance(envelope, dict) else {"result": envelope}
+
+    async def create_direct_account(
+        self, name: str, integration_id: int, payer_id: int | None = None
+    ) -> dict[str, Any]:
+        """payer_id is passed through as `payerId` if given — NOT confirmed
+        live whether Click.ru's POST /accounts actually accepts/uses it at
+        creation time, or whether the payer/ERID marking is always a
+        separate manual step in the dashboard afterwards (see TASKS.md,
+        "payerId в POST /accounts не выяснено"). Omitted from the body
+        entirely when not given, so this stays a no-op change until that's
+        confirmed.
+        """
+        body: dict[str, Any] = {"service": "DIRECT", "name": name, "integrationId": integration_id}
+        if payer_id is not None:
+            body["payerId"] = payer_id
+        response = await self._request("POST", "/accounts", json=body)
+        data = response.json()
+        envelope = data.get("response", data)
+        return envelope if isinstance(envelope, dict) else {"result": envelope}
+
+    async def direct_api(
+        self,
+        client_login: str,
+        method_path: str,
+        body: dict[str, Any],
+        api_version: str = "v5",
+    ) -> dict[str, Any]:
+        """Low-level pass-through to Yandex Direct API v5 via Click.ru's
+        proxy (POST /api_proxy/yandex_direct). `method_path` is the Direct
+        API endpoint, e.g. "campaigns" for Campaigns.add/get. Click.ru
+        injects the OAuth token for the integration behind `client_login`
+        server-side — we only say which Direct account to act on.
+
+        Yandex Direct API v5 itself returns HTTP 200 even for method-level
+        errors (error details live inside the JSON body), so errors are
+        checked there, not via HTTP status.
+        """
+        url = f"https://api.direct.yandex.com/json/{api_version}/{method_path.lstrip('/')}"
+        response = await self._request(
+            "POST",
+            "/api_proxy/yandex_direct",
+            params={"url": url},
+            headers={"Client-Login": client_login},
+            json=body,
+        )
+        data = response.json()
+        if isinstance(data, dict) and "error" in data:
+            error = data["error"]
+            raise ClickRUError(
+                f"Yandex Direct API error {error.get('error_code')}: "
+                f"{error.get('error_string')} — {error.get('error_detail')}",
+                response.status_code,
+            )
+        return data
+
+    async def create_draft_text_campaign(
+        self,
+        client_login: str,
+        name: str,
+        start_date: str,
+        average_cpc_micros: int = 10_000_000,
+        target_drr: float | None = None,
+        goal_id: int | None = None,
+    ) -> int:
+        """Creates a minimal valid TextCampaign. Confirmed live 2026-10-26:
+        a freshly-created campaign is a DRAFT by default — it cannot serve
+        or spend until ads are added and it passes moderation, and Yandex
+        itself refuses Campaigns.suspend on a draft ("Кампания является
+        черновиком и не может быть остановлена") because there's nothing
+        to stop. So no extra "make it safe" step is needed here — don't
+        add one back without a real reason; it'll just error.
+
+        BiddingStrategyType SERVING_OFF on both Search and Network at
+        creation time is rejected by Yandex Direct ("these strategies are
+        not compatible") — SERVING_OFF is only a valid later *update* on an
+        existing campaign, not a creation-time combination.
+
+        Default strategy is a minimal AVERAGE_CPC (kept for the existing
+        single-campaign endpoint). When target_drr+goal_id are given (the
+        bulk-generation flow, which always uses ДРР per product decision),
+        use AVERAGE_CRR instead — it REQUIRES a Metrica GoalId (the 'lead'
+        goal set up via /metrika/setup), there's no CRR strategy without one.
+        """
+        if target_drr is not None and goal_id is not None:
+            search_block: dict[str, Any] = {
+                "BiddingStrategyType": "AVERAGE_CRR",
+                "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
+            }
+            # Seen live: AVERAGE_CRR on BOTH Search and Network is rejected
+            # ("these strategies are not compatible") — same rule as
+            # AVERAGE_CPC below, Network takes NETWORK_DEFAULT regardless of
+            # what Search uses, not a mirrored copy of it.
+            network_block: dict[str, Any] = {
+                "BiddingStrategyType": "NETWORK_DEFAULT",
+                "NetworkDefault": {"LimitPercent": 100},
+            }
+        else:
+            search_block = {
+                "BiddingStrategyType": "AVERAGE_CPC",
+                "AverageCpc": {"AverageCpc": average_cpc_micros},
+            }
+            network_block = {
+                "BiddingStrategyType": "NETWORK_DEFAULT",
+                # LimitPercent is accepted but flagged "not supported
+                # for this strategy" (warning, not error) — harmless,
+                # kept only because an empty {} here gets misread as
+                # an array by Click.ru's (PHP) backend.
+                "NetworkDefault": {"LimitPercent": 100},
+            }
+
+        body = {
+            "method": "add",
+            "params": {
+                "Campaigns": [
+                    {
+                        "Name": name,
+                        "StartDate": start_date,
+                        "TextCampaign": {
+                            "BiddingStrategy": {
+                                "Search": search_block,
+                                "Network": network_block,
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+        return await self._add_campaign(client_login, body)
+
+    async def create_draft_unified_campaign(
+        self,
+        client_login: str,
+        name: str,
+        start_date: str,
+        target_drr: float,
+        goal_id: int,
+    ) -> int:
+        """Creates a minimal valid UnifiedCampaign (ЕПК — Search + РСЯ in
+        one campaign). NOT yet confirmed live against the real Direct API
+        the way create_draft_text_campaign is (that one has "seen live"
+        notes throughout from iterative real testing) — this mirrors the
+        same AVERAGE_CRR/NETWORK_DEFAULT Search+Network shape documented
+        for Direct API v5's UnifiedCampaign, by analogy with TextCampaign,
+        since both expose the same BiddingStrategy vocabulary. Test with
+        a single real campaign (bulk-create count=1, campaign_mode=
+        single_epk) before relying on this for real ЕПК launches — if
+        Yandex rejects the shape, the error message from Errors will say
+        why and this needs a live-debugging pass same as the TextCampaign
+        constraints were found (SERVING_OFF/AVERAGE_CRR-on-both-blocks
+        rejections documented above).
+        """
+        body = {
+            "method": "add",
+            "params": {
+                "Campaigns": [
+                    {
+                        "Name": name,
+                        "StartDate": start_date,
+                        "UnifiedCampaign": {
+                            "BiddingStrategy": {
+                                "Search": {
+                                    "BiddingStrategyType": "AVERAGE_CRR",
+                                    "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
+                                },
+                                "Network": {
+                                    "BiddingStrategyType": "NETWORK_DEFAULT",
+                                    "NetworkDefault": {"LimitPercent": 100},
+                                },
+                            },
+                        },
+                    }
+                ]
+            },
+        }
+        return await self._add_campaign(client_login, body)
+
+    async def _add_campaign(self, client_login: str, body: dict[str, Any]) -> int:
+        data = await self.direct_api(client_login, "campaigns", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось создать кампанию: {errors}")
+        return int(first["Id"])
+
+    async def create_adgroup(
+        self, client_login: str, campaign_id: int, name: str, region_ids: list[int]
+    ) -> int:
+        """AdGroups.add for a TextAdGroup — minimal required fields only
+        (Name, CampaignId, RegionIds). Keywords and ads are separate calls
+        (Keywords.add / Ads.add), not nestable here.
+        """
+        body = {
+            "method": "add",
+            "params": {"AdGroups": [{"Name": name, "CampaignId": campaign_id, "RegionIds": region_ids}]},
+        }
+        data = await self.direct_api(client_login, "adgroups", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось создать группу объявлений: {errors}")
+        return int(first["Id"])
+
+    async def add_keywords(self, client_login: str, ad_group_id: int, phrases: list[str]) -> list[int]:
+        """Keywords.add — one call for all phrases in this ad group. Partial
+        failure (some phrases rejected, others fine) raises with every
+        rejected phrase named, rather than silently dropping any.
+        """
+        if not phrases:
+            return []
+        body = {
+            "method": "add",
+            "params": {"Keywords": [{"Keyword": phrase, "AdGroupId": ad_group_id} for phrase in phrases]},
+        }
+        data = await self.direct_api(client_login, "keywords", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        ids: list[int] = []
+        failures: list[str] = []
+        for phrase, item in zip(phrases, add_results):
+            if item.get("Errors"):
+                detail = "; ".join(e.get("Message", "") for e in item["Errors"])
+                failures.append(f"{phrase!r}: {detail}")
+            else:
+                ids.append(int(item["Id"]))
+        if failures:
+            raise ClickRUError("Не все ключевые фразы добавлены: " + "; ".join(failures))
+        return ids
+
+    async def create_text_ad(
+        self,
+        client_login: str,
+        ad_group_id: int,
+        title: str,
+        text: str,
+        href: str,
+        title2: str | None = None,
+        ad_image_hash: str | None = None,
+        sitelink_set_id: int | None = None,
+        ad_extension_ids: list[int] | None = None,
+    ) -> int:
+        """Ads.add for a single TextAd. Title <=56 chars, Text <=81 chars,
+        Title2 <=30 chars — Yandex Direct enforces this itself with a clear
+        error; not pre-truncated here, since silently cutting ad copy is
+        worse than a loud validation failure.
+        """
+        text_ad: dict[str, Any] = {"Title": title, "Text": text, "Href": href, "Mobile": "NO"}
+        if title2:
+            text_ad["Title2"] = title2
+        if ad_image_hash:
+            text_ad["AdImageHash"] = ad_image_hash
+        if sitelink_set_id:
+            text_ad["SitelinkSetId"] = sitelink_set_id
+        if ad_extension_ids:
+            text_ad["AdExtensionIds"] = ad_extension_ids
+
+        body = {
+            "method": "add",
+            "params": {"Ads": [{"AdGroupId": ad_group_id, "TextAd": text_ad}]},
+        }
+        data = await self.direct_api(client_login, "ads", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось создать объявление: {errors}")
+        return int(first["Id"])
+
+    async def create_sitelinks_set(
+        self, client_login: str, sitelinks: list[dict[str, str]]
+    ) -> int:
+        """Sitelinks.add — one set of 1-8 {Title (<=30), Href, Description
+        (<=60)} items, referenced from a TextAd via SitelinkSetId. A set is
+        immutable-by-reuse in Yandex Direct's model (campaigns reference a
+        set, not individual links), so each campaign that wants a different
+        combination needs its own set.
+        """
+        body = {
+            "method": "add",
+            "params": {"SitelinksSets": [{"Sitelinks": sitelinks}]},
+        }
+        data = await self.direct_api(client_login, "sitelinks", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось создать быстрые ссылки: {errors}")
+        return int(first["Id"])
+
+    async def create_callout(self, client_login: str, text: str) -> int:
+        """AdExtensions.add for ONE callout (<=25 chars). Each callout gets
+        its own AdExtensionId; a TextAd references up to 50 of them via
+        AdExtensionIds — unlike sitelinks, callouts are added individually
+        and referenced as a list, not grouped into a set server-side.
+        """
+        body = {
+            "method": "add",
+            "params": {"AdExtensions": [{"Callout": {"CalloutText": text}}]},
+        }
+        data = await self.direct_api(client_login, "adextensions", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось создать уточнение: {errors}")
+        return int(first["Id"])
+
+    async def resume_campaign(self, client_login: str, campaign_id: int) -> None:
+        """Campaigns.resume — the ONLY step in this whole app that actually
+        makes a campaign eligible to serve and spend budget (every campaign
+        created here starts DRAFT/OFF). Caller MUST have already confirmed
+        an ОРД/ERID marking scheme is configured for the account (see
+        ClickRUClient.marking_schema) — Yandex itself may also reject this
+        if marking isn't set up, but that check should happen earlier so
+        the operator sees a clear reason before this call, not a cryptic
+        Direct API error.
+        """
+        body = {
+            "method": "resume",
+            "params": {"SelectionCriteria": {"Ids": [campaign_id]}},
+        }
+        data = await self.direct_api(client_login, "campaigns", body)
+        resume_results = (data.get("result") or {}).get("ResumeResults") or []
+        if not resume_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = resume_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось запустить кампанию: {errors}")
+
+    async def add_mobile_bid_adjustment(self, client_login: str, campaign_id: int, percent: int) -> None:
+        """BidModifiers.add — a campaign-level "корректировка ставки" for
+        mobile traffic (percent relative to the base bid; Direct allows
+        only ONE mobile adjustment per campaign and rejects a second add).
+        No OperatingSystemType given = applies to all mobile OSes as one
+        blanket adjustment, the simplest useful case.
+        """
+        body = {
+            "method": "add",
+            "params": {"BidModifiers": [{"CampaignId": campaign_id, "MobileAdjustment": {"BidModifier": percent}}]},
+        }
+        data = await self.direct_api(client_login, "bidmodifiers", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось настроить корректировку для мобильных: {errors}")
+
+    async def suspend_campaign(self, client_login: str, campaign_id: int) -> None:
+        """Campaigns.suspend — the kill-switch counterpart to resume_campaign.
+        Stops serving without deleting anything; the campaign can be resumed
+        again later. Added 2026-10-31 alongside the bulk-launch wizard so a
+        mass-activated batch always has an equally direct way to stop.
+        """
+        body = {
+            "method": "suspend",
+            "params": {"SelectionCriteria": {"Ids": [campaign_id]}},
+        }
+        data = await self.direct_api(client_login, "campaigns", body)
+        suspend_results = (data.get("result") or {}).get("SuspendResults") or []
+        if not suspend_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = suspend_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось остановить кампанию: {errors}")
+
+    async def upload_ad_image(self, client_login: str, name: str, image_base64: str) -> str:
+        """AdImages.add — Yandex Direct takes the raw image as base64, never
+        a URL (the caller downloads the image first, see main.py). Returns
+        AdImageHash, referenced from a TextAd via AdImageHash."""
+        body = {
+            "method": "add",
+            "params": {"AdImages": [{"ImageData": image_base64, "Name": name[:255]}]},
+        }
+        data = await self.direct_api(client_login, "adimages", body)
+        add_results = (data.get("result") or {}).get("AddResults") or []
+        if not add_results:
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        first = add_results[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Не удалось загрузить изображение: {errors}")
+        return str(first["AdImageHash"])

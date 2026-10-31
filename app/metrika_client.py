@@ -70,8 +70,13 @@ class YandexMetrikaClient:
         return data if isinstance(data, dict) else {}
 
     async def list_counters(self) -> list[dict[str, Any]]:
+        # "code" isn't a real field name here (confirmed against Yandex's
+        # own docs — valid values are goals/mirrors/grants/filters/
+        # operations/counter_flags/measurement_tokens) — Metrika rejects it
+        # outright with "Wrong parameter: 'field', value: 'code'". The
+        # counter's own id/name are already in the base response regardless.
         data = await self._request(
-            "GET", "/management/v1/counters", params={"field": "code,goals"}
+            "GET", "/management/v1/counters", params={"field": "goals"}
         )
         items = data.get("counters", [])
         return items if isinstance(items, list) else []
@@ -87,7 +92,7 @@ class YandexMetrikaClient:
         data = await self._request(
             "POST",
             "/management/v1/counters",
-            params={"field": "code,goals"},
+            params={"field": "goals"},
             json={"counter": {"name": name, "site": site}},
         )
         counter = data.get("counter")
@@ -114,3 +119,29 @@ class YandexMetrikaClient:
         if not isinstance(created, dict) or not created.get("id"):
             raise MetrikaAPIError("Метрика не вернула ID созданной цели lead.")
         return created
+
+    async def upload_offline_conversions(self, counter_id: int, csv_text: str) -> dict[str, Any]:
+        """Загрузка офлайн-конверсий (тот же формат, что у offCon-hourly)."""
+        url = f"{self.BASE_URL}/management/v1/counter/{int(counter_id)}/offline_conversions/upload"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                response = await client.post(
+                    url,
+                    headers={"Authorization": f"OAuth {self.access_token}", "Accept": "application/json"},
+                    files={"file": ("conversions.csv", csv_text.encode("utf-8"), "text/csv")},
+                )
+        except httpx.TimeoutException as exc:
+            raise MetrikaAPIError("Яндекс.Метрика не ответила вовремя.") from exc
+        except httpx.HTTPError as exc:
+            raise MetrikaAPIError(f"Ошибка соединения с Яндекс.Метрикой: {type(exc).__name__}") from exc
+        if response.status_code in (401, 403):
+            raise MetrikaAPIError("Нет прав на загрузку конверсий в этот счётчик. Переподключите Яндекс ID.", response.status_code)
+        if response.status_code == 429:
+            raise MetrikaAPIError("Яндекс.Метрика ограничила частоту запросов.", 429)
+        if response.status_code >= 400:
+            raise MetrikaAPIError(f"Метрика отклонила загрузку (HTTP {response.status_code}): {response.text[:200]}", response.status_code)
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}

@@ -13,8 +13,7 @@ def test_single_epk_mode_is_available():
 
 
 def test_ids_are_deduplicated():
-    project = ProjectIn(name="Example project", domain="example.ru", account_ids=[123, 123, 456], region_ids=[213, 213])
-    assert project.account_ids == [123, 456]
+    project = ProjectIn(name="Example project", domain="example.ru", region_ids=[213, 213])
     assert project.region_ids == [213]
 
 
