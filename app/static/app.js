@@ -216,6 +216,7 @@ const wizard = {
   adsPerGroup: 1,
   pool: {headlines: "", ad_texts: "", image_urls: "", callouts: "", sitelinks: ""},
   manualSets: [],
+  regionSelections: null,
 };
 const WIZARD_STEP_LABELS = ["1. Проект", "2. Аккаунт Click.ru", "3. Юрлицо", "4. Количество", "5. Креативы"];
 function wizardStepsNav(activeStep) {
@@ -229,6 +230,14 @@ byId("wizardOverlay").addEventListener("click", (event) => { if (event.target.id
 byId("wizardBody").addEventListener("change", (event) => {
   if (event.target.name === "wizConn") wizard.connectionId = Number(event.target.value);
   if (event.target.name === "wizPayer") wizard.payerId = Number(event.target.value);
+});
+document.addEventListener("click", (event) => {
+  const suggestionsBox = byId("wizPRegionSuggestions");
+  const searchInput = byId("wizPRegionSearch");
+  if (suggestionsBox && !suggestionsBox.classList.contains("hidden") &&
+      !suggestionsBox.contains(event.target) && event.target !== searchInput) {
+    suggestionsBox.classList.add("hidden");
+  }
 });
 
 function seedCreativePools(project) {
@@ -264,13 +273,38 @@ async function openWizard(projectId) {
   wizard.adsPerGroup = 1;
   seedCreativePools(project);
   wizard.manualSets = [];
+  wizard.regionSelections = null;
   byId("wizardOverlay").classList.remove("hidden");
   renderWizardStep1();
 }
 
-function renderWizardStep1() {
+let geoRegionsCache = null;
+async function loadGeoRegions() {
+  if (geoRegionsCache) return geoRegionsCache;
+  try {
+    const data = await api("/api/geo-regions");
+    geoRegionsCache = data.items || [];
+  } catch (error) {
+    geoRegionsCache = [];
+  }
+  return geoRegionsCache;
+}
+function geoRegionLabel(region) {
+  const parent = region.parents && region.parents.length ? region.parents[region.parents.length - 1] : "";
+  return parent ? region.name + " (" + parent + ")" : region.name;
+}
+
+async function renderWizardStep1() {
   const body = byId("wizardBody");
   const p = wizard.project || {};
+  if (!wizard.regionSelections) {
+    const regions = await loadGeoRegions();
+    const byId_ = new Map(regions.map((r) => [r.id, r]));
+    wizard.regionSelections = (p.region_ids || []).map((id) => {
+      const r = byId_.get(id);
+      return {id, label: r ? geoRegionLabel(r) : ("ID " + id)};
+    });
+  }
   body.innerHTML = wizardStepsNav(1) +
     '<div class="form-grid">' +
       '<label class="field field-wide">Название проекта<input id="wizPName" value="' + esc(p.name || "") + '" required maxlength="120" placeholder="Например, БФЛ — Казань"></label>' +
@@ -283,11 +317,71 @@ function renderWizardStep1() {
       '<label class="field">Корректировка ставки для мобильных, % (необязательно)<input id="wizPMobile" type="number" min="-100" max="1200" value="' + esc(p.mobile_bid_adjustment_percent ?? "") + '" placeholder="например, -50"></label>' +
       '<label class="field field-wide">Ключевые фразы — по одной на строку<textarea id="wizPKeywords" rows="3" placeholder="юрист по банкротству&#10;списание долгов">' + esc(p.keywords || "") + '</textarea></label>' +
       '<label class="field field-wide">Минус-фразы — по одной на строку (общие для группы, у Яндекса лимит 3 фразы)<textarea id="wizPNegative" rows="2" placeholder="бесплатно&#10;вакансии">' + esc(p.negative_keywords || "") + '</textarea></label>' +
-      '<label class="field field-wide">ID регионов Яндекса — через запятую<input id="wizPRegions" value="' + esc((p.region_ids || []).join(", ")) + '" placeholder="Например, 213"></label>' +
+      '<label class="field field-wide">Город или регион показа<input id="wizPRegionSearch" autocomplete="off" placeholder="Начните вводить название города или региона…">' +
+        '<div id="wizPRegionSuggestions" class="geo-suggestions hidden"></div>' +
+        '<div id="wizPRegionChips" class="geo-chips"></div>' +
+      '</label>' +
     '</div>' +
     '<div class="wizard-actions"><span></span><button class="button button-primary" id="wizNext1" type="button">Далее →</button></div>' +
     '<div id="wizPMessage" class="form-message" role="status"></div>';
+
+  renderGeoChips();
+  const searchInput = body.querySelector("#wizPRegionSearch");
+  let searchDebounce = null;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => renderGeoSuggestions(searchInput.value), 150);
+  });
+  searchInput.addEventListener("focus", () => renderGeoSuggestions(searchInput.value));
+
   body.querySelector("#wizNext1").addEventListener("click", wizardSaveProjectStep);
+}
+
+function renderGeoSuggestions(query) {
+  const suggestionsBox = byId("wizPRegionSuggestions");
+  if (!suggestionsBox) return;
+  const term = query.trim().toLowerCase().replace(/ё/g, "е");
+  if (!term) { suggestionsBox.classList.add("hidden"); suggestionsBox.innerHTML = ""; return; }
+  const selectedIds = new Set(wizard.regionSelections.map((r) => r.id));
+  const matches = (geoRegionsCache || [])
+    .filter((r) => !selectedIds.has(r.id) && r.name.toLowerCase().replace(/ё/g, "е").includes(term))
+    .slice(0, 20);
+  if (!matches.length) {
+    suggestionsBox.innerHTML = '<div class="geo-suggestion" style="cursor:default;color:#8494a8">Ничего не найдено</div>';
+    suggestionsBox.classList.remove("hidden");
+    return;
+  }
+  suggestionsBox.innerHTML = matches.map((r) =>
+    '<button type="button" class="geo-suggestion" data-region-id="' + r.id + '">' + esc(r.name) +
+    (r.parents && r.parents.length ? '<small>' + esc(r.parents[r.parents.length - 1]) + '</small>' : '') +
+    '</button>'
+  ).join("");
+  suggestionsBox.classList.remove("hidden");
+  suggestionsBox.querySelectorAll("[data-region-id]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.dataset.regionId);
+      const region = (geoRegionsCache || []).find((r) => r.id === id);
+      wizard.regionSelections.push({id, label: region ? geoRegionLabel(region) : ("ID " + id)});
+      byId("wizPRegionSearch").value = "";
+      suggestionsBox.classList.add("hidden");
+      renderGeoChips();
+    });
+  });
+}
+
+function renderGeoChips() {
+  const box = byId("wizPRegionChips");
+  if (!box) return;
+  box.innerHTML = wizard.regionSelections.map((r) =>
+    '<span class="geo-chip">' + esc(r.label) + '<button type="button" data-remove-region="' + r.id + '" aria-label="Убрать">×</button></span>'
+  ).join("");
+  box.querySelectorAll("[data-remove-region]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.dataset.removeRegion);
+      wizard.regionSelections = wizard.regionSelections.filter((r) => r.id !== id);
+      renderGeoChips();
+    });
+  });
 }
 
 async function wizardSaveProjectStep() {
@@ -302,11 +396,8 @@ async function wizardSaveProjectStep() {
   const negativeKeywords = byId("wizPNegative").value.trim();
   if (!name || !domain) { showMessage(msg, "Укажите название и домен.", "error"); return; }
   if (!keywords) { showMessage(msg, "Нужна хотя бы одна ключевая фраза.", "error"); return; }
-  let regionIds;
-  try {
-    regionIds = parseIds(byId("wizPRegions").value);
-  } catch (error) { showMessage(msg, error.message, "error"); return; }
-  if (!regionIds.length) { showMessage(msg, "Нужен хотя бы один регион (ID региона Яндекса).", "error"); return; }
+  const regionIds = (wizard.regionSelections || []).map((r) => r.id);
+  if (!regionIds.length) { showMessage(msg, "Выберите хотя бы один город или регион.", "error"); return; }
 
   const payload = {
     ...(wizard.project || {}),

@@ -532,6 +532,20 @@ class ClickRUClient:
             errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
             raise ClickRUError(f"Не удалось настроить корректировку для мобильных: {errors}")
 
+    async def dictionaries(self, client_login: str, names: list[str]) -> dict[str, Any]:
+        """Dictionaries.get — static Yandex Direct reference data (region
+        tree, timezones, etc.), identical regardless of which real Direct
+        account's `client_login` routes the call through Click.ru (the data
+        itself isn't account-specific) — any already-connected account
+        works as the routing login.
+        """
+        body = {"method": "get", "params": {"DictionaryNames": names}}
+        data = await self.direct_api(client_login, "dictionaries", body)
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
+        return result
+
     async def suspend_campaign(self, client_login: str, campaign_id: int) -> None:
         """Campaigns.suspend — the kill-switch counterpart to resume_campaign.
         Stops serving without deleting anything; the campaign can be resumed

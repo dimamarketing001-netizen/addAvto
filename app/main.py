@@ -279,6 +279,59 @@ async def list_payers(_: AuthUser, connection_id: int | None = Query(default=Non
     return {"items": payers}
 
 
+@app.get("/api/geo-regions")
+async def get_geo_regions(_: AuthUser):
+    """Яндекс-справочник регионов (Dictionaries.getGeoRegions), отфильтрованный
+    до России — визард (шаг 1) использует это вместо ручного ввода ID
+    регионов. Не привязан к конкретному проекту/запуску — любой уже
+    подключённый аккаунт Click.ru подходит, справочник не account-specific.
+    Кэшируется в app_settings (статичный справочник, меняется редко —
+    см. блог Яндекс.Директа про обновления гео-дерева): первый запрос после
+    рестарта сервера идёт в Click.ru/Direct, остальные — из кэша.
+    """
+    cached = db.get_setting("geo_regions_russia")
+    if cached:
+        return {"items": cached}
+
+    connections = db.list_clickru_connections()
+    client = _resolve_clickru_client(connections[0]["id"]) if connections else ClickRUClient()
+    if not client.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Нужен хотя бы один настроенный аккаунт Click.ru для справочника регионов.",
+        )
+    try:
+        accounts = await client.accounts()
+        account = next((a for a in accounts if a.get("serviceLogin")), None)
+        if account is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Нет ни одного Директ-аккаунта с serviceLogin — справочник регионов недоступен.",
+            )
+        result = await client.dictionaries(account["serviceLogin"], ["GeoRegions"])
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    raw = result.get("GeoRegions") or []
+    items = []
+    for row in raw:
+        parent_names = ((row.get("ParentGeoRegionNames") or {}).get("Items")) or []
+        # Only Russia's own subtree — "Russia" itself is always the first
+        # entry in ParentGeoRegionNames for anything under it (confirmed
+        # against a live response, see CHECKS.md).
+        if "Russia" not in parent_names and "Россия" not in parent_names:
+            continue
+        items.append({
+            "id": int(row["GeoRegionId"]),
+            "name": row.get("GeoRegionName", ""),
+            "parents": parent_names,
+        })
+
+    items.sort(key=lambda x: x["name"])
+    db.set_setting("geo_regions_russia", items)
+    return {"items": items}
+
+
 @app.get("/api/accounts/{account_id}/marking-schema")
 async def get_marking_schema(
     account_id: int, _: AuthUser, connection_id: int | None = Query(default=None, ge=1)

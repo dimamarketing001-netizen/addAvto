@@ -146,6 +146,51 @@ def test_payers_and_marking_schema(tmp_path, monkeypatch):
         assert schema_response.json()["configured"] is False
 
 
+def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
+    from app import db
+    from app.click_client import ClickRUClient
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    calls = {"accounts": 0, "dictionaries": 0}
+
+    async def fake_accounts(self):
+        calls["accounts"] += 1
+        return [{"id": 1, "serviceLogin": "porg-1"}]
+
+    async def fake_dictionaries(self, client_login, names):
+        calls["dictionaries"] += 1
+        assert names == ["GeoRegions"]
+        return {
+            "GeoRegions": [
+                {"GeoRegionId": 225, "GeoRegionName": "Россия", "ParentGeoRegionNames": {"Items": ["Земля"]}},
+                {"GeoRegionId": 213, "GeoRegionName": "Москва", "ParentGeoRegionNames": {"Items": ["Земля", "Россия", "Центральный федеральный округ"]}},
+                {"GeoRegionId": 187, "GeoRegionName": "Киев", "ParentGeoRegionNames": {"Items": ["Земля", "Украина"]}},
+            ]
+        }
+
+    monkeypatch.setattr(ClickRUClient, "accounts", fake_accounts)
+    monkeypatch.setattr(ClickRUClient, "dictionaries", fake_dictionaries)
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        response = client.get("/api/geo-regions", auth=auth)
+        assert response.status_code == 200, response.text
+        items = response.json()["items"]
+        names = {item["name"] for item in items}
+        assert names == {"Москва"}  # Россия сама по себе и Киев (не РФ) отфильтрованы
+
+        # Второй запрос идёт из кэша app_settings, не дёргает Click.ru снова.
+        response2 = client.get("/api/geo-regions", auth=auth)
+        assert response2.status_code == 200
+        assert calls["accounts"] == 1
+        assert calls["dictionaries"] == 1
+
+
 def test_activate_campaign_requires_marking_schema(tmp_path, monkeypatch):
     from app.click_client import ClickRUClient
 
