@@ -139,8 +139,6 @@ class ClickRUClient:
         Click.ru master account, with their balance. Needed before any real
         campaign launch: Russian ad-marking law (ОРД/маркировка, ERID)
         requires ads to be tied to a registered payer/legal entity.
-        Юрлица/реквизиты/договоры themselves are set up manually in the
-        Click.ru dashboard, not through this API — this call is read-only.
         """
         response = await self._request("GET", "/users/payers")
         data = response.json()
@@ -148,6 +146,24 @@ class ClickRUClient:
         if isinstance(envelope, dict):
             return envelope.get("payers", []) or envelope.get("items", [])
         return envelope if isinstance(envelope, list) else []
+
+    async def create_payer(self, payload: dict[str, Any]) -> int:
+        """POST /users/payers — creates a BUSINESS/INDIVIDUAL/PERSON payer
+        (юрлицо/ИП/физлицо) directly, confirmed in Click.ru's own
+        openapi.json (2026-11-02) — contrary to the earlier assumption that
+        this had to be done manually in the Click.ru dashboard. `payload`
+        is the already-camelCased, type-specific body (see main.py's
+        `_build_payer_payload`); Click.ru rejects it with a 422 listing the
+        missing/invalid fields if the shape is wrong for the chosen type —
+        not pre-validated further here.
+        """
+        response = await self._request("POST", "/users/payers", json=payload)
+        data = response.json()
+        envelope = data.get("response", data)
+        payer_id = envelope.get("payerId") if isinstance(envelope, dict) else None
+        if payer_id is None:
+            raise ClickRUError(f"Click.ru не вернул payerId: {data}")
+        return int(payer_id)
 
     async def marking_schema(self, account_id: int) -> dict[str, Any]:
         """GET /markings/schemas/account?accountId=<id> — whether this

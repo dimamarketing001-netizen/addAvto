@@ -34,6 +34,55 @@ class ClickRUConnectionOut(BaseModel):
     created_at: str
 
 
+PayerType = Literal["BUSINESS", "INDIVIDUAL", "PERSON"]
+TaxForm = Literal["OSN", "USN"]
+
+
+class PayerAddressIn(BaseModel):
+    address: str = Field(min_length=5, max_length=500)
+    postal_code: str = Field(min_length=3, max_length=20)
+
+
+class PayerBankIn(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    rcbic: str = Field(min_length=9, max_length=9, description="БИК банка")
+    account: str = Field(min_length=5, max_length=34)
+    correspondent_account: str = Field(min_length=5, max_length=34)
+
+
+class PayerCreateIn(BaseModel):
+    """Создание юрлица/ИП/физлица в Click.ru (POST /users/payers) — шаг 2
+    визарда, "+ Добавить юрлицо". Поля опциональны на уровне схемы и
+    проверяются по `type` в main.py, т.к. у BUSINESS/INDIVIDUAL/PERSON
+    разный обязательный набор (см. Click.ru openapi.json,
+    Users.Payers.Business/Individual/Person) — тащить это в pydantic
+    discriminated union ради одной формы не стоило.
+    """
+    type: PayerType
+    inn: str = Field(min_length=10, max_length=12)
+    phone: str | None = Field(default=None, max_length=20)
+
+    # BUSINESS и INDIVIDUAL
+    name: str | None = Field(default=None, max_length=300)
+    tax_form: TaxForm | None = None
+    business_address: PayerAddressIn | None = None
+    actual_address: PayerAddressIn | None = None
+    bank: PayerBankIn | None = None
+
+    # Только BUSINESS (ООО)
+    full_name: str | None = Field(default=None, max_length=500)
+    kpp: str | None = Field(default=None, min_length=9, max_length=9)
+    ogrn: int | None = None
+
+    # Только INDIVIDUAL (ИП)
+    ogrnip: int | None = None
+
+    # Только PERSON (физлицо)
+    last_name: str | None = Field(default=None, max_length=150)
+    first_name: str | None = Field(default=None, max_length=150)
+    middle_name: str | None = Field(default=None, max_length=150)
+
+
 class SitelinkIn(BaseModel):
     title: str = Field(max_length=30)
     href: str = Field(max_length=1024)

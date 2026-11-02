@@ -146,6 +146,60 @@ def test_payers_and_marking_schema(tmp_path, monkeypatch):
         assert schema_response.json()["configured"] is False
 
 
+def test_create_payer_business_builds_correct_clickru_payload(tmp_path, monkeypatch):
+    from app.click_client import ClickRUClient
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "payer-create-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    captured = {}
+
+    async def fake_create_payer(self, payload):
+        captured.update(payload)
+        return 555
+
+    monkeypatch.setattr(ClickRUClient, "create_payer", fake_create_payer)
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        response = client.post("/api/payers", auth=auth, json={
+            "type": "BUSINESS",
+            "inn": "7701234567",
+            "name": "ООО Ромашка",
+            "full_name": "Общество с ограниченной ответственностью «Ромашка»",
+            "kpp": "770101001",
+            "ogrn": 1027700132195,
+            "tax_form": "USN",
+            "business_address": {"address": "Москва, ул. Новая, д. 1", "postal_code": "101000"},
+            "actual_address": {"address": "Москва, ул. Новая, д. 1", "postal_code": "101000"},
+            "bank": {"name": "Альфа-банк", "rcbic": "044525593", "account": "40702810100000000001", "correspondent_account": "30101810200000000593"},
+        })
+        assert response.status_code == 201, response.text
+        assert response.json()["payer_id"] == 555
+        assert captured["type"] == "BUSINESS"
+        assert captured["fullName"].startswith("Общество")
+        assert captured["businessAddress"] == {"address": "Москва, ул. Новая, д. 1", "postalCode": "101000"}
+        assert captured["bank"]["correspondentAccount"] == "30101810200000000593"
+        assert captured["ogrn"] == 1027700132195
+
+
+def test_create_payer_business_requires_type_specific_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "payer-missing-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        response = client.post("/api/payers", auth=auth, json={"type": "BUSINESS", "inn": "7701234567"})
+        assert response.status_code == 422
+        assert "обязательно" in response.json()["detail"]
+
+
 def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
     from app import db
     from app.click_client import ClickRUClient

@@ -13,6 +13,15 @@ function money(value) {
 function num(value) {
   return new Intl.NumberFormat("ru-RU", {maximumFractionDigits:0}).format(Number(value)||0);
 }
+function pluralizeRu(n, one, few, many) {
+  const mod10 = n % 10, mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}
+function accountsWord(n) {
+  return pluralizeRu(n, "аккаунт", "аккаунта", "аккаунтов");
+}
 function modeLabel(mode) {
   return mode === "single_epk" ? "Одна ЕПК" : "Поиск + РСЯ";
 }
@@ -484,10 +493,21 @@ async function renderWizardStep3() {
   }
   const list = wizard.payers.length ? wizard.payers.map((p) => (
     '<label class="wizard-radio"><input type="radio" name="wizPayer" value="' + p.id + '"' + (wizard.payerId === p.id ? " checked" : "") + '><span><strong>' + esc(p.name || ("Юрлицо #" + p.id)) + '</strong><small>Баланс: ' + money(p.balance) + '</small></span></label>'
-  )).join("") : '<div class="notice notice-warning">Юрлица для маркировки не найдены — настройте их в кабинете Click.ru. Можно продолжить без выбора, но активировать показы без маркировки не получится.</div>';
+  )).join("") : '<div class="notice notice-warning">Юрлица для маркировки не найдены — добавьте первое ниже или настройте в кабинете Click.ru. Можно продолжить без выбора, но активировать показы без маркировки не получится.</div>';
   body.innerHTML = wizardStepsNav(3) +
     '<div class="notice notice-info">Юрлицо используется для маркировки рекламы (ОРД/ERID) — обязательно перед реальным запуском показов.</div>' +
     '<div class="wizard-list">' + list + '</div>' +
+    '<button class="button button-ghost button-small wizard-add" id="wizAddPayerToggle" type="button">+ Добавить юрлицо</button>' +
+    '<form id="wizAddPayerForm" class="hidden">' +
+      '<fieldset class="field field-wide mode-picker payer-type-picker">' +
+        '<label class="mode-option"><input type="radio" name="payerType" value="BUSINESS" checked><span><strong>ООО</strong></span></label>' +
+        '<label class="mode-option"><input type="radio" name="payerType" value="INDIVIDUAL"><span><strong>ИП</strong></span></label>' +
+        '<label class="mode-option"><input type="radio" name="payerType" value="PERSON"><span><strong>Физлицо</strong></span></label>' +
+      '</fieldset>' +
+      '<div id="wizPayerFields" class="form-grid"></div>' +
+      '<div class="wizard-actions"><span></span><button class="button button-primary" type="submit">Добавить юрлицо</button></div>' +
+    '</form>' +
+    '<div id="wizAddPayerMessage" class="form-message"></div>' +
     '<div class="wizard-actions"><button class="button button-ghost" id="wizBack3" type="button">← Назад</button><button class="button button-primary" id="wizNext3" type="button">Далее →</button></div>';
   body.querySelector("#wizBack3").addEventListener("click", () => { wizard.step = 2; renderWizardStep2(); });
   body.querySelector("#wizNext3").addEventListener("click", () => {
@@ -495,6 +515,108 @@ async function renderWizardStep3() {
     wizard.step = 4;
     renderWizardStep4();
   });
+
+  const payerForm = body.querySelector("#wizAddPayerForm");
+  const payerFieldsBox = body.querySelector("#wizPayerFields");
+  function refreshPayerFields() {
+    const type = body.querySelector('input[name="payerType"]:checked').value;
+    payerFieldsBox.innerHTML = renderPayerTypeFields(type);
+  }
+  refreshPayerFields();
+  body.querySelector("#wizAddPayerToggle").addEventListener("click", () => {
+    payerForm.classList.toggle("hidden");
+  });
+  body.querySelectorAll('input[name="payerType"]').forEach((input) => {
+    input.addEventListener("change", refreshPayerFields);
+  });
+  payerForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const msg = body.querySelector("#wizAddPayerMessage");
+    const button = event.submitter;
+    try {
+      button.disabled = true;
+      showMessage(msg, "Создаю юрлицо в Click.ru…");
+      const payload = buildPayerPayload(new FormData(payerForm));
+      const created = await api("/api/payers?connection_id=" + wizard.connectionId, {
+        method: "POST", body: JSON.stringify(payload),
+      });
+      wizard.payerId = created.payer_id;
+      showMessage(msg, "Юрлицо добавлено.", "success");
+      await renderWizardStep3();
+    } catch (error) {
+      showMessage(msg, error.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+function renderPayerTypeFields(type) {
+  const common =
+    '<label class="field">ИНН<input name="inn" required minlength="10" maxlength="12"></label>' +
+    '<label class="field">Телефон (необязательно)<input name="phone"></label>';
+  if (type === "PERSON") {
+    return common +
+      '<label class="field">Фамилия<input name="last_name" required></label>' +
+      '<label class="field">Имя<input name="first_name" required></label>' +
+      '<label class="field">Отчество<input name="middle_name" required></label>';
+  }
+  const typeSpecific = type === "BUSINESS"
+    ? '<label class="field field-wide">Полное название (например, Общество с ограниченной ответственностью «Ромашка»)<input name="full_name" required></label>' +
+      '<label class="field">КПП<input name="kpp" required minlength="9" maxlength="9"></label>' +
+      '<label class="field">ОГРН<input name="ogrn" required inputmode="numeric" pattern="[0-9]+"></label>'
+    : '<label class="field">ОГРНИП<input name="ogrnip" required inputmode="numeric" pattern="[0-9]+"></label>';
+  return common +
+    '<label class="field field-wide">' + (type === "BUSINESS" ? "Краткое название (например, ООО «Ромашка»)" : "Полное название ИП") + '<input name="name" required></label>' +
+    typeSpecific +
+    '<label class="field">Форма налогообложения<select name="tax_form" required><option value="OSN">ОСН</option><option value="USN">УСН</option></select></label>' +
+    '<label class="field field-wide">Юридический адрес<input name="business_address_address" required placeholder="Россия, Москва, улица Новая, дом 1, офис 1"></label>' +
+    '<label class="field">Индекс (юр. адрес)<input name="business_address_postal_code" required maxlength="20"></label>' +
+    '<label class="field field-wide">Фактический адрес<input name="actual_address_address" required></label>' +
+    '<label class="field">Индекс (факт. адрес)<input name="actual_address_postal_code" required maxlength="20"></label>' +
+    '<label class="field field-wide">Банк<input name="bank_name" required placeholder="Например, Альфа-банк"></label>' +
+    '<label class="field">БИК банка<input name="bank_rcbic" required minlength="9" maxlength="9"></label>' +
+    '<label class="field">Расчётный счёт<input name="bank_account" required></label>' +
+    '<label class="field">Корреспондентский счёт<input name="bank_correspondent_account" required></label>';
+}
+
+function buildPayerPayload(f) {
+  const type = f.get("payerType");
+  const payload = {
+    type,
+    inn: String(f.get("inn") || "").trim(),
+    phone: String(f.get("phone") || "").trim() || null,
+  };
+  if (type === "PERSON") {
+    payload.last_name = String(f.get("last_name") || "").trim();
+    payload.first_name = String(f.get("first_name") || "").trim();
+    payload.middle_name = String(f.get("middle_name") || "").trim();
+    return payload;
+  }
+  payload.name = String(f.get("name") || "").trim();
+  payload.tax_form = f.get("tax_form");
+  payload.business_address = {
+    address: String(f.get("business_address_address") || "").trim(),
+    postal_code: String(f.get("business_address_postal_code") || "").trim(),
+  };
+  payload.actual_address = {
+    address: String(f.get("actual_address_address") || "").trim(),
+    postal_code: String(f.get("actual_address_postal_code") || "").trim(),
+  };
+  payload.bank = {
+    name: String(f.get("bank_name") || "").trim(),
+    rcbic: String(f.get("bank_rcbic") || "").trim(),
+    account: String(f.get("bank_account") || "").trim(),
+    correspondent_account: String(f.get("bank_correspondent_account") || "").trim(),
+  };
+  if (type === "BUSINESS") {
+    payload.full_name = String(f.get("full_name") || "").trim();
+    payload.kpp = String(f.get("kpp") || "").trim();
+    payload.ogrn = Number(f.get("ogrn"));
+  } else {
+    payload.ogrnip = Number(f.get("ogrnip"));
+  }
+  return payload;
 }
 
 async function renderWizardStep4() {
@@ -530,23 +652,27 @@ async function renderWizardStep4() {
   });
 }
 
-function wizardModeOption(value, title, note) {
-  return '<label class="mode-option"><input type="radio" name="wizMode" value="' + value + '"' + (wizard.creativeMode === value ? " checked" : "") + '><span class="mode-icon">●</span><span><strong>' + esc(title) + '</strong><small>' + esc(note) + '</small></span></label>';
+function wizardModeOption(value, icon, title, note) {
+  return '<label class="mode-option"><input type="radio" name="wizMode" value="' + value + '"' + (wizard.creativeMode === value ? " checked" : "") + '><span class="mode-icon">' + icon + '</span><span><strong>' + esc(title) + '</strong><small>' + esc(note) + '</small></span></label>';
 }
 
 function renderWizardStep5() {
   const body = byId("wizardBody");
-  const structureBlock = '<fieldset class="field field-wide mode-picker"><legend>Структура объявлений в группе каждого аккаунта</legend>' +
-    '<label class="mode-option"><input type="radio" name="wizStructure" value="single"' + (wizard.adsPerGroup <= 1 ? " checked" : "") + '><span class="mode-icon">1</span><span><strong>Одно объявление на аккаунт</strong><small>Один фиксированный креатив на кампанию.</small></span></label>' +
-    '<label class="mode-option"><input type="radio" name="wizStructure" value="multi"' + (wizard.adsPerGroup > 1 ? " checked" : "") + '><span class="mode-icon">N</span><span><strong>Несколько объявлений в группе</strong><small>До 50 в одной группе — Директ сам подберёт лучшую связку показа. Только с режимом «Скрипт перемешает» ниже.</small></span></label>' +
+  const accountsN = wizard.count;
+  const structureBlock = '<fieldset class="field field-wide mode-picker"><legend>Сколько объявлений создавать в группе каждого аккаунта</legend>' +
+    '<label class="mode-option"><input type="radio" name="wizStructure" value="single"' + (wizard.adsPerGroup <= 1 ? " checked" : "") + '><span class="mode-icon">1</span><span><strong>Одно объявление</strong><small>Простой и предсказуемый вариант: у каждого аккаунта один фиксированный заголовок, текст и картинка.</small></span></label>' +
+    '<label class="mode-option"><input type="radio" name="wizStructure" value="multi"' + (wizard.adsPerGroup > 1 ? " checked" : "") + '><span class="mode-icon">N</span><span><strong>Несколько объявлений (A/B)</strong><small>До 50 вариантов в одной группе — Директ сам покажет чаще тот, что лучше работает. Доступно только вместе с режимом «Скрипт перемешает» ниже.</small></span></label>' +
     '</fieldset>' +
     (wizard.adsPerGroup > 1
-      ? '<label class="field">Сколько объявлений в группе (2–50)<input id="wizAdsPerGroup" type="number" min="2" max="50" value="' + wizard.adsPerGroup + '"></label>'
+      ? '<label class="field">Сколько вариантов объявления в группе (от 2 до 50)<input id="wizAdsPerGroup" type="number" min="2" max="50" value="' + wizard.adsPerGroup + '"></label>'
       : "");
-  const modeOptions = '<fieldset class="field field-wide mode-picker"><legend>Как собрать креативы на ' + wizard.count + ' аккаунт(ов)</legend>' +
-    wizardModeOption("shuffle", "Скрипт перемешает", "Один общий набор заголовков/текстов/картинок — на каждый аккаунт (и объявление, если их несколько в группе) берётся случайный.") +
-    wizardModeOption("duplicate_single", "Продублировать один набор", "Один заголовок/текст/картинка — одинаковые на всех аккаунтах.") +
-    wizardModeOption("manual_per_account", "Свой набор на каждый аккаунт", "Вручную заполняете " + wizard.count + " разных наборов — по одному на аккаунт.") +
+  const modeOptions = '<fieldset class="field field-wide mode-picker"><legend>Откуда брать заголовки, тексты и картинки для ' + accountsN + ' ' + accountsWord(accountsN) + '</legend>' +
+    wizardModeOption("shuffle", "⇄", "Скрипт перемешает сам",
+      "Вы один раз загружаете список заголовков, текстов и картинок ниже — для каждого аккаунта (и каждого объявления, если их несколько) скрипт случайно собирает из них свою связку.") +
+    wizardModeOption("duplicate_single", "⧉", "Один набор на все аккаунты",
+      "Вы вводите ОДИН заголовок, текст и картинку — они без изменений попадут во все " + accountsN + " " + accountsWord(accountsN) + ".") +
+    wizardModeOption("manual_per_account", "✎", "Свой набор на каждый аккаунт",
+      "Вы вручную заполняете " + accountsN + " " + (accountsN === 1 ? "форму" : "форм") + " — по одной на каждый аккаунт, с собственным заголовком, текстом и картинкой.") +
     '</fieldset>';
   const poolForm =
     '<label class="field field-wide">Заголовки — по одному на строку (до 56 символов)<textarea id="wizHeadlines" rows="3">' + esc(wizard.pool.headlines) + '</textarea></label>' +
@@ -582,15 +708,16 @@ function renderWizardStep5() {
       if (Number.isInteger(value) && value >= 2) wizard.adsPerGroup = Math.min(value, 50);
     });
   }
+  // Живая привязка к wizard.pool на каждый ввод (не только при смене
+  // режима) — иначе набранные заголовки/тексты терялись при переходе
+  // "← Назад" на шаг 4 и обратно, см. жалобу пользователя 2026-11-02.
+  const poolFieldMap = {wizHeadlines: "headlines", wizAdTexts: "ad_texts", wizImages: "image_urls", wizCallouts: "callouts", wizSitelinks: "sitelinks"};
+  Object.keys(poolFieldMap).forEach((fieldId) => {
+    const el = byId(fieldId);
+    if (el) el.addEventListener("input", () => { wizard.pool[poolFieldMap[fieldId]] = el.value; });
+  });
   body.querySelectorAll('input[name="wizMode"]').forEach((input) => {
     input.addEventListener("change", (event) => {
-      if (byId("wizHeadlines")) {
-        wizard.pool.headlines = byId("wizHeadlines").value;
-        wizard.pool.ad_texts = byId("wizAdTexts").value;
-        wizard.pool.image_urls = byId("wizImages").value;
-        wizard.pool.callouts = byId("wizCallouts").value;
-        wizard.pool.sitelinks = byId("wizSitelinks").value;
-      }
       wizard.creativeMode = event.target.value;
       if (wizard.creativeMode !== "shuffle") wizard.adsPerGroup = 1;
       renderWizardStep5();

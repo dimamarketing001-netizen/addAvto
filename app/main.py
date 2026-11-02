@@ -30,6 +30,7 @@ from .schemas import (
     BulkJobStartOut,
     CampaignPlan,
     ClickRUConnectionIn,
+    PayerCreateIn,
     DirectAccountCreate,
     PlanItem,
     ProjectIn,
@@ -265,9 +266,7 @@ async def list_payers(_: AuthUser, connection_id: int | None = Query(default=Non
     """Legal entities (юрлица) with a balance, available under the chosen
     Click.ru master account (wizard step 2 — picked after step 1's account
     connection). Needed before a real campaign launch — Russian ad-marking
-    law (ОРД/ERID) ties every served ad to a registered payer. Юрлица/
-    реквизиты/договоры are set up manually in the Click.ru dashboard; this
-    is a read-only list for picking one in the UI.
+    law (ОРД/ERID) ties every served ad to a registered payer.
     """
     client = _resolve_clickru_client(connection_id)
     if not client.configured:
@@ -277,6 +276,65 @@ async def list_payers(_: AuthUser, connection_id: int | None = Query(default=Non
     except ClickRUError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"items": payers}
+
+
+def _build_payer_payload(payload: PayerCreateIn) -> dict[str, Any]:
+    """Переводит PayerCreateIn в точную форму, которую ждёт Click.ru
+    (camelCase, разный набор полей по типу — см. openapi.json,
+    Users.Payers.Business/Individual/Person, сверено 2026-11-02)."""
+    body: dict[str, Any] = {"type": payload.type, "inn": payload.inn}
+    if payload.phone:
+        body["phone"] = payload.phone
+
+    def require(value: Any, field_label: str) -> Any:
+        if value is None:
+            raise HTTPException(status_code=422, detail=f"Для этого типа плательщика обязательно поле «{field_label}».")
+        return value
+
+    if payload.type in ("BUSINESS", "INDIVIDUAL"):
+        body["name"] = require(payload.name, "Название")
+        body["taxForm"] = require(payload.tax_form, "Форма налогообложения")
+        address = require(payload.business_address, "Юридический адрес")
+        body["businessAddress"] = {"address": address.address, "postalCode": address.postal_code}
+        actual = require(payload.actual_address, "Фактический адрес")
+        body["actualAddress"] = {"address": actual.address, "postalCode": actual.postal_code}
+        bank = require(payload.bank, "Банковские реквизиты")
+        body["bank"] = {
+            "name": bank.name, "rcbic": bank.rcbic,
+            "account": bank.account, "correspondentAccount": bank.correspondent_account,
+        }
+        if payload.type == "BUSINESS":
+            body["fullName"] = require(payload.full_name, "Полное название")
+            body["kpp"] = require(payload.kpp, "КПП")
+            body["ogrn"] = require(payload.ogrn, "ОГРН")
+        else:
+            body["ogrnip"] = require(payload.ogrnip, "ОГРНИП")
+    else:  # PERSON
+        body["lastName"] = require(payload.last_name, "Фамилия")
+        body["firstName"] = require(payload.first_name, "Имя")
+        body["middleName"] = require(payload.middle_name, "Отчество")
+
+    return body
+
+
+@app.post("/api/payers", status_code=201)
+async def create_payer(
+    payload: PayerCreateIn, _: AuthUser, connection_id: int | None = Query(default=None, ge=1)
+):
+    """Создаёт юрлицо/ИП/физлицо прямо в Click.ru (POST /users/payers) —
+    визард, шаг 2, «+ Добавить юрлицо». Раньше (до 2026-11-02) это
+    документация описывала как исключительно ручную настройку в кабинете
+    Click.ru — на самом деле API это поддерживает, см. openapi.json.
+    """
+    client = _resolve_clickru_client(connection_id)
+    if not client.configured:
+        raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
+    body = _build_payer_payload(payload)
+    try:
+        payer_id = await client.create_payer(body)
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"payer_id": payer_id}
 
 
 @app.get("/api/geo-regions")
