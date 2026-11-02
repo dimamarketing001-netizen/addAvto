@@ -48,63 +48,22 @@ async function loadProjects() {
     const projects = data.items || [];
     byId("metricProjects").textContent = num(projects.length);
     if (!projects.length) {
-      body.innerHTML = '<tr><td colspan="6" class="empty">Проектов пока нет. Создайте первый шаблон выше.</td></tr>';
+      body.innerHTML = '<tr><td colspan="4" class="empty">Проектов пока нет. Нажмите «+ Новый проект» выше.</td></tr>';
       return;
     }
     body.innerHTML = projects.map((p) => {
       return '<tr>' +
         '<td><div class="project-title">' + esc(p.name) + '</div><div class="project-domain">' + esc(p.domain) + '</div></td>' +
         '<td><span class="mode-badge">' + esc(modeLabel(p.campaign_mode)) + '</span></td>' +
-        '<td>' + esc(strategyLabel(p.strategy)) + '</td>' +
         '<td>' + num(p.target_drr) + '%</td>' +
-        '<td>' + money(p.budget) + '</td>' +
         '<td><div class="row-actions"><button class="link-button" data-plan="' + p.id + '">План</button><button class="link-button" data-bulk="' + p.id + '">Массовый запуск</button><button class="link-button" data-history="' + p.id + '">История</button><button class="link-button danger" data-delete="' + p.id + '">Удалить</button></div></td>' +
         '</tr>';
     }).join("");
   } catch (error) {
-    body.innerHTML = '<tr><td colspan="6" class="empty">Ошибка загрузки: ' + esc(error.message) + '</td></tr>';
+    body.innerHTML = '<tr><td colspan="4" class="empty">Ошибка загрузки: ' + esc(error.message) + '</td></tr>';
   }
 }
-function getProjectPayload(form) {
-  const f = new FormData(form);
-  const imageText = String(f.get("image_urls") || "");
-  return {
-    name: String(f.get("name") || "").trim(),
-    domain: String(f.get("domain") || "").trim(),
-    campaign_mode: String(f.get("campaign_mode") || "separate"),
-    strategy: String(f.get("strategy") || "AVERAGE_CRR"),
-    target_drr: Number(f.get("target_drr")),
-    budget: Number(f.get("budget")),
-    lead_value: Number(f.get("lead_value") || 0),
-    headline: String(f.get("headline") || "").trim(),
-    ad_text: String(f.get("ad_text") || "").trim(),
-    keywords: String(f.get("keywords") || "").trim(),
-    negative_keywords: String(f.get("negative_keywords") || "").trim(),
-    image_urls: imageText.split(String.fromCharCode(10)).map(x => x.trim()).filter(Boolean),
-    region_ids: parseIds(String(f.get("region_ids") || "")),
-    mobile_bid_adjustment_percent: f.get("mobile_bid_adjustment_percent") ? Number(f.get("mobile_bid_adjustment_percent")) : null
-  };
-}
-byId("projectForm").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  // currentTarget is only guaranteed during synchronous event dispatch.
-  // Keep a stable reference before awaiting the API request.
-  const form = event.currentTarget;
-  const button = event.submitter;
-  const msg = byId("formMessage");
-  try {
-    const payload = getProjectPayload(form);
-    button.disabled = true;
-    await api("/api/projects", {method:"POST", body:JSON.stringify(payload)});
-    form.reset();
-    showMessage(msg, "Проект сохранён. Откройте «План», чтобы проверить выбранную структуру кампаний.", "success");
-    await loadProjects();
-  } catch (error) {
-    showMessage(msg, error.message, "error");
-  } finally {
-    button.disabled = false;
-  }
-});
+byId("newProjectButton").addEventListener("click", () => openWizard(null));
 
 let bulkCreatedTotal = 0;
 
@@ -258,7 +217,7 @@ const wizard = {
   pool: {headlines: "", ad_texts: "", image_urls: "", callouts: "", sitelinks: ""},
   manualSets: [],
 };
-const WIZARD_STEP_LABELS = ["1. Аккаунт Click.ru", "2. Юрлицо", "3. Количество", "4. Креативы"];
+const WIZARD_STEP_LABELS = ["1. Проект", "2. Аккаунт Click.ru", "3. Юрлицо", "4. Количество", "5. Креативы"];
 function wizardStepsNav(activeStep) {
   return '<div class="wizard-steps">' + WIZARD_STEP_LABELS.map((label, i) =>
     '<span' + (i + 1 === activeStep ? ' class="active"' : '') + '>' + esc(label) + '</span>'
@@ -272,14 +231,30 @@ byId("wizardBody").addEventListener("change", (event) => {
   if (event.target.name === "wizPayer") wizard.payerId = Number(event.target.value);
 });
 
+function seedCreativePools(project) {
+  const p = project || {};
+  const seedHeadlines = (p.headlines && p.headlines.length) ? p.headlines : [];
+  const seedAdTexts = (p.ad_texts && p.ad_texts.length) ? p.ad_texts : [];
+  const seedSitelinks = (p.sitelinks_pool || []).map((sl) => [sl.title, sl.href, sl.description || ""].join("|"));
+  wizard.pool = {
+    headlines: seedHeadlines.join("\n"),
+    ad_texts: seedAdTexts.join("\n"),
+    image_urls: (p.image_urls || []).join("\n"),
+    callouts: (p.callouts_pool || []).join("\n"),
+    sitelinks: seedSitelinks.join("\n"),
+  };
+}
+
 async function openWizard(projectId) {
-  let project;
-  try {
-    const data = await api("/api/projects");
-    project = (data.items || []).find((p) => p.id === projectId);
-  } catch (error) { alert(error.message); return; }
-  if (!project) { alert("Проект не найден, обновите список."); return; }
-  wizard.projectId = projectId;
+  let project = null;
+  if (projectId) {
+    try {
+      const data = await api("/api/projects");
+      project = (data.items || []).find((p) => p.id === projectId);
+    } catch (error) { alert(error.message); return; }
+    if (!project) { alert("Проект не найден, обновите список."); return; }
+  }
+  wizard.projectId = projectId || null;
   wizard.project = project;
   wizard.step = 1;
   wizard.connectionId = null;
@@ -287,30 +262,86 @@ async function openWizard(projectId) {
   wizard.count = 1;
   wizard.creativeMode = "shuffle";
   wizard.adsPerGroup = 1;
-  const seedHeadlines = (project.headlines && project.headlines.length) ? project.headlines : (project.headline ? [project.headline] : []);
-  const seedAdTexts = (project.ad_texts && project.ad_texts.length) ? project.ad_texts : (project.ad_text ? [project.ad_text] : []);
-  const seedSitelinks = (project.sitelinks_pool || []).map((sl) => [sl.title, sl.href, sl.description || ""].join("|"));
-  wizard.pool = {
-    headlines: seedHeadlines.join("\n"),
-    ad_texts: seedAdTexts.join("\n"),
-    image_urls: (project.image_urls || []).join("\n"),
-    callouts: (project.callouts_pool || []).join("\n"),
-    sitelinks: seedSitelinks.join("\n"),
-  };
+  seedCreativePools(project);
   wizard.manualSets = [];
   byId("wizardOverlay").classList.remove("hidden");
-  await renderWizardStep1();
+  renderWizardStep1();
 }
 
-async function renderWizardStep1() {
+function renderWizardStep1() {
   const body = byId("wizardBody");
-  body.innerHTML = wizardStepsNav(1) + '<div class="muted small">Загружаю подключения…</div>';
+  const p = wizard.project || {};
+  body.innerHTML = wizardStepsNav(1) +
+    '<div class="form-grid">' +
+      '<label class="field field-wide">Название проекта<input id="wizPName" value="' + esc(p.name || "") + '" required maxlength="120" placeholder="Например, БФЛ — Казань"></label>' +
+      '<label class="field field-wide">Домен / посадочная страница<input id="wizPDomain" value="' + esc(p.domain || "") + '" required placeholder="https://example.ru/"></label>' +
+      '<fieldset class="field field-wide mode-picker"><legend>Структура рекламных кампаний</legend>' +
+        '<label class="mode-option"><input type="radio" name="wizPMode" value="separate"' + ((p.campaign_mode || "separate") === "separate" ? " checked" : "") + '><span class="mode-icon">Ⅱ</span><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ.</small></span></label>' +
+        '<label class="mode-option"><input type="radio" name="wizPMode" value="single_epk"' + (p.campaign_mode === "single_epk" ? " checked" : "") + '><span class="mode-icon">▣</span><span><strong>Одна ЕПК</strong><small>Единая перфоманс-кампания, Поиск+РСЯ вместе.</small></span></label>' +
+      '</fieldset>' +
+      '<label class="field">Целевой ДРР, %<input id="wizPDrr" type="number" min="0.1" max="1000" step="0.1" value="' + esc(p.target_drr ?? 30) + '" required></label>' +
+      '<label class="field">Корректировка ставки для мобильных, % (необязательно)<input id="wizPMobile" type="number" min="-100" max="1200" value="' + esc(p.mobile_bid_adjustment_percent ?? "") + '" placeholder="например, -50"></label>' +
+      '<label class="field field-wide">Ключевые фразы — по одной на строку<textarea id="wizPKeywords" rows="3" placeholder="юрист по банкротству&#10;списание долгов">' + esc(p.keywords || "") + '</textarea></label>' +
+      '<label class="field field-wide">Минус-фразы — по одной на строку (общие для группы, у Яндекса лимит 3 фразы)<textarea id="wizPNegative" rows="2" placeholder="бесплатно&#10;вакансии">' + esc(p.negative_keywords || "") + '</textarea></label>' +
+      '<label class="field field-wide">ID регионов Яндекса — через запятую<input id="wizPRegions" value="' + esc((p.region_ids || []).join(", ")) + '" placeholder="Например, 213"></label>' +
+    '</div>' +
+    '<div class="wizard-actions"><span></span><button class="button button-primary" id="wizNext1" type="button">Далее →</button></div>' +
+    '<div id="wizPMessage" class="form-message" role="status"></div>';
+  body.querySelector("#wizNext1").addEventListener("click", wizardSaveProjectStep);
+}
+
+async function wizardSaveProjectStep() {
+  const msg = byId("wizPMessage");
+  const button = byId("wizNext1");
+  const name = byId("wizPName").value.trim();
+  const domain = byId("wizPDomain").value.trim();
+  const campaignMode = document.querySelector('input[name="wizPMode"]:checked').value;
+  const targetDrr = Number(byId("wizPDrr").value);
+  const mobileRaw = byId("wizPMobile").value.trim();
+  const keywords = byId("wizPKeywords").value.trim();
+  const negativeKeywords = byId("wizPNegative").value.trim();
+  if (!name || !domain) { showMessage(msg, "Укажите название и домен.", "error"); return; }
+  if (!keywords) { showMessage(msg, "Нужна хотя бы одна ключевая фраза.", "error"); return; }
+  let regionIds;
+  try {
+    regionIds = parseIds(byId("wizPRegions").value);
+  } catch (error) { showMessage(msg, error.message, "error"); return; }
+  if (!regionIds.length) { showMessage(msg, "Нужен хотя бы один регион (ID региона Яндекса).", "error"); return; }
+
+  const payload = {
+    ...(wizard.project || {}),
+    name, domain, campaign_mode: campaignMode, target_drr: targetDrr,
+    keywords, negative_keywords: negativeKeywords, region_ids: regionIds,
+    mobile_bid_adjustment_percent: mobileRaw ? Number(mobileRaw) : null,
+  };
+  button.disabled = true;
+  showMessage(msg, wizard.projectId ? "Сохраняю проект…" : "Создаю проект…");
+  try {
+    const saved = wizard.projectId
+      ? await api("/api/projects/" + wizard.projectId, {method: "PUT", body: JSON.stringify(payload)})
+      : await api("/api/projects", {method: "POST", body: JSON.stringify(payload)});
+    wizard.project = saved;
+    wizard.projectId = saved.id;
+    seedCreativePools(saved);
+    loadProjects();
+    wizard.step = 2;
+    renderWizardStep2();
+  } catch (error) {
+    showMessage(msg, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function renderWizardStep2() {
+  const body = byId("wizardBody");
+  body.innerHTML = wizardStepsNav(2) + '<div class="muted small">Загружаю подключения…</div>';
   const connections = await loadClickruConnections();
   wizard.connections = connections;
   const list = connections.length ? connections.map((c) => (
     '<label class="wizard-radio"><input type="radio" name="wizConn" value="' + c.id + '"' + (wizard.connectionId === c.id ? " checked" : "") + '><span><strong>' + esc(c.label) + '</strong><small>' + esc(c.token_preview) + (c.user_id ? " · User ID " + esc(c.user_id) : "") + '</small></span></label>'
   )).join("") : '<div class="empty">Подключений пока нет — добавьте первое ниже.</div>';
-  body.innerHTML = wizardStepsNav(1) +
+  body.innerHTML = wizardStepsNav(2) +
     '<div class="wizard-list">' + list + '</div>' +
     '<button class="button button-ghost button-small wizard-add" id="wizAddConnToggle" type="button">+ Добавить ещё аккаунт Click.ru</button>' +
     '<form id="wizAddConnForm" class="account-create-form hidden">' +
@@ -320,7 +351,7 @@ async function renderWizardStep1() {
       '<button class="button button-primary" type="submit">Добавить и проверить</button>' +
     '</form>' +
     '<div id="wizAddConnMessage" class="form-message"></div>' +
-    '<div class="wizard-actions"><span></span><button class="button button-primary" id="wizNext1" type="button">Далее →</button></div>';
+    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack2" type="button">← Назад</button><button class="button button-primary" id="wizNext2" type="button">Далее →</button></div>';
   body.querySelector("#wizAddConnToggle").addEventListener("click", () => {
     body.querySelector("#wizAddConnForm").classList.toggle("hidden");
   });
@@ -336,39 +367,12 @@ async function renderWizardStep1() {
         user_id: String(f.get("user_id") || "").trim(),
       })});
       wizard.connectionId = created.id;
-      await renderWizardStep1();
+      await renderWizardStep2();
     } catch (error) { showMessage(msg, error.message, "error"); }
   });
-  body.querySelector("#wizNext1").addEventListener("click", () => {
-    if (!wizard.connectionId) { alert("Выберите аккаунт Click.ru."); return; }
-    wizard.step = 2;
-    renderWizardStep2();
-  });
-}
-
-async function renderWizardStep2() {
-  const body = byId("wizardBody");
-  body.innerHTML = wizardStepsNav(2) + '<div class="muted small">Загружаю юрлица для маркировки…</div>';
-  try {
-    const data = await api("/api/payers?connection_id=" + wizard.connectionId);
-    wizard.payers = data.items || [];
-  } catch (error) {
-    body.innerHTML = wizardStepsNav(2) +
-      '<div class="notice notice-warning">Не удалось получить юрлица: ' + esc(error.message) + '</div>' +
-      '<div class="wizard-actions"><button class="button button-ghost" id="wizBack2" type="button">← Назад</button></div>';
-    body.querySelector("#wizBack2").addEventListener("click", () => { wizard.step = 1; renderWizardStep1(); });
-    return;
-  }
-  const list = wizard.payers.length ? wizard.payers.map((p) => (
-    '<label class="wizard-radio"><input type="radio" name="wizPayer" value="' + p.id + '"' + (wizard.payerId === p.id ? " checked" : "") + '><span><strong>' + esc(p.name || ("Юрлицо #" + p.id)) + '</strong><small>Баланс: ' + money(p.balance) + '</small></span></label>'
-  )).join("") : '<div class="notice notice-warning">Юрлица для маркировки не найдены — настройте их в кабинете Click.ru. Можно продолжить без выбора, но активировать показы без маркировки не получится.</div>';
-  body.innerHTML = wizardStepsNav(2) +
-    '<div class="notice notice-info">Юрлицо используется для маркировки рекламы (ОРД/ERID) — обязательно перед реальным запуском показов.</div>' +
-    '<div class="wizard-list">' + list + '</div>' +
-    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack2" type="button">← Назад</button><button class="button button-primary" id="wizNext2" type="button">Далее →</button></div>';
   body.querySelector("#wizBack2").addEventListener("click", () => { wizard.step = 1; renderWizardStep1(); });
   body.querySelector("#wizNext2").addEventListener("click", () => {
-    if (wizard.payers.length && !wizard.payerId) { alert("Выберите юрлицо для маркировки — без него нельзя будет запустить показы."); return; }
+    if (!wizard.connectionId) { alert("Выберите аккаунт Click.ru."); return; }
     wizard.step = 3;
     renderWizardStep3();
   });
@@ -376,7 +380,35 @@ async function renderWizardStep2() {
 
 async function renderWizardStep3() {
   const body = byId("wizardBody");
-  body.innerHTML = wizardStepsNav(3) + '<div class="muted small">Проверяю свободные аккаунты в пуле…</div>';
+  body.innerHTML = wizardStepsNav(3) + '<div class="muted small">Загружаю юрлица для маркировки…</div>';
+  try {
+    const data = await api("/api/payers?connection_id=" + wizard.connectionId);
+    wizard.payers = data.items || [];
+  } catch (error) {
+    body.innerHTML = wizardStepsNav(3) +
+      '<div class="notice notice-warning">Не удалось получить юрлица: ' + esc(error.message) + '</div>' +
+      '<div class="wizard-actions"><button class="button button-ghost" id="wizBack3" type="button">← Назад</button></div>';
+    body.querySelector("#wizBack3").addEventListener("click", () => { wizard.step = 2; renderWizardStep2(); });
+    return;
+  }
+  const list = wizard.payers.length ? wizard.payers.map((p) => (
+    '<label class="wizard-radio"><input type="radio" name="wizPayer" value="' + p.id + '"' + (wizard.payerId === p.id ? " checked" : "") + '><span><strong>' + esc(p.name || ("Юрлицо #" + p.id)) + '</strong><small>Баланс: ' + money(p.balance) + '</small></span></label>'
+  )).join("") : '<div class="notice notice-warning">Юрлица для маркировки не найдены — настройте их в кабинете Click.ru. Можно продолжить без выбора, но активировать показы без маркировки не получится.</div>';
+  body.innerHTML = wizardStepsNav(3) +
+    '<div class="notice notice-info">Юрлицо используется для маркировки рекламы (ОРД/ERID) — обязательно перед реальным запуском показов.</div>' +
+    '<div class="wizard-list">' + list + '</div>' +
+    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack3" type="button">← Назад</button><button class="button button-primary" id="wizNext3" type="button">Далее →</button></div>';
+  body.querySelector("#wizBack3").addEventListener("click", () => { wizard.step = 2; renderWizardStep2(); });
+  body.querySelector("#wizNext3").addEventListener("click", () => {
+    if (wizard.payers.length && !wizard.payerId) { alert("Выберите юрлицо для маркировки — без него нельзя будет запустить показы."); return; }
+    wizard.step = 4;
+    renderWizardStep4();
+  });
+}
+
+async function renderWizardStep4() {
+  const body = byId("wizardBody");
+  body.innerHTML = wizardStepsNav(4) + '<div class="muted small">Проверяю свободные аккаунты в пуле…</div>';
   let free = null, total = null;
   try {
     const data = await api("/api/parsya-pool/accounts");
@@ -389,12 +421,12 @@ async function renderWizardStep3() {
   wizard.freeCount = free;
   const hint = free === null ? "Не удалось получить статус пула ParsYa." : ("Свободно в пуле: " + free + " из " + total + ".");
   const maxAllowed = free && free > 0 ? Math.min(free, 20) : 20;
-  body.innerHTML = wizardStepsNav(3) +
+  body.innerHTML = wizardStepsNav(4) +
     '<div class="notice notice-info">' + esc(hint) + ' Каждый аккаунт — это НОВЫЙ Direct-аккаунт, созданный из пула, со своей кампанией.</div>' +
     '<label class="field">Сколько аккаунтов запустить<input id="wizCount" type="number" min="1" max="' + maxAllowed + '" value="' + wizard.count + '"></label>' +
-    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack3" type="button">← Назад</button><button class="button button-primary" id="wizNext3" type="button">Далее →</button></div>';
-  body.querySelector("#wizBack3").addEventListener("click", () => { wizard.step = 2; renderWizardStep2(); });
-  body.querySelector("#wizNext3").addEventListener("click", () => {
+    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack4" type="button">← Назад</button><button class="button button-primary" id="wizNext4" type="button">Далее →</button></div>';
+  body.querySelector("#wizBack4").addEventListener("click", () => { wizard.step = 3; renderWizardStep3(); });
+  body.querySelector("#wizNext4").addEventListener("click", () => {
     const value = Number(body.querySelector("#wizCount").value);
     if (!Number.isInteger(value) || value < 1 || value > 20) { alert("Укажите количество от 1 до 20."); return; }
     if (wizard.freeCount !== null && value > wizard.freeCount) {
@@ -402,8 +434,8 @@ async function renderWizardStep3() {
     }
     wizard.count = value;
     wizard.manualSets = Array.from({length: value}, (_, i) => wizard.manualSets[i] || {headline: "", ad_text: "", image_url: ""});
-    wizard.step = 4;
-    renderWizardStep4();
+    wizard.step = 5;
+    renderWizardStep5();
   });
 }
 
@@ -411,7 +443,7 @@ function wizardModeOption(value, title, note) {
   return '<label class="mode-option"><input type="radio" name="wizMode" value="' + value + '"' + (wizard.creativeMode === value ? " checked" : "") + '><span class="mode-icon">●</span><span><strong>' + esc(title) + '</strong><small>' + esc(note) + '</small></span></label>';
 }
 
-function renderWizardStep4() {
+function renderWizardStep5() {
   const body = byId("wizardBody");
   const structureBlock = '<fieldset class="field field-wide mode-picker"><legend>Структура объявлений в группе каждого аккаунта</legend>' +
     '<label class="mode-option"><input type="radio" name="wizStructure" value="single"' + (wizard.adsPerGroup <= 1 ? " checked" : "") + '><span class="mode-icon">1</span><span><strong>Одно объявление на аккаунт</strong><small>Один фиксированный креатив на кампанию.</small></span></label>' +
@@ -438,9 +470,9 @@ function renderWizardStep4() {
       '<label class="field field-wide">Ссылка на изображение (необязательно)<input data-manual-image="' + i + '" value="' + esc(set.image_url || "") + '"></label>' +
     '</div></div>'
   )).join("");
-  body.innerHTML = wizardStepsNav(4) + structureBlock + modeOptions +
+  body.innerHTML = wizardStepsNav(5) + structureBlock + modeOptions +
     '<div id="wizCreativeArea">' + (wizard.creativeMode === "manual_per_account" ? manualForm : poolForm) + '</div>' +
-    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack4" type="button">← Назад</button><button class="button button-primary" id="wizLaunch" type="button">Запустить массовый запуск</button></div>' +
+    '<div class="wizard-actions"><button class="button button-ghost" id="wizBack5" type="button">← Назад</button><button class="button button-primary" id="wizLaunch" type="button">Запустить массовый запуск</button></div>' +
     '<div id="wizLaunchMessage" class="form-message"></div>';
   body.querySelectorAll('input[name="wizStructure"]').forEach((input) => {
     input.addEventListener("change", (event) => {
@@ -450,7 +482,7 @@ function renderWizardStep4() {
       } else {
         wizard.adsPerGroup = 1;
       }
-      renderWizardStep4();
+      renderWizardStep5();
     });
   });
   if (byId("wizAdsPerGroup")) {
@@ -470,7 +502,7 @@ function renderWizardStep4() {
       }
       wizard.creativeMode = event.target.value;
       if (wizard.creativeMode !== "shuffle") wizard.adsPerGroup = 1;
-      renderWizardStep4();
+      renderWizardStep5();
     });
   });
   body.querySelectorAll("[data-manual-headline]").forEach((input) => {
@@ -482,7 +514,7 @@ function renderWizardStep4() {
   body.querySelectorAll("[data-manual-image]").forEach((input) => {
     input.addEventListener("input", (event) => { wizard.manualSets[Number(event.target.dataset.manualImage)].image_url = event.target.value; });
   });
-  body.querySelector("#wizBack4").addEventListener("click", () => { wizard.step = 3; renderWizardStep3(); });
+  body.querySelector("#wizBack5").addEventListener("click", () => { wizard.step = 4; renderWizardStep4(); });
   body.querySelector("#wizLaunch").addEventListener("click", wizardLaunch);
 }
 

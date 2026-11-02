@@ -51,7 +51,7 @@ class FakeClickRUClient:
         assert goal_id is not None
         return 60000 + int(client_login.split("-")[1])
 
-    async def create_adgroup(self, client_login, campaign_id, name, region_ids):
+    async def create_adgroup(self, client_login, campaign_id, name, region_ids, negative_keywords=None):
         assert region_ids == [225]
         return 80000 + campaign_id
 

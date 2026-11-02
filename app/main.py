@@ -646,7 +646,7 @@ async def preview_plan(project_id: int, _: AuthUser):
     return CampaignPlan(
         project_id=project_id,
         campaign_mode=project["campaign_mode"],
-        strategy=project["strategy"],
+        strategy="AVERAGE_CRR",  # bulk-create always uses this, по продуктовому решению — не настраивается
         items=items,
     )
 
@@ -821,8 +821,8 @@ async def bulk_create_campaigns(project_id: int, payload: BulkCampaignCreateRequ
     if project is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
-    headlines = project.get("headlines") or ([project["headline"]] if project.get("headline", "").strip() else [])
-    ad_texts = project.get("ad_texts") or ([project["ad_text"]] if project.get("ad_text", "").strip() else [])
+    headlines = project.get("headlines") or []
+    ad_texts = project.get("ad_texts") or []
 
     if payload.creative_mode in ("shuffle", "duplicate_single") and (not headlines or not ad_texts):
         raise HTTPException(
@@ -871,11 +871,12 @@ async def _run_bulk_job(
     pool_client: ParsYaPoolClient,
     payload: BulkCampaignCreateRequest,
 ) -> None:
-    headlines = project.get("headlines") or ([project["headline"]] if project.get("headline", "").strip() else [])
-    ad_texts = project.get("ad_texts") or ([project["ad_text"]] if project.get("ad_text", "").strip() else [])
+    headlines = project.get("headlines") or []
+    ad_texts = project.get("ad_texts") or []
     sitelinks_pool = project.get("sitelinks_pool") or []
     callouts_pool = project.get("callouts_pool") or []
     image_urls = project.get("image_urls") or []
+    negative_keywords = [line.strip() for line in project.get("negative_keywords", "").splitlines() if line.strip()]
 
     try:
         for index in range(payload.count):
@@ -952,7 +953,10 @@ async def _run_bulk_job(
                         # sink the whole account.
                         note = f"Корректировка для мобильных не применена: {exc}"
 
-                ad_group_id = await client.create_adgroup(client_login, campaign_id, project["name"], project["region_ids"])
+                ad_group_id = await client.create_adgroup(
+                    client_login, campaign_id, project["name"], project["region_ids"],
+                    negative_keywords=negative_keywords or None,
+                )
                 await client.add_keywords(client_login, ad_group_id, phrases)
 
                 # ads_per_group (wizard step 4, "структура объявлений"): >1

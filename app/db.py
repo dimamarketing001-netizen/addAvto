@@ -9,11 +9,15 @@ from typing import Any
 
 
 PROJECT_FIELDS = [
-    "name", "domain", "campaign_mode", "strategy", "target_drr", "budget", "lead_value",
-    "headline", "ad_text", "keywords", "negative_keywords", "image_urls",
+    "name", "domain", "campaign_mode", "target_drr",
+    "keywords", "negative_keywords", "image_urls",
     "region_ids", "headlines", "ad_texts", "sitelinks_pool", "callouts_pool",
     "mobile_bid_adjustment_percent",
 ]
+# strategy/budget/lead_value/headline/ad_text columns still exist in the
+# `projects` table (old rows have real values) but are no longer written —
+# they were decorative, never read by bulk-create (see ProjectIn's
+# docstring in schemas.py, 2026-11-02).
 
 _JSON_PROJECT_FIELDS = (
     "image_urls", "region_ids", "headlines", "ad_texts",

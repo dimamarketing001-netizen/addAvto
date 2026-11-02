@@ -9,7 +9,7 @@
 <body>
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">D</div><div><strong>Direct Manager</strong><small>Click.ru · Яндекс Директ</small></div></div>
-    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Подключение Click.ru</a><a class="nav-link" href="#reports">Отчётность</a><a class="nav-link" href="/lk">Конверсии в Метрику</a></nav>
+    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Аккаунты Click.ru</a><a class="nav-link" href="#reports">Отчётность</a><a class="nav-link" href="/lk">Конверсии в Метрику</a></nav>
     <div class="sidebar-foot"><span class="status-dot"></span> Локальная панель<small>Массовый запуск создаёт только черновики</small></div>
   </aside>
   <main class="main">
@@ -21,35 +21,9 @@
       <article class="metric-card"><div class="metric-label">Аккаунты Click.ru</div><div class="metric-value metric-status" id="metricConnection">—</div><div class="metric-foot">Подключено</div></article>
     </section>
     <section id="projects" class="panel">
-      <div class="panel-heading"><div><div class="eyebrow">ШАБЛОН КАМПАНИИ</div><h2>Новый рекламный проект</h2></div><span class="chip">Настройки сохраняются</span></div>
-      <div class="notice notice-info">Выбери структуру размещения: раздельные кампании Поиск и РСЯ либо одна ЕПК, где включены оба места показа. Счётчик Метрики, цель lead и сам рекламный аккаунт создаются автоматически для КАЖДОГО запуска из пула ParsYa — вручную их указывать не нужно.</div>
-      <form id="projectForm">
-        <div class="form-grid">
-          <label class="field field-wide">Название проекта<input name="name" placeholder="Например, БФЛ — Казань" required maxlength="120"></label>
-          <label class="field field-wide">Домен / посадочная страница<input name="domain" placeholder="https://example.ru/" required></label>
-          <fieldset class="field field-wide mode-picker"><legend>Структура рекламных кампаний</legend>
-            <label class="mode-option"><input type="radio" name="campaign_mode" value="separate" checked><span class="mode-icon">Ⅱ</span><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ. Раздельные бюджеты и отчёты.</small></span></label>
-            <label class="mode-option"><input type="radio" name="campaign_mode" value="single_epk"><span class="mode-icon">▣</span><span><strong>Одна ЕПК</strong><small>Одна Единая перфоманс-кампания с включёнными Поиском и РСЯ.</small></span></label>
-          </fieldset>
-          <label class="field">Стратегия<select name="strategy"><option value="AVERAGE_CRR">ДРР, оплата за клики (AVERAGE_CRR)</option><option value="PAY_FOR_CONVERSION_CRR">ДРР, оплата за конверсии (PAY_FOR_CONVERSION_CRR)</option></select><small>Доступность стратегии зависит от требований Яндекса к аккаунту и конверсиям.</small></label>
-          <label class="field">Целевой ДРР, %<input name="target_drr" type="number" min="0.1" max="1000" step="0.1" value="30" required></label>
-          <label class="field">Бюджет, ₽<input name="budget" type="number" min="0" step="100" value="20000" required></label>
-          <label class="field">Ценность лида, ₽<input name="lead_value" type="number" min="0" step="100" value="0"><small>Нужно для расчёта и оптимизации по денежной ценности конверсии.</small></label>
-          <label class="field">Заголовок<input name="headline" maxlength="200" placeholder="Заголовок объявления"></label>
-          <label class="field field-wide">Текст объявления<textarea name="ad_text" rows="3" maxlength="2000" placeholder="Текст, который будет использоваться в объявлении"></textarea></label>
-          <label class="field field-wide">Ключевые фразы — по одной на строку<textarea name="keywords" rows="3" placeholder="юрист по банкротству&#10;списание долгов"></textarea></label>
-          <label class="field field-wide">Минус-фразы — по одной на строку<textarea name="negative_keywords" rows="2" placeholder="бесплатно&#10;вакансии"></textarea></label>
-          <label class="field field-wide">Ссылки на изображения — по одной на строку<textarea name="image_urls" rows="2" placeholder="https://example.ru/banner.jpg"></textarea></label>
-          <label class="field field-wide">ID регионов Яндекса — через запятую<input name="region_ids" placeholder="Например, 213"></label>
-          <label class="field">Корректировка ставки для мобильных, % (необязательно)<input name="mobile_bid_adjustment_percent" type="number" min="-100" max="1200" placeholder="например, -50"><small>-50 снизит ставку на мобильных на 50%, 200 — повысит в 2 раза. Пусто — без корректировки.</small></label>
-        </div>
-        <div class="form-actions"><span class="muted small">Реальный запуск показов выполняется отдельным явным подтверждением.</span><button class="button button-primary" type="submit">Сохранить проект</button></div>
-        <div id="formMessage" class="form-message" role="status"></div>
-      </form>
-    </section>
-    <section class="panel">
-      <div class="panel-heading"><div><div class="eyebrow">СОХРАНЁННЫЕ НАСТРОЙКИ</div><h2>Проекты</h2></div><button class="button button-ghost button-small" id="reloadProjects">Обновить список</button></div>
-      <div class="table-wrap"><table><thead><tr><th>Проект / домен</th><th>Режим</th><th>Стратегия</th><th>ДРР</th><th>Бюджет</th><th></th></tr></thead><tbody id="projectsRows"><tr><td colspan="6" class="empty">Загрузка…</td></tr></tbody></table></div>
+      <div class="panel-heading"><div><div class="eyebrow">ШАБЛОН КАМПАНИИ</div><h2>Рекламные проекты</h2></div><div class="row-actions"><button class="button button-ghost button-small" id="reloadProjects">Обновить список</button><button class="button button-primary button-small" id="newProjectButton">+ Новый проект</button></div></div>
+      <div class="notice notice-info">Всё — от названия и гео до аккаунта Click.ru и креативов — заполняется пошагово в мастере «+ Новый проект» / «Массовый запуск». Счётчик Метрики, цель lead и сам рекламный аккаунт создаются автоматически для КАЖДОГО запуска из пула ParsYa.</div>
+      <div class="table-wrap"><table><thead><tr><th>Проект / домен</th><th>Режим</th><th>ДРР</th><th></th></tr></thead><tbody id="projectsRows"><tr><td colspan="4" class="empty">Загрузка…</td></tr></tbody></table></div>
       <div id="planOutput" class="plan-output hidden"></div>
       <div id="bulkOutput" class="plan-output hidden"></div>
     </section>

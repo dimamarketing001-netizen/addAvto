@@ -348,15 +348,27 @@ class ClickRUClient:
         return int(first["Id"])
 
     async def create_adgroup(
-        self, client_login: str, campaign_id: int, name: str, region_ids: list[int]
+        self,
+        client_login: str,
+        campaign_id: int,
+        name: str,
+        region_ids: list[int],
+        negative_keywords: list[str] | None = None,
     ) -> int:
-        """AdGroups.add for a TextAdGroup — minimal required fields only
-        (Name, CampaignId, RegionIds). Keywords and ads are separate calls
-        (Keywords.add / Ads.add), not nestable here.
+        """AdGroups.add for a TextAdGroup — minimal required fields
+        (Name, CampaignId, RegionIds) plus optional NegativeKeywords
+        (shared by every keyword in the group; Yandex caps this at 3
+        phrases, <=7 words each, <=4096 chars combined — not pre-validated
+        here, same "let Direct's own error be the validator" policy as
+        headline/text length elsewhere). Keywords and ads are separate
+        calls (Keywords.add / Ads.add), not nestable here.
         """
+        group: dict[str, Any] = {"Name": name, "CampaignId": campaign_id, "RegionIds": region_ids}
+        if negative_keywords:
+            group["NegativeKeywords"] = {"Items": negative_keywords}
         body = {
             "method": "add",
-            "params": {"AdGroups": [{"Name": name, "CampaignId": campaign_id, "RegionIds": region_ids}]},
+            "params": {"AdGroups": [group]},
         }
         data = await self.direct_api(client_login, "adgroups", body)
         add_results = (data.get("result") or {}).get("AddResults") or []

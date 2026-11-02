@@ -54,24 +54,29 @@ class CreativeSetIn(BaseModel):
 
 
 class ProjectIn(BaseModel):
+    """Создаётся ТОЛЬКО через визард массового запуска (шаг 1) — отдельной
+    формы создания проекта больше нет (убрана 2026-11-02 вместе со
+    `strategy`/`budget`/`lead_value`/`headline`/`ad_text`: все эти поля
+    были декоративными, bulk-create их никогда не читал — реальная
+    стратегия всегда AVERAGE_CRR, бюджет/ценность лида никуда не
+    передавались, headline/ad_text дублировали headlines/ad_texts пулы).
+    """
     name: str = Field(min_length=2, max_length=120)
     domain: str = Field(min_length=8, max_length=2048)
     campaign_mode: CampaignMode = "separate"
-    strategy: StrategyType = "AVERAGE_CRR"
     target_drr: float = Field(default=30, ge=0.1, le=1000)
-    budget: float = Field(default=20000, ge=0, le=100000000)
-    lead_value: float = Field(default=0, ge=0, le=100000000)
-    headline: str = Field(default="", max_length=200)
-    ad_text: str = Field(default="", max_length=2000)
     keywords: str = Field(default="", max_length=30000)
+    # Общие для группы минус-фразы (AdGroups.NegativeKeywords) — Яндекс
+    # ограничивает это максимум 3 фразами, до 7 слов каждая, не больше
+    # 4096 символов суммарно; не валидируем заранее, Direct сам откажет
+    # понятной ошибкой при превышении.
     negative_keywords: str = Field(default="", max_length=30000)
     image_urls: list[str] = Field(default_factory=list, max_length=20)
     region_ids: list[int] = Field(default_factory=list, max_length=300)
 
     # Creative pools for bulk campaign generation (POST /campaigns/bulk-create):
     # each generated campaign picks ONE random headline + ad_text + image,
-    # and a random SUBSET of sitelinks/callouts, from these. headline/
-    # ad_text/image_urls above are the fallback when a pool field is empty.
+    # and a random SUBSET of sitelinks/callouts, from these.
     headlines: list[str] = Field(default_factory=list, max_length=100)
     ad_texts: list[str] = Field(default_factory=list, max_length=100)
     sitelinks_pool: list[SitelinkIn] = Field(default_factory=list, max_length=100)
