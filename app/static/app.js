@@ -42,6 +42,21 @@ function showMessage(el, message, kind = "") {
   el.textContent = message;
   el.className = ("form-message " + kind).trim();
 }
+const IMAGE_UPLOAD_MAX_MB = 4;
+function readImageFilesAsDataUris(fileList) {
+  const files = Array.from(fileList || []);
+  const tooBig = files.find((f) => f.size > IMAGE_UPLOAD_MAX_MB * 1024 * 1024);
+  if (tooBig) {
+    alert('Файл "' + tooBig.name + '" больше ' + IMAGE_UPLOAD_MAX_MB + ' МБ — выберите файл меньшего размера.');
+    return Promise.resolve([]);
+  }
+  return Promise.all(files.map((file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("Не удалось прочитать файл " + file.name));
+    reader.readAsDataURL(file);
+  })));
+}
 function parseIds(value) {
   if (!value.trim()) return [];
   const raw = value.split(",").filter((x) => x.trim());
@@ -61,11 +76,15 @@ async function loadProjects() {
       return;
     }
     body.innerHTML = projects.map((p) => {
+      const editButton = p.has_launched
+        ? '<button class="link-button" disabled title="Проект уже запущен — изменить настройки нельзя">Редактировать</button>'
+        : '<button class="link-button" data-edit="' + p.id + '">Редактировать</button>';
+      const bulkLabel = p.has_launched ? "Запустить ещё" : "Массовый запуск";
       return '<tr>' +
         '<td><div class="project-title">' + esc(p.name) + '</div><div class="project-domain">' + esc(p.domain) + '</div></td>' +
         '<td><span class="mode-badge">' + esc(modeLabel(p.campaign_mode)) + '</span></td>' +
         '<td>' + num(p.target_drr) + '%</td>' +
-        '<td><div class="row-actions"><button class="link-button" data-plan="' + p.id + '">План</button><button class="link-button" data-bulk="' + p.id + '">Массовый запуск</button><button class="link-button" data-history="' + p.id + '">История</button><button class="link-button danger" data-delete="' + p.id + '">Удалить</button></div></td>' +
+        '<td><div class="row-actions">' + editButton + '<button class="link-button" data-plan="' + p.id + '">План</button><button class="link-button" data-bulk="' + p.id + '">' + bulkLabel + '</button><button class="link-button" data-duplicate="' + p.id + '" title="Создать копию с теми же настройками, которую можно запустить как есть или сначала отредактировать">Дублировать</button><button class="link-button" data-history="' + p.id + '">История</button><button class="link-button danger" data-delete="' + p.id + '">Удалить</button></div></td>' +
         '</tr>';
     }).join("");
   } catch (error) {
@@ -77,12 +96,31 @@ byId("newProjectButton").addEventListener("click", () => openWizard(null));
 let bulkCreatedTotal = 0;
 
 byId("projectsRows").addEventListener("click", async (event) => {
+  const editButton = event.target.closest("[data-edit]");
   const planButton = event.target.closest("[data-plan]");
   const bulkButton = event.target.closest("[data-bulk]");
+  const duplicateButton = event.target.closest("[data-duplicate]");
   const historyButton = event.target.closest("[data-history]");
   const deleteButton = event.target.closest("[data-delete]");
+  if (editButton) {
+    openWizard(Number(editButton.dataset.edit));
+    return;
+  }
   if (bulkButton) {
     openWizard(Number(bulkButton.dataset.bulk));
+    return;
+  }
+  if (duplicateButton) {
+    duplicateButton.disabled = true;
+    try {
+      const copy = await api("/api/projects/" + duplicateButton.dataset.duplicate + "/duplicate", {method: "POST", body: "{}"});
+      await loadProjects();
+      openWizard(copy.id);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      duplicateButton.disabled = false;
+    }
     return;
   }
   if (historyButton) {
@@ -217,7 +255,7 @@ byId("connRows").addEventListener("click", async (event) => {
 });
 
 const wizard = {
-  projectId: null, project: null, step: 1,
+  projectId: null, project: null, step: 1, locked: false,
   connections: [], connectionId: null,
   payers: [], payerId: null,
   freeCount: null, count: 1,
@@ -274,6 +312,7 @@ async function openWizard(projectId) {
   }
   wizard.projectId = projectId || null;
   wizard.project = project;
+  wizard.locked = !!(project && project.has_launched);
   wizard.step = 1;
   wizard.connectionId = null;
   wizard.payerId = null;
@@ -306,6 +345,27 @@ function geoRegionLabel(region) {
 async function renderWizardStep1() {
   const body = byId("wizardBody");
   const p = wizard.project || {};
+  if (wizard.locked) {
+    const regionsLocked = await loadGeoRegions();
+    const byIdLocked = new Map(regionsLocked.map((r) => [r.id, r]));
+    const regionLabels = (p.region_ids || []).map((id) => {
+      const r = byIdLocked.get(id);
+      return r ? geoRegionLabel(r) : ("ID " + id);
+    });
+    body.innerHTML = wizardStepsNav(1) +
+      '<div class="notice notice-info">Проект уже запущен — название, домен, ключевые фразы и регион показа больше нельзя менять, ' +
+      'чтобы они не расходились с уже созданными кампаниями. Дальше можно запустить ещё аккаунты с теми же настройками.</div>' +
+      '<div class="form-grid">' +
+        '<div class="field field-wide field-readonly"><span>Название проекта</span><strong>' + esc(p.name || "") + '</strong></div>' +
+        '<div class="field field-wide field-readonly"><span>Домен / посадочная страница</span><strong>' + esc(p.domain || "") + '</strong></div>' +
+        '<div class="field field-readonly"><span>Структура кампаний</span><strong>' + (p.campaign_mode === "single_epk" ? "Одна ЕПК" : "Отдельные РК") + '</strong></div>' +
+        '<div class="field field-readonly"><span>Целевой ДРР</span><strong>' + esc(p.target_drr ?? "") + '%</strong></div>' +
+        '<div class="field field-wide field-readonly"><span>Регион показа</span><strong>' + esc(regionLabels.join(", ") || "—") + '</strong></div>' +
+      '</div>' +
+      '<div class="wizard-actions"><span></span><button class="button button-primary" id="wizNext1" type="button">Далее →</button></div>';
+    body.querySelector("#wizNext1").addEventListener("click", () => { wizard.step = 2; renderWizardStep2(); });
+    return;
+  }
   if (!wizard.regionSelections) {
     const regions = await loadGeoRegions();
     const byId_ = new Map(regions.map((r) => [r.id, r]));
@@ -319,8 +379,8 @@ async function renderWizardStep1() {
       '<label class="field field-wide">Название проекта<input id="wizPName" value="' + esc(p.name || "") + '" required maxlength="120" placeholder="Например, БФЛ — Казань"></label>' +
       '<label class="field field-wide">Домен / посадочная страница<input id="wizPDomain" value="' + esc(p.domain || "") + '" required placeholder="https://example.ru/"></label>' +
       '<fieldset class="field field-wide mode-picker"><legend>Структура рекламных кампаний</legend>' +
-        '<label class="mode-option"><input type="radio" name="wizPMode" value="separate"' + ((p.campaign_mode || "separate") === "separate" ? " checked" : "") + '><span class="mode-icon">Ⅱ</span><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ.</small></span></label>' +
-        '<label class="mode-option"><input type="radio" name="wizPMode" value="single_epk"' + (p.campaign_mode === "single_epk" ? " checked" : "") + '><span class="mode-icon">▣</span><span><strong>Одна ЕПК</strong><small>Единая перфоманс-кампания, Поиск+РСЯ вместе.</small></span></label>' +
+        '<label class="mode-option"><input type="radio" name="wizPMode" value="separate"' + ((p.campaign_mode || "separate") === "separate" ? " checked" : "") + '><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ.</small></span></label>' +
+        '<label class="mode-option"><input type="radio" name="wizPMode" value="single_epk"' + (p.campaign_mode === "single_epk" ? " checked" : "") + '><span><strong>Одна ЕПК</strong><small>Единая перфоманс-кампания, Поиск+РСЯ вместе.</small></span></label>' +
       '</fieldset>' +
       '<label class="field">Целевой ДРР, %<input id="wizPDrr" type="number" min="0.1" max="1000" step="0.1" value="' + esc(p.target_drr ?? 30) + '" required></label>' +
       '<label class="field">Корректировка ставки для мобильных, % (необязательно)<input id="wizPMobile" type="number" min="-100" max="1200" value="' + esc(p.mobile_bid_adjustment_percent ?? "") + '" placeholder="например, -50"></label>' +
@@ -652,39 +712,43 @@ async function renderWizardStep4() {
   });
 }
 
-function wizardModeOption(value, icon, title, note) {
-  return '<label class="mode-option"><input type="radio" name="wizMode" value="' + value + '"' + (wizard.creativeMode === value ? " checked" : "") + '><span class="mode-icon">' + icon + '</span><span><strong>' + esc(title) + '</strong><small>' + esc(note) + '</small></span></label>';
+function wizardModeOption(value, title, note) {
+  return '<label class="mode-option"><input type="radio" name="wizMode" value="' + value + '"' + (wizard.creativeMode === value ? " checked" : "") + '><span><strong>' + esc(title) + '</strong><small>' + esc(note) + '</small></span></label>';
 }
 
 function renderWizardStep5() {
   const body = byId("wizardBody");
   const accountsN = wizard.count;
   const structureBlock = '<fieldset class="field field-wide mode-picker"><legend>Сколько объявлений создавать в группе каждого аккаунта</legend>' +
-    '<label class="mode-option"><input type="radio" name="wizStructure" value="single"' + (wizard.adsPerGroup <= 1 ? " checked" : "") + '><span class="mode-icon">1</span><span><strong>Одно объявление</strong><small>Простой и предсказуемый вариант: у каждого аккаунта один фиксированный заголовок, текст и картинка.</small></span></label>' +
-    '<label class="mode-option"><input type="radio" name="wizStructure" value="multi"' + (wizard.adsPerGroup > 1 ? " checked" : "") + '><span class="mode-icon">N</span><span><strong>Несколько объявлений (A/B)</strong><small>До 50 вариантов в одной группе — Директ сам покажет чаще тот, что лучше работает. Доступно только вместе с режимом «Скрипт перемешает» ниже.</small></span></label>' +
+    '<label class="mode-option"><input type="radio" name="wizStructure" value="single"' + (wizard.adsPerGroup <= 1 ? " checked" : "") + '><span><strong>Одно объявление</strong><small>Простой и предсказуемый вариант: у каждого аккаунта один фиксированный заголовок, текст и картинка.</small></span></label>' +
+    '<label class="mode-option"><input type="radio" name="wizStructure" value="multi"' + (wizard.adsPerGroup > 1 ? " checked" : "") + '><span><strong>Несколько объявлений (A/B)</strong><small>До 50 вариантов в одной группе — Директ сам покажет чаще тот, что лучше работает. Доступно только вместе с режимом «Скрипт перемешает» ниже.</small></span></label>' +
     '</fieldset>' +
     (wizard.adsPerGroup > 1
       ? '<label class="field">Сколько вариантов объявления в группе (от 2 до 50)<input id="wizAdsPerGroup" type="number" min="2" max="50" value="' + wizard.adsPerGroup + '"></label>'
       : "");
   const modeOptions = '<fieldset class="field field-wide mode-picker"><legend>Откуда брать заголовки, тексты и картинки для ' + accountsN + ' ' + accountsWord(accountsN) + '</legend>' +
-    wizardModeOption("shuffle", "⇄", "Скрипт перемешает сам",
+    wizardModeOption("shuffle", "Скрипт перемешает сам",
       "Вы один раз загружаете список заголовков, текстов и картинок ниже — для каждого аккаунта (и каждого объявления, если их несколько) скрипт случайно собирает из них свою связку.") +
-    wizardModeOption("duplicate_single", "⧉", "Один набор на все аккаунты",
+    wizardModeOption("duplicate_single", "Один набор на все аккаунты",
       "Вы вводите ОДИН заголовок, текст и картинку — они без изменений попадут во все " + accountsN + " " + accountsWord(accountsN) + ".") +
-    wizardModeOption("manual_per_account", "✎", "Свой набор на каждый аккаунт",
+    wizardModeOption("manual_per_account", "Свой набор на каждый аккаунт",
       "Вы вручную заполняете " + accountsN + " " + (accountsN === 1 ? "форму" : "форм") + " — по одной на каждый аккаунт, с собственным заголовком, текстом и картинкой.") +
     '</fieldset>';
   const poolForm =
     '<label class="field field-wide">Заголовки — по одному на строку (до 56 символов)<textarea id="wizHeadlines" rows="3">' + esc(wizard.pool.headlines) + '</textarea></label>' +
     '<label class="field field-wide">Тексты объявлений — по одному на строку (до 81 символа)<textarea id="wizAdTexts" rows="3">' + esc(wizard.pool.ad_texts) + '</textarea></label>' +
-    '<label class="field field-wide">Ссылки на изображения — по одной на строку (необязательно)<textarea id="wizImages" rows="2">' + esc(wizard.pool.image_urls) + '</textarea></label>' +
+    '<label class="field field-wide">Изображения — вставьте ссылки (по одной на строку) или выберите файлы ниже (необязательно)<textarea id="wizImages" rows="2">' + esc(wizard.pool.image_urls) + '</textarea>' +
+      '<input type="file" id="wizImagesFile" accept="image/jpeg,image/png,image/gif" multiple>' +
+      '<small>JPG/PNG/GIF, до ' + IMAGE_UPLOAD_MAX_MB + ' МБ на файл — выбранные файлы сами добавятся строками в поле выше.</small>' +
+    '</label>' +
     '<label class="field field-wide">Уточнения (callouts) — по одному на строку, до 25 символов (необязательно, до 5 на объявление)<textarea id="wizCallouts" rows="2">' + esc(wizard.pool.callouts) + '</textarea></label>' +
     '<label class="field field-wide">Быстрые ссылки (sitelinks) — по одной на строку: «Заголовок|Ссылка|Описание» (описание необязательно, до 4 на объявление)<textarea id="wizSitelinks" rows="3" placeholder="Доставка|https://example.ru/delivery|Условия доставки">' + esc(wizard.pool.sitelinks) + '</textarea></label>';
   const manualForm = wizard.manualSets.map((set, i) => (
     '<div class="wizard-creative-set"><strong>Аккаунт ' + (i + 1) + '</strong><div class="wizard-creative-grid">' +
       '<label class="field">Заголовок<input data-manual-headline="' + i + '" maxlength="56" value="' + esc(set.headline) + '"></label>' +
       '<label class="field field-wide">Текст объявления<input data-manual-adtext="' + i + '" maxlength="81" value="' + esc(set.ad_text) + '"></label>' +
-      '<label class="field field-wide">Ссылка на изображение (необязательно)<input data-manual-image="' + i + '" value="' + esc(set.image_url || "") + '"></label>' +
+      '<label class="field field-wide">Ссылка на изображение или файл (необязательно)<input data-manual-image="' + i + '" value="' + esc((set.image_url || "").startsWith("data:") ? "" : (set.image_url || "")) + '" placeholder="' + (((set.image_url || "").startsWith("data:")) ? "Файл загружен ✓ (выберите другой, чтобы заменить)" : "https://example.ru/banner.jpg") + '">' +
+      '<input type="file" data-manual-image-file="' + i + '" accept="image/jpeg,image/png,image/gif" style="margin-top:6px"></label>' +
     '</div></div>'
   )).join("");
   body.innerHTML = wizardStepsNav(5) + structureBlock + modeOptions +
@@ -731,6 +795,29 @@ function renderWizardStep5() {
   });
   body.querySelectorAll("[data-manual-image]").forEach((input) => {
     input.addEventListener("input", (event) => { wizard.manualSets[Number(event.target.dataset.manualImage)].image_url = event.target.value; });
+  });
+  if (byId("wizImagesFile")) {
+    byId("wizImagesFile").addEventListener("change", async (event) => {
+      const uris = await readImageFilesAsDataUris(event.target.files);
+      event.target.value = "";
+      if (!uris.length) return;
+      const textarea = byId("wizImages");
+      const existing = textarea.value.trim();
+      textarea.value = (existing ? existing + "\n" : "") + uris.join("\n");
+      wizard.pool.image_urls = textarea.value;
+    });
+  }
+  body.querySelectorAll("[data-manual-image-file]").forEach((fileInput) => {
+    fileInput.addEventListener("change", async (event) => {
+      const i = Number(event.target.dataset.manualImageFile);
+      const [uri] = await readImageFilesAsDataUris(event.target.files);
+      event.target.value = "";
+      if (!uri) return;
+      wizard.manualSets[i].image_url = uri;
+      const textInput = body.querySelector('[data-manual-image="' + i + '"]');
+      textInput.value = "";
+      textInput.placeholder = "Файл загружен ✓ (выберите другой, чтобы заменить)";
+    });
   });
   body.querySelector("#wizBack5").addEventListener("click", () => { wizard.step = 4; renderWizardStep4(); });
   body.querySelector("#wizLaunch").addEventListener("click", wizardLaunch);

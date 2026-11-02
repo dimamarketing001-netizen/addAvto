@@ -318,6 +318,17 @@ def create_bulk_job(project_id: int, requested: int) -> int:
         return int(cursor.lastrowid)
 
 
+def has_bulk_job(project_id: int) -> bool:
+    """True once at least one bulk-create job (any status) has ever been
+    started for this project — used to lock project editing after launch
+    (см. ProjectIn в main.py: редактирование разрешено только до первого
+    запуска, иначе уже созданные кампании и отредактированные позже
+    настройки проекта расходятся между собой)."""
+    with connect() as db:
+        row = db.execute("SELECT 1 FROM bulk_jobs WHERE project_id = ? LIMIT 1", (project_id,)).fetchone()
+    return row is not None
+
+
 def get_running_bulk_job(project_id: int) -> dict[str, Any] | None:
     with connect() as db:
         row = db.execute(

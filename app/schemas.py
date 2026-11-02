@@ -176,10 +176,18 @@ class ProjectIn(BaseModel):
     @field_validator("image_urls")
     @classmethod
     def validate_images(cls, value: list[str]) -> list[str]:
+        # Yandex Direct's AdImages.add only ever takes raw base64 image
+        # bytes — it has no concept of a URL at all. "image_urls" историческое
+        # имя поля: ссылка — это НАШЕ удобство (main.py сам её скачивает),
+        # а "data:image/...;base64,..." — прямая загрузка с компьютера
+        # (см. wizard шаг 5) — оставляем как есть, без HttpUrl-валидации.
         cleaned: list[str] = []
         for item in value:
             item = item.strip()
             if not item:
+                continue
+            if item.startswith("data:image/"):
+                cleaned.append(item)
                 continue
             parsed = HttpUrl(item)
             cleaned.append(str(parsed))

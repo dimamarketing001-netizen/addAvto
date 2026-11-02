@@ -360,15 +360,34 @@ async def get_geo_regions(_: AuthUser):
         )
     try:
         accounts = await client.accounts()
-        account = next((a for a in accounts if a.get("serviceLogin")), None)
-        if account is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Нет ни одного Директ-аккаунта с serviceLogin — справочник регионов недоступен.",
-            )
-        result = await client.dictionaries(account["serviceLogin"], ["GeoRegions"])
     except ClickRUError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Не каждый serviceLogin в пуле — настоящий логин Яндекс.Директа: среди
+    # подключённых через Click.ru аккаунтов встречаются интеграции других
+    # сетей (например "zzclickadwords-..." — это Google Ads, а не Директ) и
+    # неактивные логины, которые Dictionaries.get отвергает с ошибкой
+    # "Логин не найден или неактивен", хотя Click.ru помечает сам аккаунт
+    # ACTIVE. Поэтому пробуем по очереди (сначала ACTIVE), а не берём первый
+    # попавшийся — иначе один неудачный логин навсегда ломает справочник.
+    candidates = [a for a in accounts if a.get("serviceLogin")]
+    candidates.sort(key=lambda a: a.get("status") != "ACTIVE")
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail="Нет ни одного Директ-аккаунта с serviceLogin — справочник регионов недоступен.",
+        )
+    result = None
+    last_error: ClickRUError | None = None
+    for account in candidates[:15]:
+        try:
+            result = await client.dictionaries(account["serviceLogin"], ["GeoRegions"])
+            break
+        except ClickRUError as exc:
+            last_error = exc
+            continue
+    if result is None:
+        raise HTTPException(status_code=502, detail=str(last_error))
 
     raw = result.get("GeoRegions") or []
     items = []
@@ -713,7 +732,10 @@ async def list_parsya_pool_accounts(_: AuthUser):
 
 @app.get("/api/projects")
 async def get_projects(_: AuthUser):
-    return {"items": db.list_projects()}
+    items = db.list_projects()
+    for item in items:
+        item["has_launched"] = db.has_bulk_job(item["id"])
+    return {"items": items}
 
 
 @app.post("/api/projects", status_code=201)
@@ -723,10 +745,30 @@ async def create_project(project: ProjectIn, _: AuthUser):
 
 @app.put("/api/projects/{project_id}")
 async def update_project(project_id: int, project: ProjectIn, _: AuthUser):
+    if db.has_bulk_job(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Проект уже запущен — редактирование настроек недоступно (чтобы не разойтись с уже созданными кампаниями).",
+        )
     item = db.update_project(project_id, project.model_dump(mode="json"))
     if item is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
     return item
+
+
+@app.post("/api/projects/{project_id}/duplicate", status_code=201)
+async def duplicate_project(project_id: int, _: AuthUser):
+    """Копия проекта со всеми настройками (ключевые фразы, регионы, пулы
+    креативов) — для случая "запустить то же самое ещё раз, может с
+    правками". Копия — всегда новый, никогда не запущенный проект, так
+    что её можно редактировать независимо от того, запущен ли оригинал.
+    """
+    source = db.get_project(project_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    data = {field: source.get(field) for field in db.PROJECT_FIELDS}
+    data["name"] = (data.get("name") or "").strip() + " (копия)"
+    return db.create_project(data)
 
 
 @app.delete("/api/projects/{project_id}")
@@ -853,6 +895,12 @@ async def _resolve_client_login(client: ClickRUClient, account_id: int) -> str:
 
 
 async def _download_image_base64(url: str) -> str:
+    # "data:image/...;base64,..." — файл, загруженный пользователем прямо
+    # с компьютера (визард, шаг 5) — уже сырые base64-байты, скачивать
+    # нечего, просто отрезаем заголовок data-URI.
+    if url.startswith("data:image/"):
+        _, _, data = url.partition(",")
+        return data
     async with httpx.AsyncClient(timeout=20.0) as http_client:
         response = await http_client.get(url)
         response.raise_for_status()

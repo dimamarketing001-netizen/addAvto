@@ -245,6 +245,82 @@ def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
         assert calls["dictionaries"] == 1
 
 
+def test_geo_regions_skips_accounts_with_invalid_login(tmp_path, monkeypatch):
+    """2026-11-02: пул аккаунтов Click.ru содержит логины, которые
+    Dictionaries.get не принимает (другие интеграции типа
+    zzclickadwords-*, неактивные логины) — первый попавшийся serviceLogin
+    не гарантирует успех, нужно пробовать следующий."""
+    from app.click_client import ClickRUClient, ClickRUError
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-fallback-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    async def fake_accounts(self):
+        return [
+            {"id": 1, "serviceLogin": "zzclickadwords-1-xxx", "status": "ACTIVE"},
+            {"id": 2, "serviceLogin": "porg-good", "status": "ACTIVE"},
+        ]
+
+    async def fake_dictionaries(self, client_login, names):
+        if client_login == "zzclickadwords-1-xxx":
+            raise ClickRUError("Логин не найден или неактивен")
+        return {"GeoRegions": [{"GeoRegionId": 213, "GeoRegionName": "Москва", "ParentGeoRegionNames": {"Items": ["Россия"]}}]}
+
+    monkeypatch.setattr(ClickRUClient, "accounts", fake_accounts)
+    monkeypatch.setattr(ClickRUClient, "dictionaries", fake_dictionaries)
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        response = client.get("/api/geo-regions", auth=auth)
+        assert response.status_code == 200, response.text
+        assert {item["name"] for item in response.json()["items"]} == {"Москва"}
+
+
+def test_project_locked_after_launch_but_duplicate_is_editable(tmp_path, monkeypatch):
+    from app import db
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "lock-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "")
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        created = client.post("/api/projects", auth=auth, json={
+            "name": "Проект", "domain": "https://example.ru",
+            "campaign_mode": "separate", "target_drr": 30,
+            "keywords": "lawyer", "region_ids": [213],
+        }).json()
+
+        items = client.get("/api/projects", auth=auth).json()["items"]
+        assert next(p for p in items if p["id"] == created["id"])["has_launched"] is False
+
+        db.create_bulk_job(created["id"], requested=1)
+
+        items = client.get("/api/projects", auth=auth).json()["items"]
+        assert next(p for p in items if p["id"] == created["id"])["has_launched"] is True
+
+        created["name"] = "Изменённое имя"
+        blocked = client.put(f"/api/projects/{created['id']}", auth=auth, json=created)
+        assert blocked.status_code == 409, blocked.text
+
+        duplicate = client.post(f"/api/projects/{created['id']}/duplicate", auth=auth)
+        assert duplicate.status_code == 201, duplicate.text
+        copy = duplicate.json()
+        assert copy["id"] != created["id"]
+        assert copy["name"] == "Проект (копия)"
+        assert copy["keywords"] == "lawyer"
+        assert copy["region_ids"] == [213]
+
+        copy["name"] = "Отредактированная копия"
+        edit_copy = client.put(f"/api/projects/{copy['id']}", auth=auth, json=copy)
+        assert edit_copy.status_code == 200, edit_copy.text
+
+
 def test_activate_campaign_requires_marking_schema(tmp_path, monkeypatch):
     from app.click_client import ClickRUClient
 
