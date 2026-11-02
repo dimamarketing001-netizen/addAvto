@@ -1,3 +1,4 @@
+// НЕ РЕДАКТИРОВАТЬ ОТСЮДА — см. предупреждение в app/lk.py. deploy.sh исключает этот файл.
 "use strict";
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));

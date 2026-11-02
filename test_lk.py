@@ -1,3 +1,4 @@
+# НЕ РЕДАКТИРОВАТЬ ОТСЮДА — см. предупреждение в app/lk.py. deploy.sh исключает этот файл.
 import asyncio
 import base64
 import os
