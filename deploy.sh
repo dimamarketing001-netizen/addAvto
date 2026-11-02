@@ -52,6 +52,11 @@ for p in "${LK_OWNED_PATHS[@]}"; do
   fi
 done
 
+echo "--- copying current live /lk files into staging so app.main can import (read-only, never synced back) ---"
+for p in "${LK_OWNED_PATHS[@]}"; do
+  ssh "$SERVER" "[ -e '$REMOTE_DIR/$p' ] && mkdir -p '$REMOTE_STAGING/$(dirname "$p")' && cp -r '$REMOTE_DIR/$p' '$REMOTE_STAGING/$p' || true"
+done
+
 echo "--- running tests in staging (real .env) ---"
 ssh "$SERVER" "cd '$REMOTE_STAGING' && python3.12 -m venv .venv && .venv/bin/pip install -q -r requirements.txt && DATABASE_PATH=./data_test/app.db .venv/bin/python -m pytest tests/ -q"
 
