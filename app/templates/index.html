@@ -4,12 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Direct Campaign Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
 </head>
 <body>
   <aside class="sidebar">
     <div class="brand"><div class="brand-mark">D</div><div><strong>Direct Manager</strong><small>Click.ru · Яндекс Директ</small></div></div>
-    <nav><a class="nav-link active" href="#overview">Обзор</a><a class="nav-link" href="#projects">Рекламные проекты</a><a class="nav-link" href="#connection">Аккаунты Click.ru</a><a class="nav-link" href="#reports">Отчётность</a><a class="nav-link" href="/lk">Конверсии в Метрику</a><a class="nav-link" href="/parser/">Парсер</a></nav>
+    <nav><a class="nav-link active" href="#overview"><i data-lucide="layout-grid"></i> Обзор</a><a class="nav-link" href="#projects"><i data-lucide="radar"></i> Рекламные проекты</a><a class="nav-link" href="#connection"><i data-lucide="plug"></i> Аккаунты Click.ru</a><a class="nav-link" href="#reports"><i data-lucide="activity"></i> Отчётность</a><a class="nav-link" href="/lk"><i data-lucide="line-chart"></i> Конверсии в Метрику</a><a class="nav-link" href="/parser/"><i data-lucide="scan-search"></i> Парсер</a></nav>
     <div class="sidebar-foot"><span class="status-dot"></span> Локальная панель<small>Массовый запуск создаёт только черновики</small></div>
   </aside>
   <main class="main">
@@ -55,5 +57,6 @@
     </div>
   </div>
   <script src="/static/app.js" defer></script>
+  <script>if(window.lucide)lucide.createIcons();</script>
 </body>
 </html>
