@@ -2,11 +2,24 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Ozon-режим массового запуска (app/ozon_ad_creator.py) резервным путём
+# открывает настоящий Chromium через Playwright, когда обычный HTTP-запрос
+# блокируется антиботом Ozon — ставим браузер и его системные зависимости
+# прямо в образ (--with-deps сам делает apt-get, поэтому делаем это ДО
+# переключения на appuser), плюс Xvfb: Ozon блокирует headless Chrome (см.
+# докстринг ozon_ad_creator.py), а у контейнера нет своего дисплея — CMD
+# ниже запускает uvicorn под xvfb-run, чтобы "видимому" браузеру было что
+# открыть.
+RUN playwright install --with-deps chromium && \
+    apt-get update && apt-get install -y --no-install-recommends xvfb xauth x11-utils && \
+    rm -rf /var/lib/apt/lists/* && \
+    chmod -R a+rX /opt/pw-browsers
 
 COPY app ./app
 RUN mkdir -p /app/data && useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
@@ -18,4 +31,4 @@ EXPOSE 8000
 # exposure regression from the previous bridge+port-mapping setup, which
 # only published 127.0.0.1:8000. Bind to loopback explicitly to keep the
 # same "nginx-only, nothing else reaches it directly" posture.
-CMD ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]
+CMD ["xvfb-run", "-a", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"]

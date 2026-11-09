@@ -3,6 +3,14 @@ services:
     build: .
     container_name: direct-campaign-manager
     restart: unless-stopped
+    # CMD now runs under xvfb-run (Ozon-режим массового запуска, см.
+    # Dockerfile) — its readiness handshake signals its own PID 1 via
+    # SIGUSR1, which the kernel silently drops for a PID-1 process with no
+    # real init (classic Docker gotcha). init:true gives the container a
+    # real PID 1 (tini) so that signal actually reaches the shell script —
+    # without it, xvfb-run hangs forever with zero log output, confirmed
+    # by testing locally (works instantly with --init, hangs without it).
+    init: true
     env_file:
       - .env
     # The ParsYa pool API is only reachable via the host's own 127.0.0.1
