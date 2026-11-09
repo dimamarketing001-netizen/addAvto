@@ -358,6 +358,7 @@ async function renderWizardStep1() {
       '<div class="form-grid">' +
         '<div class="field field-wide field-readonly"><span>Название проекта</span><strong>' + esc(p.name || "") + '</strong></div>' +
         '<div class="field field-wide field-readonly"><span>Домен / посадочная страница</span><strong>' + esc(p.domain || "") + '</strong></div>' +
+        (p.launch_mode === "ozon" ? '<div class="field field-wide field-readonly"><span>Источник креативов</span><strong>Директ Озон — ' + esc(p.ozon_url || "") + '</strong></div>' : "") +
         '<div class="field field-readonly"><span>Структура кампаний</span><strong>' + (p.campaign_mode === "single_epk" ? "Одна ЕПК" : "Отдельные РК") + '</strong></div>' +
         '<div class="field field-readonly"><span>Целевой ДРР</span><strong>' + esc(p.target_drr ?? "") + '%</strong></div>' +
         '<div class="field field-wide field-readonly"><span>Регион показа</span><strong>' + esc(regionLabels.join(", ") || "—") + '</strong></div>' +
@@ -374,10 +375,19 @@ async function renderWizardStep1() {
       return {id, label: r ? geoRegionLabel(r) : ("ID " + id)};
     });
   }
+  const launchMode = p.launch_mode || "direct";
   body.innerHTML = wizardStepsNav(1) +
     '<div class="form-grid">' +
-      '<label class="field field-wide">Название проекта<input id="wizPName" value="' + esc(p.name || "") + '" required maxlength="120" placeholder="Например, БФЛ — Казань"></label>' +
-      '<label class="field field-wide">Домен / посадочная страница<input id="wizPDomain" value="' + esc(p.domain || "") + '" required placeholder="https://example.ru/"></label>' +
+      '<label class="field field-wide">Название проекта<input id="wizPName" value="' + esc(p.name || "") + '" maxlength="120" placeholder="Например, БФЛ — Казань (можно оставить пустым для режима Озон — подставится название товара)"></label>' +
+      '<fieldset class="field field-wide mode-picker"><legend>Источник креативов</legend>' +
+        '<label class="mode-option"><input type="radio" name="wizLaunchMode" value="direct"' + (launchMode === "direct" ? " checked" : "") + '><span><strong>Обычный Директ</strong><small>Заголовки, тексты, картинки и ключевые фразы вводите сами (шаг 5).</small></span></label>' +
+        '<label class="mode-option"><input type="radio" name="wizLaunchMode" value="ozon"' + (launchMode === "ozon" ? " checked" : "") + '><span><strong>Директ Озон</strong><small>Даёте ссылку на карточку товара Ozon — скрипт сам парсит её и просит Gemini написать заголовки, тексты, ключевые фразы и подобрать картинки.</small></span></label>' +
+      '</fieldset>' +
+      '<div id="wizDomainBlock"' + (launchMode === "ozon" ? " hidden" : "") + '><label class="field field-wide">Домен / посадочная страница<input id="wizPDomain" value="' + esc(launchMode === "ozon" ? "" : (p.domain || "")) + '" placeholder="https://example.ru/"></label></div>' +
+      '<div id="wizOzonBlock"' + (launchMode === "ozon" ? "" : " hidden") + '>' +
+        '<label class="field field-wide">Ссылка на карточку товара Ozon<input id="wizPOzonUrl" value="' + esc(p.ozon_url || "") + '" placeholder="https://www.ozon.ru/product/..."></label>' +
+        '<div class="notice notice-info">Домен/посадочная, заголовки, тексты объявлений, ключевые и минус-фразы, картинки — заполнятся автоматически после нажатия «Далее». Их можно будет поправить вручную на шаге 5 или перегенерировать позже.</div>' +
+      '</div>' +
       '<fieldset class="field field-wide mode-picker"><legend>Структура рекламных кампаний</legend>' +
         '<label class="mode-option"><input type="radio" name="wizPMode" value="separate"' + ((p.campaign_mode || "separate") === "separate" ? " checked" : "") + '><span><strong>Отдельные РК</strong><small>Одна кампания Поиск + одна кампания РСЯ.</small></span></label>' +
         '<label class="mode-option"><input type="radio" name="wizPMode" value="single_epk"' + (p.campaign_mode === "single_epk" ? " checked" : "") + '><span><strong>Одна ЕПК</strong><small>Единая перфоманс-кампания, Поиск+РСЯ вместе.</small></span></label>' +
@@ -402,6 +412,17 @@ async function renderWizardStep1() {
     searchDebounce = setTimeout(() => renderGeoSuggestions(searchInput.value), 150);
   });
   searchInput.addEventListener("focus", () => renderGeoSuggestions(searchInput.value));
+
+  // Переключение режима не должно перерисовывать весь шаг (потерялись бы
+  // уже введённые название/ДРР/регионы) — просто прячем/показываем два
+  // готовых блока (домен vs ссылка Ozon).
+  body.querySelectorAll('input[name="wizLaunchMode"]').forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const isOzon = event.target.value === "ozon";
+      byId("wizDomainBlock").hidden = isOzon;
+      byId("wizOzonBlock").hidden = !isOzon;
+    });
+  });
 
   body.querySelector("#wizNext1").addEventListener("click", wizardSaveProjectStep);
 }
@@ -456,32 +477,69 @@ function renderGeoChips() {
 async function wizardSaveProjectStep() {
   const msg = byId("wizPMessage");
   const button = byId("wizNext1");
+  const launchMode = document.querySelector('input[name="wizLaunchMode"]:checked').value;
   const name = byId("wizPName").value.trim();
-  const domain = byId("wizPDomain").value.trim();
   const campaignMode = document.querySelector('input[name="wizPMode"]:checked').value;
   const targetDrr = Number(byId("wizPDrr").value);
   const mobileRaw = byId("wizPMobile").value.trim();
-  const keywords = byId("wizPKeywords").value.trim();
-  const negativeKeywords = byId("wizPNegative").value.trim();
-  if (!name || !domain) { showMessage(msg, "Укажите название и домен.", "error"); return; }
-  if (!keywords) { showMessage(msg, "Нужна хотя бы одна ключевая фраза.", "error"); return; }
   const regionIds = (wizard.regionSelections || []).map((r) => r.id);
   if (!regionIds.length) { showMessage(msg, "Выберите хотя бы один город или регион.", "error"); return; }
 
-  const payload = {
-    ...(wizard.project || {}),
-    name, domain, campaign_mode: campaignMode, target_drr: targetDrr,
-    keywords, negative_keywords: negativeKeywords, region_ids: regionIds,
-    mobile_bid_adjustment_percent: mobileRaw ? Number(mobileRaw) : null,
-  };
+  let payload;
+  if (launchMode === "ozon") {
+    const ozonUrl = byId("wizPOzonUrl").value.trim();
+    if (!ozonUrl) { showMessage(msg, "Укажите ссылку на карточку товара Ozon.", "error"); return; }
+    if (!/ozon\./i.test(ozonUrl)) { showMessage(msg, "Это не похоже на ссылку Ozon.", "error"); return; }
+    payload = {
+      ...(wizard.project || {}),
+      name: name || "Товар Ozon", domain: ozonUrl, campaign_mode: campaignMode, target_drr: targetDrr,
+      launch_mode: "ozon", ozon_url: ozonUrl,
+      keywords: "", negative_keywords: "", region_ids: regionIds,
+      mobile_bid_adjustment_percent: mobileRaw ? Number(mobileRaw) : null,
+    };
+  } else {
+    const domain = byId("wizPDomain").value.trim();
+    const keywords = byId("wizPKeywords").value.trim();
+    const negativeKeywords = byId("wizPNegative").value.trim();
+    if (!name || !domain) { showMessage(msg, "Укажите название и домен.", "error"); return; }
+    if (!keywords) { showMessage(msg, "Нужна хотя бы одна ключевая фраза.", "error"); return; }
+    payload = {
+      ...(wizard.project || {}),
+      name, domain, campaign_mode: campaignMode, target_drr: targetDrr,
+      launch_mode: "direct", ozon_url: "",
+      keywords, negative_keywords: negativeKeywords, region_ids: regionIds,
+      mobile_bid_adjustment_percent: mobileRaw ? Number(mobileRaw) : null,
+    };
+  }
+
   button.disabled = true;
   showMessage(msg, wizard.projectId ? "Сохраняю проект…" : "Создаю проект…");
   try {
-    const saved = wizard.projectId
+    let saved = wizard.projectId
       ? await api("/api/projects/" + wizard.projectId, {method: "PUT", body: JSON.stringify(payload)})
       : await api("/api/projects", {method: "POST", body: JSON.stringify(payload)});
     wizard.project = saved;
     wizard.projectId = saved.id;
+
+    if (launchMode === "ozon") {
+      showMessage(msg, "Озон парсит карточку, Gemini пишет тексты… это может занять 30–90 секунд.");
+      try {
+        const genResult = await api("/api/projects/" + saved.id + "/ozon-generate", {
+          method: "POST", body: JSON.stringify({url: payload.ozon_url}),
+        });
+        saved = genResult.project;
+        wizard.project = saved;
+        showMessage(msg, "Готово: " + saved.headlines.length + " заголовков, " + saved.ad_texts.length +
+          " текстов, " + saved.image_urls.length + " картинок, " +
+          saved.keywords.split("\n").filter(Boolean).length + " ключевых фраз.", "success");
+      } catch (genError) {
+        showMessage(msg, "Проект создан, но генерация не удалась: " + genError.message +
+          " Можно нажать «Далее» ещё раз (попробовать снова) или заполнить шаг 5 вручную.", "error");
+        loadProjects();
+        return;
+      }
+    }
+
     seedCreativePools(saved);
     loadProjects();
     wizard.step = 2;
@@ -751,10 +809,37 @@ function renderWizardStep5() {
       '<input type="file" data-manual-image-file="' + i + '" accept="image/jpeg,image/png,image/gif" style="margin-top:6px"></label>' +
     '</div></div>'
   )).join("");
-  body.innerHTML = wizardStepsNav(5) + structureBlock + modeOptions +
+  const isOzonProject = (wizard.project || {}).launch_mode === "ozon";
+  const ozonRegenBlock = isOzonProject ?
+    '<div class="notice notice-info">Эти заголовки/тексты/ключевые фразы/картинки сгенерировал Gemini по карточке ' +
+      '<a href="' + esc((wizard.project || {}).ozon_url || "") + '" target="_blank" rel="noopener">' + esc((wizard.project || {}).ozon_url || "") + '</a>. ' +
+      'Можно поправить вручную ниже или перегенерировать заново (старые значения заменятся).' +
+      '<div style="margin-top:10px"><button class="button button-ghost button-small" id="wizOzonRegen" type="button">🔄 Пересоздать через Gemini</button></div>' +
+      '<div id="wizOzonRegenMessage" class="form-message"></div>' +
+    '</div>' : "";
+  body.innerHTML = wizardStepsNav(5) + ozonRegenBlock + structureBlock + modeOptions +
     '<div id="wizCreativeArea">' + (wizard.creativeMode === "manual_per_account" ? manualForm : poolForm) + '</div>' +
     '<div class="wizard-actions"><button class="button button-ghost" id="wizBack5" type="button">← Назад</button><button class="button button-primary" id="wizLaunch" type="button">Запустить массовый запуск</button></div>' +
     '<div id="wizLaunchMessage" class="form-message"></div>';
+  if (isOzonProject) {
+    byId("wizOzonRegen").addEventListener("click", async () => {
+      const regenMsg = byId("wizOzonRegenMessage");
+      const regenButton = byId("wizOzonRegen");
+      regenButton.disabled = true;
+      showMessage(regenMsg, "Озон парсит карточку, Gemini пишет тексты… это может занять 30–90 секунд.");
+      try {
+        const genResult = await api("/api/projects/" + wizard.projectId + "/ozon-generate", {
+          method: "POST", body: JSON.stringify({url: wizard.project.ozon_url}),
+        });
+        wizard.project = genResult.project;
+        seedCreativePools(genResult.project);
+        renderWizardStep5();
+      } catch (error) {
+        showMessage(regenMsg, error.message, "error");
+        regenButton.disabled = false;
+      }
+    });
+  }
   body.querySelectorAll('input[name="wizStructure"]').forEach((input) => {
     input.addEventListener("change", (event) => {
       if (event.target.value === "multi") {

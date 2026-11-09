@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 CampaignMode = Literal["separate", "single_epk"]
 StrategyType = Literal["AVERAGE_CRR", "PAY_FOR_CONVERSION_CRR"]
+LaunchMode = Literal["direct", "ozon"]
 
 
 class DirectAccountCreate(BaseModel):
@@ -113,6 +114,13 @@ class ProjectIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     domain: str = Field(min_length=8, max_length=2048)
     campaign_mode: CampaignMode = "separate"
+    # "ozon": domain/headlines/ad_texts/keywords/negative_keywords/image_urls
+    # come from POST /api/projects/{id}/ozon-generate (app/ozon_ad_creator.py)
+    # instead of being typed in by hand — everything downstream of them
+    # (bulk-create, campaign creation) reads the exact same project fields
+    # either way and needs no mode-specific branching.
+    launch_mode: LaunchMode = "direct"
+    ozon_url: str = Field(default="", max_length=2048)
     target_drr: float = Field(default=30, ge=0.1, le=1000)
     keywords: str = Field(default="", max_length=30000)
     # Общие для группы минус-фразы (AdGroups.NegativeKeywords) — Яндекс
@@ -295,6 +303,25 @@ class BulkCampaignCreateResult(BaseModel):
         "Каждая кампания создана ЧЕРНОВИКОМ (Status=DRAFT, State=OFF) — "
         "запуск не выполняется автоматически."
     )
+
+
+class OzonGenerateIn(BaseModel):
+    """POST /api/projects/{id}/ozon-generate body — url overrides the
+    project's own stored ozon_url for a one-off regenerate with a different
+    link; omitted/empty falls back to project["ozon_url"]."""
+    url: str = Field(default="", max_length=2048)
+
+
+class OzonGenerateOut(BaseModel):
+    """Response for a successful (re)generation — `project` is the project
+    AFTER its headlines/ad_texts/keywords/negative_keywords/image_urls/
+    domain were overwritten from the scrape+Gemini result, `ad_copy` is the
+    full result (facts/big_idea/vk_ads/etc.) for the wizard to preview even
+    though only a subset of it maps onto the project's own creative pools.
+    """
+    project: ProjectOut
+    ad_copy: dict
+    warnings: list[str] = Field(default_factory=list)
 
 
 BulkJobStatus = Literal["running", "done", "failed"]

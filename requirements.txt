@@ -6,3 +6,14 @@ python-multipart>=0.0.9
 pydantic>=2.8,<3.0
 pytest>=8.0,<9.0
 cryptography>=43,<47
+
+# Ozon-режим массового запуска (app/ozon_ad_creator.py): парсинг карточки
+# товара + генерация рекламных текстов через Gemini. curl_cffi — опционально,
+# но сильно снижает шанс блокировки Ozon (имитирует TLS-отпечаток Chrome);
+# playwright — резервный режим настоящего браузера, когда и curl_cffi
+# блокируют (см. OZON_FETCH_MODE в .env.example). После установки playwright
+# на сервере нужно ОДНОКРАТНО выполнить `playwright install --with-deps
+# chromium` (или оставить OZON_BROWSER_CHANNEL=chrome и поставить сам Google
+# Chrome) — pip install самого браузерного бинарника не ставит.
+curl_cffi>=0.7,<1.0
+playwright>=1.47,<2.0

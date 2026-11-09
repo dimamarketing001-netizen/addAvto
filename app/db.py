@@ -12,7 +12,7 @@ PROJECT_FIELDS = [
     "name", "domain", "campaign_mode", "target_drr",
     "keywords", "negative_keywords", "image_urls",
     "region_ids", "headlines", "ad_texts", "sitelinks_pool", "callouts_pool",
-    "mobile_bid_adjustment_percent",
+    "mobile_bid_adjustment_percent", "launch_mode", "ozon_url",
 ]
 # strategy/budget/lead_value/headline/ad_text columns still exist in the
 # `projects` table (old rows have real values) but are no longer written —
@@ -65,6 +65,10 @@ def init_db() -> None:
                 db.execute(f"ALTER TABLE projects ADD COLUMN {json_field} TEXT NOT NULL DEFAULT '[]'")
         if "mobile_bid_adjustment_percent" not in existing_columns:
             db.execute("ALTER TABLE projects ADD COLUMN mobile_bid_adjustment_percent INTEGER")
+        if "launch_mode" not in existing_columns:
+            db.execute("ALTER TABLE projects ADD COLUMN launch_mode TEXT NOT NULL DEFAULT 'direct'")
+        if "ozon_url" not in existing_columns:
+            db.execute("ALTER TABLE projects ADD COLUMN ozon_url TEXT NOT NULL DEFAULT ''")
         db.execute("""
             CREATE TABLE IF NOT EXISTS bulk_campaigns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

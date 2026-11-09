@@ -22,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 from . import db, lk
 from .click_client import ClickRUClient, ClickRUError
 from .metrika_client import MetrikaAPIError, YandexMetrikaClient
+from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, process_ozon_url
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from .schemas import (
     BulkCampaignCreateRequest,
@@ -30,6 +31,8 @@ from .schemas import (
     BulkJobStartOut,
     CampaignPlan,
     ClickRUConnectionIn,
+    OzonGenerateIn,
+    OzonGenerateOut,
     PayerCreateIn,
     DirectAccountCreate,
     PlanItem,
@@ -37,6 +40,12 @@ from .schemas import (
 )
 from .token_crypto import TokenCryptoError, decrypt_secret, encrypt_secret
 from .yandex_oauth import YandexOAuthClient, YandexOAuthError
+
+# Один браузер Playwright на всё приложение (лениво стартует при первом
+# запросе Ozon-режима, см. ozon_ad_creator.OzonBrowser.start) — запускать
+# новый процесс браузера на каждый запрос было бы намного медленнее и
+# быстрее исчерпало бы память. Закрывается в lifespan при остановке.
+_ozon_browser = OzonBrowser()
 
 
 security = HTTPBasic()
@@ -57,6 +66,7 @@ async def lifespan(_: FastAPI):
     yield
     if worker:
         worker.cancel()
+    await _ozon_browser.close()
 
 
 app = FastAPI(
@@ -754,6 +764,76 @@ async def update_project(project_id: int, project: ProjectIn, _: AuthUser):
     if item is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
     return item
+
+
+@app.post("/api/projects/{project_id}/ozon-generate", response_model=OzonGenerateOut)
+async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
+    """Директ-Озон режим (wizard шаг 1): парсит карточку Ozon и просит Gemini
+    написать рекламные тексты (app/ozon_ad_creator.py), затем ЗАПИСЫВАЕТ
+    результат прямо в project["domain"/"headlines"/"ad_texts"/"keywords"/
+    "negative_keywords"/"image_urls"] — ровно те же поля, что обычный
+    (ручной) режим заполняет через PUT /api/projects/{id}. Всё, что идёт
+    дальше (шаги 2-5 визарда, campaigns/bulk-create) не знает и не должно
+    знать, откуда взялись эти значения.
+
+    url в теле запроса — для одноразовой регенерации по другой ссылке без
+    предварительного PUT; пустая строка/отсутствие — берём project["ozon_url"].
+    """
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    if db.has_bulk_job(project_id):
+        raise HTTPException(status_code=409, detail="Проект уже запущен — генерация недоступна.")
+
+    url = (payload.url or project.get("ozon_url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=422, detail="Нужна ссылка на карточку Ozon (ozon_url)")
+
+    try:
+        result = await process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser)
+    except OzonParseError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except GeminiError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    product, ad_copy = result.product, result.ad_copy
+    assert ad_copy is not None  # use_ai=True всегда возвращает ad_copy или бросает GeminiError выше
+
+    # Headlines/ad_texts пулы для bulk-create's shuffle — берём ИМЕННО
+    # yandex_direct (title1/text уже написаны с лимитами Директа 56/81
+    # символов и привязаны к своей группе ключей), а не ad_copy.headlines
+    # (универсальные заголовки до 60 символов — превышают лимит Директа).
+    headlines = list(dict.fromkeys(d.title1 for d in ad_copy.yandex_direct if d.title1))[:100]
+    ad_texts = list(dict.fromkeys(d.text for d in ad_copy.yandex_direct if d.text))[:100]
+
+    update_data = {
+        "domain": product.url.rstrip("/"),  # same normalization ProjectIn.validate_domain applies to a typed-in domain
+        "ozon_url": url,
+        "keywords": "\n".join(ad_copy.keywords),
+        "negative_keywords": "\n".join(ad_copy.negative_keywords),
+        "image_urls": product.images[:20],
+        "headlines": headlines,
+        "ad_texts": ad_texts,
+    }
+    # launch_mode остаётся "ozon" (bulk-create его не читает вовсе — только
+    # headlines/ad_texts/keywords/image_urls/domain выше, которые уже
+    # обычные project-поля) — это только для UI: открыв проект снова,
+    # визард помнит, что creative pool пришёл из Ozon, и показывает кнопку
+    # "Пересоздать через Gemini" на шаге 5.
+    # "Товар Ozon" is the generic placeholder the wizard itself sends when the
+    # name field is left blank (ProjectIn.name needs min_length=2) — treat it
+    # the same as genuinely blank, so the real scraped title still wins.
+    current_name = (project.get("name") or "").strip()
+    if not current_name or current_name == "Товар Ozon":
+        update_data["name"] = (product.title or "Товар Ozon")[:120]
+    updated = db.update_project(project_id, update_data)
+    assert updated is not None
+
+    return OzonGenerateOut(
+        project=updated,
+        ad_copy=ad_copy.model_dump(mode="json"),
+        warnings=ad_copy.warnings,
+    )
 
 
 @app.post("/api/projects/{project_id}/duplicate", status_code=201)
