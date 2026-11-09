@@ -24,6 +24,14 @@ _JSON_PROJECT_FIELDS = (
     "sitelinks_pool", "callouts_pool",
 )
 
+# Columns added with NOT NULL DEFAULT ... (see init_db) after callers already
+# existed that don't pass them — create_project() substitutes these when the
+# key is absent/None, matching what the SQL default would give a bare INSERT.
+_PROJECT_FIELD_DEFAULTS = {
+    "launch_mode": "direct",
+    "ozon_url": "",
+}
+
 
 def _db_path() -> Path:
     return Path(os.getenv("DATABASE_PATH", "./data/app.db"))
@@ -180,6 +188,13 @@ def create_project(data: dict[str, Any]) -> dict[str, Any]:
     values: list[Any] = []
     for field in fields:
         value = data.get(field)
+        if value is None and field in _PROJECT_FIELD_DEFAULTS:
+            # Callers that predate launch_mode/ozon_url (e.g. older tests)
+            # omit them entirely — data.get() then returns None, which SQL's
+            # own "NOT NULL DEFAULT ..." does NOT substitute for (defaults
+            # only apply when the column is left out of the INSERT, not
+            # when explicitly given NULL). Apply the same default here.
+            value = _PROJECT_FIELD_DEFAULTS[field]
         if field in _JSON_PROJECT_FIELDS:
             value = json.dumps(value or [], ensure_ascii=False)
         values.append(value)
