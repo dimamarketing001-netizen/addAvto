@@ -347,19 +347,113 @@ async def create_payer(
     return {"payer_id": payer_id}
 
 
+GEO_RUSSIA_ID = 225
+GEO_CACHE_KEY = "geo_regions_ru_tree_v2"
+
+
+def _geo_sort_key(name: str) -> str:
+    return (name or "").lower().replace("ё", "е")
+
+
+def build_russia_geo(raw: list[dict[str, Any]]) -> dict[str, Any]:
+    """Дерево «субъект РФ → города» из Dictionaries.get GeoRegions.
+
+    Реальный формат строки Директа API v5: GeoRegionId, GeoRegionName,
+    GeoRegionType ("Country", "Administrative area", "City", "District",
+    "Village", ...) и ParentId. Никаких списков имён родителей там нет —
+    прежняя версия фильтровала по несуществующему ParentGeoRegionNames и
+    на проде всегда отдавала пустой справочник (найдено 2026-11-10).
+
+    Возвращает:
+      items — плоский список {id, name, type, parent_id} (для поиска по
+              названию и показа имён по id);
+      tree  — для nv-tree-select: [{value, label, children}], где первым
+              идёт «Вся Россия» (225), дальше субъекты по алфавиту, внутри —
+              города субъекта. Город относится к ближайшему предку-субъекту
+              (автономные округа внутри областей — отдельные субъекты).
+    """
+    nodes: dict[int, dict[str, Any]] = {}
+    for row in raw:
+        try:
+            rid = int(row["GeoRegionId"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        parent = row.get("ParentId")
+        try:
+            parent_id = int(parent) if parent not in (None, "") else None
+        except (TypeError, ValueError):
+            parent_id = None
+        nodes[rid] = {
+            "id": rid,
+            "name": str(row.get("GeoRegionName") or "").strip(),
+            "type": str(row.get("GeoRegionType") or ""),
+            "parent_id": parent_id,
+        }
+
+    def ancestors(rid: int) -> list[int]:
+        chain: list[int] = []
+        cur = nodes[rid]["parent_id"]
+        while cur is not None and cur in nodes and cur not in chain and len(chain) < 32:
+            chain.append(cur)
+            cur = nodes[cur]["parent_id"]
+        return chain
+
+    areas: dict[int, dict[str, Any]] = {}
+    cities: list[tuple[dict[str, Any], list[int]]] = []
+    items: list[dict[str, Any]] = []
+    for node in nodes.values():
+        if node["id"] == GEO_RUSSIA_ID:
+            continue
+        chain = ancestors(node["id"])
+        if GEO_RUSSIA_ID not in chain or not node["name"]:
+            continue
+        if node["type"] == "Administrative area":
+            areas[node["id"]] = {"value": str(node["id"]), "label": node["name"], "children": []}
+            items.append(node)
+        elif node["type"] == "City":
+            cities.append((node, chain))
+            items.append(node)
+
+    top_cities: list[dict[str, Any]] = []
+    for node, chain in cities:
+        leaf = {"value": str(node["id"]), "label": node["name"]}
+        area_id = next((a for a in chain if a in areas), None)
+        if area_id is None:
+            top_cities.append(leaf)
+        else:
+            areas[area_id]["children"].append(leaf)
+
+    regions = sorted(areas.values(), key=lambda n: _geo_sort_key(n["label"]))
+    for region in regions:
+        if region["children"]:
+            region["children"].sort(key=lambda n: _geo_sort_key(n["label"]))
+        else:
+            del region["children"]
+    top_cities.sort(key=lambda n: _geo_sort_key(n["label"]))
+
+    tree: list[dict[str, Any]] = []
+    if regions or top_cities:
+        tree.append({"value": str(GEO_RUSSIA_ID), "label": "Вся Россия"})
+        items.append({"id": GEO_RUSSIA_ID, "name": "Россия", "type": "Country", "parent_id": None})
+    tree.extend(top_cities + regions)
+    items.sort(key=lambda x: _geo_sort_key(x["name"]))
+    return {"items": items, "tree": tree}
+
+
 @app.get("/api/geo-regions")
 async def get_geo_regions(_: AuthUser):
-    """Яндекс-справочник регионов (Dictionaries.getGeoRegions), отфильтрованный
-    до России — визард (шаг 1) использует это вместо ручного ввода ID
-    регионов. Не привязан к конкретному проекту/запуску — любой уже
-    подключённый аккаунт Click.ru подходит, справочник не account-specific.
-    Кэшируется в app_settings (статичный справочник, меняется редко —
-    см. блог Яндекс.Директа про обновления гео-дерева): первый запрос после
-    рестарта сервера идёт в Click.ru/Direct, остальные — из кэша.
+    """Яндекс-справочник регионов (Dictionaries.get GeoRegions) по России —
+    визард (шаг 1, поле «Город или регион показа») показывает его деревом
+    «регион → города» и отправляет выбранные id в region_ids. Не привязан к
+    конкретному проекту/запуску — любой уже подключённый аккаунт Click.ru
+    подходит, справочник не account-specific.
+    Кэшируется в app_settings (статичный справочник, меняется редко):
+    первый запрос идёт в Click.ru/Direct, остальные — из кэша. Пустой
+    результат НЕ кэшируется, чтобы временный сбой не залипал навсегда.
     """
-    cached = db.get_setting("geo_regions_russia")
-    if cached:
-        return {"items": cached}
+    cached = db.get_setting(GEO_CACHE_KEY)
+    if cached and cached.get("tree"):
+        return cached
 
     connections = db.list_clickru_connections()
     client = _resolve_clickru_client(connections[0]["id"]) if connections else ClickRUClient()
@@ -399,24 +493,10 @@ async def get_geo_regions(_: AuthUser):
     if result is None:
         raise HTTPException(status_code=502, detail=str(last_error))
 
-    raw = result.get("GeoRegions") or []
-    items = []
-    for row in raw:
-        parent_names = ((row.get("ParentGeoRegionNames") or {}).get("Items")) or []
-        # Only Russia's own subtree — "Russia" itself is always the first
-        # entry in ParentGeoRegionNames for anything under it (confirmed
-        # against a live response, see CHECKS.md).
-        if "Russia" not in parent_names and "Россия" not in parent_names:
-            continue
-        items.append({
-            "id": int(row["GeoRegionId"]),
-            "name": row.get("GeoRegionName", ""),
-            "parents": parent_names,
-        })
-
-    items.sort(key=lambda x: x["name"])
-    db.set_setting("geo_regions_russia", items)
-    return {"items": items}
+    geo = build_russia_geo(result.get("GeoRegions") or [])
+    if geo["tree"]:
+        db.set_setting(GEO_CACHE_KEY, geo)
+    return geo
 
 
 @app.get("/api/accounts/{account_id}/marking-schema")

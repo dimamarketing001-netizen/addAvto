@@ -202,6 +202,7 @@ class ClickRUClient:
         method_path: str,
         body: dict[str, Any],
         api_version: str = "v5",
+        accept_language: str | None = None,
     ) -> dict[str, Any]:
         """Low-level pass-through to Yandex Direct API v5 via Click.ru's
         proxy (POST /api_proxy/yandex_direct). `method_path` is the Direct
@@ -214,11 +215,16 @@ class ClickRUClient:
         checked there, not via HTTP status.
         """
         url = f"https://api.direct.yandex.com/json/{api_version}/{method_path.lstrip('/')}"
+        headers = {"Client-Login": client_login}
+        if accept_language:
+            # Direct локализует справочники (названия регионов и т.п.) по
+            # Accept-Language; без него может отдать английские названия.
+            headers["Accept-Language"] = accept_language
         response = await self._request(
             "POST",
             "/api_proxy/yandex_direct",
             params={"url": url},
-            headers={"Client-Login": client_login},
+            headers=headers,
             json=body,
         )
         data = response.json()
@@ -556,7 +562,7 @@ class ClickRUClient:
         works as the routing login.
         """
         body = {"method": "get", "params": {"DictionaryNames": names}}
-        data = await self.direct_api(client_login, "dictionaries", body)
+        data = await self.direct_api(client_login, "dictionaries", body, accept_language="ru")
         result = data.get("result")
         if not isinstance(result, dict):
             raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")

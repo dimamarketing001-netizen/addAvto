@@ -200,6 +200,26 @@ def test_create_payer_business_requires_type_specific_fields(tmp_path, monkeypat
         assert "обязательно" in response.json()["detail"]
 
 
+GEO_FIXTURE = [
+    {"GeoRegionId": 10000, "GeoRegionName": "Земля", "GeoRegionType": "World", "ParentId": None},
+    {"GeoRegionId": 225, "GeoRegionName": "Россия", "GeoRegionType": "Country", "ParentId": 10000},
+    {"GeoRegionId": 3, "GeoRegionName": "Центральный федеральный округ", "GeoRegionType": "Region", "ParentId": 225},
+    {"GeoRegionId": 1, "GeoRegionName": "Москва и Московская область", "GeoRegionType": "Administrative area", "ParentId": 3},
+    {"GeoRegionId": 213, "GeoRegionName": "Москва", "GeoRegionType": "City", "ParentId": 1},
+    {"GeoRegionId": 20279, "GeoRegionName": "Центральный административный округ", "GeoRegionType": "City district", "ParentId": 213},
+    {"GeoRegionId": 10758, "GeoRegionName": "Химки", "GeoRegionType": "City", "ParentId": 1},
+    {"GeoRegionId": 52, "GeoRegionName": "Уральский федеральный округ", "GeoRegionType": "Region", "ParentId": 225},
+    {"GeoRegionId": 11176, "GeoRegionName": "Тюменская область", "GeoRegionType": "Administrative area", "ParentId": 52},
+    {"GeoRegionId": 55, "GeoRegionName": "Тюмень", "GeoRegionType": "City", "ParentId": 11176},
+    {"GeoRegionId": 11193, "GeoRegionName": "Ханты-Мансийский автономный округ", "GeoRegionType": "Administrative area", "ParentId": 11176},
+    {"GeoRegionId": 973, "GeoRegionName": "Сургут", "GeoRegionType": "City", "ParentId": 11193},
+    {"GeoRegionId": 59, "GeoRegionName": "Сибирский федеральный округ", "GeoRegionType": "Region", "ParentId": 225},
+    {"GeoRegionId": 10231, "GeoRegionName": "Республика Алтай", "GeoRegionType": "Administrative area", "ParentId": 59},
+    {"GeoRegionId": 187, "GeoRegionName": "Украина", "GeoRegionType": "Country", "ParentId": 10000},
+    {"GeoRegionId": 143, "GeoRegionName": "Киев", "GeoRegionType": "City", "ParentId": 187},
+]
+
+
 def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
     from app import db
     from app.click_client import ClickRUClient
@@ -219,13 +239,9 @@ def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
     async def fake_dictionaries(self, client_login, names):
         calls["dictionaries"] += 1
         assert names == ["GeoRegions"]
-        return {
-            "GeoRegions": [
-                {"GeoRegionId": 225, "GeoRegionName": "Россия", "ParentGeoRegionNames": {"Items": ["Земля"]}},
-                {"GeoRegionId": 213, "GeoRegionName": "Москва", "ParentGeoRegionNames": {"Items": ["Земля", "Россия", "Центральный федеральный округ"]}},
-                {"GeoRegionId": 187, "GeoRegionName": "Киев", "ParentGeoRegionNames": {"Items": ["Земля", "Украина"]}},
-            ]
-        }
+        # Реальный формат Dictionaries.get GeoRegions (API v5): id, имя,
+        # тип и ParentId — дерево строится только по ParentId.
+        return {"GeoRegions": GEO_FIXTURE}
 
     monkeypatch.setattr(ClickRUClient, "accounts", fake_accounts)
     monkeypatch.setattr(ClickRUClient, "dictionaries", fake_dictionaries)
@@ -234,15 +250,55 @@ def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
         auth = ("test-admin", "test-password-long-enough")
         response = client.get("/api/geo-regions", auth=auth)
         assert response.status_code == 200, response.text
-        items = response.json()["items"]
-        names = {item["name"] for item in items}
-        assert names == {"Москва"}  # Россия сама по себе и Киев (не РФ) отфильтрованы
+        body = response.json()
+        names = {item["name"] for item in body["items"]}
+        # Федеральные округа, районы городов и всё вне РФ — не в справочнике.
+        assert names == {"Россия", "Москва и Московская область", "Москва", "Химки",
+                         "Тюменская область", "Тюмень", "Ханты-Мансийский автономный округ", "Сургут",
+                         "Республика Алтай"}
+        tree = body["tree"]
+        assert tree[0] == {"value": "225", "label": "Вся Россия"}
+        by_label = {n["label"]: n for n in tree}
+        assert [c["label"] for c in by_label["Москва и Московская область"]["children"]] == ["Москва", "Химки"]
+        assert by_label["Москва и Московская область"]["value"] == "1"
+        # Город относится к ближайшему субъекту: Сургут — к ХМАО, не к Тюменской области.
+        assert [c["value"] for c in by_label["Тюменская область"]["children"]] == ["55"]
+        assert [c["value"] for c in by_label["Ханты-Мансийский автономный округ"]["children"]] == ["973"]
+        assert "children" not in by_label["Республика Алтай"]  # субъект без городов — лист
+        assert "Киев" not in names and "Центральный федеральный округ" not in by_label
 
         # Второй запрос идёт из кэша app_settings, не дёргает Click.ru снова.
         response2 = client.get("/api/geo-regions", auth=auth)
         assert response2.status_code == 200
+        assert response2.json() == body
         assert calls["accounts"] == 1
         assert calls["dictionaries"] == 1
+
+
+def test_geo_regions_empty_result_is_not_cached(tmp_path, monkeypatch):
+    from app.click_client import ClickRUClient
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-empty-test.db"))
+    monkeypatch.setenv("APP_USERNAME", "test-admin")
+    monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
+
+    replies = [[], GEO_FIXTURE]
+
+    async def fake_accounts(self):
+        return [{"id": 1, "serviceLogin": "porg-1", "status": "ACTIVE"}]
+
+    async def fake_dictionaries(self, client_login, names):
+        return {"GeoRegions": replies.pop(0)}
+
+    monkeypatch.setattr(ClickRUClient, "accounts", fake_accounts)
+    monkeypatch.setattr(ClickRUClient, "dictionaries", fake_dictionaries)
+
+    with TestClient(app) as client:
+        auth = ("test-admin", "test-password-long-enough")
+        assert client.get("/api/geo-regions", auth=auth).json()["tree"] == []
+        assert client.get("/api/geo-regions", auth=auth).json()["tree"][0]["value"] == "225"
 
 
 def test_geo_regions_skips_accounts_with_invalid_login(tmp_path, monkeypatch):
@@ -267,7 +323,7 @@ def test_geo_regions_skips_accounts_with_invalid_login(tmp_path, monkeypatch):
     async def fake_dictionaries(self, client_login, names):
         if client_login == "zzclickadwords-1-xxx":
             raise ClickRUError("Логин не найден или неактивен")
-        return {"GeoRegions": [{"GeoRegionId": 213, "GeoRegionName": "Москва", "ParentGeoRegionNames": {"Items": ["Россия"]}}]}
+        return {"GeoRegions": GEO_FIXTURE}
 
     monkeypatch.setattr(ClickRUClient, "accounts", fake_accounts)
     monkeypatch.setattr(ClickRUClient, "dictionaries", fake_dictionaries)
@@ -276,7 +332,7 @@ def test_geo_regions_skips_accounts_with_invalid_login(tmp_path, monkeypatch):
         auth = ("test-admin", "test-password-long-enough")
         response = client.get("/api/geo-regions", auth=auth)
         assert response.status_code == 200, response.text
-        assert {item["name"] for item in response.json()["items"]} == {"Москва"}
+        assert "Москва" in {item["name"] for item in response.json()["items"]}
 
 
 def test_project_locked_after_launch_but_duplicate_is_editable(tmp_path, monkeypatch):
