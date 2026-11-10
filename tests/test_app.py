@@ -225,6 +225,7 @@ def test_geo_regions_filters_to_russia_and_caches(tmp_path, monkeypatch):
     from app.click_client import ClickRUClient
 
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-test.db"))
+    monkeypatch.setenv("GEO_REGIONS_BUNDLED", "0")  # эти тесты — про путь через Click.ru
     monkeypatch.setenv("APP_USERNAME", "test-admin")
     monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
     monkeypatch.setenv("APP_ENV", "test")
@@ -279,6 +280,7 @@ def test_geo_regions_empty_result_is_not_cached(tmp_path, monkeypatch):
     from app.click_client import ClickRUClient
 
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-empty-test.db"))
+    monkeypatch.setenv("GEO_REGIONS_BUNDLED", "0")  # эти тесты — про путь через Click.ru
     monkeypatch.setenv("APP_USERNAME", "test-admin")
     monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
     monkeypatch.setenv("APP_ENV", "test")
@@ -309,6 +311,7 @@ def test_geo_regions_skips_accounts_with_invalid_login(tmp_path, monkeypatch):
     from app.click_client import ClickRUClient, ClickRUError
 
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "geo-fallback-test.db"))
+    monkeypatch.setenv("GEO_REGIONS_BUNDLED", "0")  # эти тесты — про путь через Click.ru
     monkeypatch.setenv("APP_USERNAME", "test-admin")
     monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
     monkeypatch.setenv("APP_ENV", "test")

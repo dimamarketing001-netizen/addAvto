@@ -504,7 +504,29 @@ async def create_payer(
 
 
 GEO_RUSSIA_ID = 225
-GEO_CACHE_KEY = "geo_regions_ru_tree_v3"
+# v4 (2026-11-10): русские названия из app/geo_regions_ru.json — старый
+# кэш с английскими (через Click.ru) должен перестать использоваться.
+GEO_CACHE_KEY = "geo_regions_ru_tree_v4"
+# Справочник на русском, выгруженный напрямую из Direct API (через Click.ru
+# названия только английские — прокси режет Accept-Language). Обновление:
+# YANDEX_DIRECT_TOKEN=... python tools/refresh_geo_regions.py
+GEO_BUNDLED_FILE = os.path.join(os.path.dirname(__file__), "geo_regions_ru.json")
+
+
+def _bundled_geo_raw() -> list[dict[str, Any]]:
+    """Строки в формате Dictionaries.get GeoRegions из app/geo_regions_ru.json.
+    GEO_REGIONS_BUNDLED=0 — не использовать файл (только Click.ru)."""
+    if os.getenv("GEO_REGIONS_BUNDLED", "1") == "0":
+        return []
+    try:
+        with open(GEO_BUNDLED_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return [
+        {"GeoRegionId": r[0], "ParentId": r[1], "GeoRegionType": r[2], "GeoRegionName": r[3]}
+        for r in data.get("regions") or [] if isinstance(r, list) and len(r) == 4
+    ]
 # Живой ответ Директа (проверено 2026-11-10): субъект РФ — "Federation subject".
 # "Administrative area" — вариант из документации, оставлен на всякий случай.
 GEO_AREA_TYPES = {"Federation subject", "Administrative area"}
@@ -614,6 +636,13 @@ async def get_geo_regions(_: AuthUser):
     cached = db.get_setting(GEO_CACHE_KEY)
     if cached and cached.get("tree"):
         return cached
+
+    bundled = _bundled_geo_raw()
+    if bundled:
+        geo = build_russia_geo(bundled)
+        if geo["tree"]:
+            db.set_setting(GEO_CACHE_KEY, geo)
+            return geo
 
     connections = db.list_clickru_connections()
     client = _resolve_clickru_client(connections[0]["id"]) if connections else ClickRUClient()
