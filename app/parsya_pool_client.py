@@ -63,27 +63,18 @@ class ParsYaPoolClient:
 
         return await self._request(f"/api/addavto/yandex-pool-accounts/{quote(login, safe='')}")
 
-    async def provision_direct_account(self, account_name_prefix: str | None = None) -> dict[str, Any]:
-        """Claims one fresh pool login and runs the Selenium-driven
-        connect-to-Click.ru + create-Direct-account pipeline on WSL (see
-        connect_direct_account.py / provision_next_direct_account.py in
-        ParsYa). Slow — real browser automation, not a quick DB read like
-        the other methods here — budget up to ~3 minutes per call.
-        """
+    async def _post(self, path: str, payload: dict[str, Any], timeout: float, timeout_message: str) -> dict[str, Any]:
         if not self.token:
             raise ParsYaPoolError("PARSYA_POOL_API_TOKEN не задан в .env")
-        payload: dict[str, Any] = {}
-        if account_name_prefix:
-            payload["account_name_prefix"] = account_name_prefix
         try:
-            async with httpx.AsyncClient(timeout=200.0, follow_redirects=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 response = await client.post(
-                    f"{self.base_url}/api/addavto/provision-direct-account",
+                    f"{self.base_url}{path}",
                     headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
-            raise ParsYaPoolError("Провижининг аккаунта не успел завершиться вовремя.") from exc
+            raise ParsYaPoolError(timeout_message) from exc
         except httpx.HTTPError as exc:
             raise ParsYaPoolError(f"Ошибка соединения с ParsYa pool API: {type(exc).__name__}") from exc
 
@@ -94,3 +85,46 @@ class ParsYaPoolClient:
                 detail = f"HTTP {response.status_code}"
             raise ParsYaPoolError(detail, response.status_code)
         return response.json()
+
+    async def provision_direct_account(
+        self,
+        account_name_prefix: str | None = None,
+        clickru: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Claims one fresh pool login and runs the Selenium-driven
+        connect-to-Click.ru + create-Direct-account pipeline on WSL (see
+        connect_direct_account.py / provision_next_direct_account.py in
+        ParsYa). Slow — real browser automation, not a quick DB read like
+        the other methods here — budget up to ~3 minutes per call.
+
+        `clickru` — веб-кабинет выбранного подключения Click.ru:
+        {"connection_id", "username", "password", "cookies"}. Без него
+        скрипт работает по-старому, от CLICKRU_WEB_* из .env ParsYa (только
+        для подключения, совпадающего с CLICKRU_API_TOKEN, см. main.py).
+        В ответе может прийти "clickru_cookies" — обновлённая сессия.
+        """
+        payload: dict[str, Any] = {}
+        if account_name_prefix:
+            payload["account_name_prefix"] = account_name_prefix
+        if clickru:
+            payload["clickru"] = clickru
+        return await self._post(
+            "/api/addavto/provision-direct-account", payload, 300.0,
+            "Провижининг аккаунта не успел завершиться вовремя.",
+        )
+
+    async def clickru_web_login(
+        self, username: str, password: str, cookies: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Вход в веб-кабинет click.ru через Chrome в WSL (тот же браузер и
+        IP, откуда потом идёт провижининг). Сначала пробует сохранённые
+        cookies, при необходимости логинится паролем.
+        Ответ: {"ok": true, "cookies": [...], "relogged": bool} или
+        ParsYaPoolError (409 — вход не удался, detail — причина).
+        """
+        return await self._post(
+            "/api/addavto/clickru-web-login",
+            {"username": username, "password": password, "cookies": cookies or []},
+            180.0,
+            "Вход в кабинет Click.ru не успел завершиться вовремя.",
+        )

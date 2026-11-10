@@ -110,6 +110,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+        # 2026-11-10: веб-кабинет Click.ru на уровне подключения (логин,
+        # пароль, cookies сессии — зашифрованы Fernet, см. token_crypto.py).
+        # Нужен для шага, которого нет в API Click.ru: подключение Яндекс ID
+        # из пула как Директ-интеграции (Selenium в WSL, ParsYa).
+        clickru_columns = {row["name"] for row in db.execute("PRAGMA table_info(clickru_connections)")}
+        for column, ddl in (
+            ("web_username", "TEXT NOT NULL DEFAULT ''"),
+            ("web_password_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("web_cookies_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("web_status", "TEXT NOT NULL DEFAULT 'none'"),
+            ("web_status_message", "TEXT NOT NULL DEFAULT ''"),
+            ("web_checked_at", "TEXT"),
+        ):
+            if column not in clickru_columns:
+                db.execute(f"ALTER TABLE clickru_connections ADD COLUMN {column} {ddl}")
         db.execute("""
             CREATE TABLE IF NOT EXISTS bulk_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,10 +294,11 @@ def set_setting(key: str, value: Any) -> None:
 
 
 # --- Click.ru connections: multiple master-account API tokens, selectable
-# per launch (see main.py's ClickRUClient(token=...) override). Tokens are
-# stored in plain SQLite, same trust level as CLICKRU_API_TOKEN already had
-# in plain .env — not Fernet-encrypted (that machinery was removed with the
-# old Metrika OAuth flow, see TASKS.md 2026-10-31).
+# per launch (see main.py's ClickRUClient(token=...) override). API tokens
+# are stored in plain SQLite, same trust level as CLICKRU_API_TOKEN already
+# had in plain .env. Web-cabinet secrets (web_password_enc, web_cookies_enc)
+# ARE Fernet-encrypted via token_crypto.py — encrypt/decrypt happens in
+# main.py, this module only stores the opaque strings.
 
 def create_clickru_connection(label: str, token: str, user_id: str = "") -> dict[str, Any]:
     with connect() as db:
@@ -306,6 +322,48 @@ def get_clickru_connection(connection_id: int) -> dict[str, Any] | None:
     with connect() as db:
         row = db.execute("SELECT * FROM clickru_connections WHERE id = ?", (connection_id,)).fetchone()
     return dict(row) if row else None
+
+
+CLICKRU_WEB_STATUSES = {"none", "ok", "relogin_required", "failed"}
+
+
+def set_clickru_web_credentials(connection_id: int, username: str, password_enc: str) -> None:
+    """Новый логин/пароль веб-кабинета: старые cookies принадлежат прежней
+    учётке, поэтому сбрасываются вместе со статусом."""
+    with connect() as db:
+        db.execute(
+            """UPDATE clickru_connections
+               SET web_username = ?, web_password_enc = ?, web_cookies_enc = '',
+                   web_status = 'none', web_status_message = '', web_checked_at = NULL
+               WHERE id = ?""",
+            (username, password_enc, connection_id),
+        )
+
+
+def set_clickru_web_session(
+    connection_id: int,
+    status: str,
+    message: str = "",
+    cookies_enc: str | None = None,
+) -> None:
+    """Результат входа/проверки веб-сессии. cookies_enc=None — cookies не
+    трогаем (например, проверка упала по сети и старые ещё могут быть живы)."""
+    if status not in CLICKRU_WEB_STATUSES:
+        raise ValueError(f"unknown web_status {status!r}")
+    with connect() as db:
+        if cookies_enc is None:
+            db.execute(
+                """UPDATE clickru_connections
+                   SET web_status = ?, web_status_message = ?, web_checked_at = ? WHERE id = ?""",
+                (status, message[:500], _now(), connection_id),
+            )
+        else:
+            db.execute(
+                """UPDATE clickru_connections
+                   SET web_status = ?, web_status_message = ?, web_checked_at = ?, web_cookies_enc = ?
+                   WHERE id = ?""",
+                (status, message[:500], _now(), cookies_enc, connection_id),
+            )
 
 
 def delete_clickru_connection(connection_id: int) -> bool:

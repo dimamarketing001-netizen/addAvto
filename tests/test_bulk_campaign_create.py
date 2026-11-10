@@ -28,6 +28,8 @@ def _configure_test_env(monkeypatch, database_path):
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
     monkeypatch.setenv("PARSYA_POOL_API_TOKEN", "test-pool-token-not-used-for-network")
+    # Fernet-ключ для логина/пароля/cookies кабинета Click.ru (2026-11-10).
+    monkeypatch.setenv("METRIKA_TOKEN_ENCRYPTION_KEY", "mX94veC1967OrYtU45Xa36eGPOKLRhtQR2TV_d18exg=")
 
 
 class FakeClickRUClient:
@@ -84,14 +86,19 @@ class FakeParsYaPoolClient:
     configured = True
     _counter = 0
 
-    async def provision_direct_account(self, account_name_prefix=None):
+    clickru_calls: list = []
+
+    async def provision_direct_account(self, account_name_prefix=None, clickru=None):
         FakeParsYaPoolClient._counter += 1
+        FakeParsYaPoolClient.clickru_calls.append(clickru)
         n = FakeParsYaPoolClient._counter
         return {
             "pool_login": f"testuser{n}@mcdonalds001.shop",
             "integration_id": 300000 + n,
             "account_id": 9100 + n,
             "account_name": f"acc{n}",
+            # Скрипт ParsYa возвращает обновлённую сессию кабинета.
+            "clickru_cookies": [{"name": "sid", "value": f"session-{n}", "domain": ".click.ru"}],
         }
 
     async def get_account(self, login):
@@ -122,8 +129,17 @@ class FakeYandexMetrikaClient:
 
 
 def _seed_connection() -> int:
+    """Подключение со своим логином/паролем кабинета (2026-11-10): без них
+    подключение с токеном не из .env для запуска не годится."""
+    import json
     from app import db
+    from app.token_crypto import encrypt_secret
     connection = db.create_clickru_connection("Test Click.ru account", "fake-token", "")
+    db.set_clickru_web_credentials(connection["id"], "agency-login", encrypt_secret("agency-password"))
+    db.set_clickru_web_session(
+        connection["id"], "ok", "Сессия активна",
+        cookies_enc=encrypt_secret(json.dumps([{"name": "sid", "value": "session-0", "domain": ".click.ru"}])),
+    )
     return int(connection["id"])
 
 
@@ -408,12 +424,12 @@ def test_bulk_create_partial_failure_continues(tmp_path, monkeypatch):
     class FlakyPoolClient(FakeParsYaPoolClient):
         _calls = 0
 
-        async def provision_direct_account(self, account_name_prefix=None):
+        async def provision_direct_account(self, account_name_prefix=None, clickru=None):
             FlakyPoolClient._calls += 1
             if FlakyPoolClient._calls == 2:
                 from app.parsya_pool_client import ParsYaPoolError
                 raise ParsYaPoolError("Пул пуст")
-            return await super().provision_direct_account(account_name_prefix)
+            return await super().provision_direct_account(account_name_prefix, clickru)
 
     monkeypatch.setattr(main_module, "ClickRUClient", FakeClickRUClient)
     monkeypatch.setattr(main_module, "ParsYaPoolClient", FlakyPoolClient)

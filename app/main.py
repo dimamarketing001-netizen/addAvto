@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import os
 import random
 import secrets
@@ -31,6 +32,7 @@ from .schemas import (
     BulkJobStartOut,
     CampaignPlan,
     ClickRUConnectionIn,
+    ClickRUWebCredentialsIn,
     OzonGenerateIn,
     OzonGenerateOut,
     PayerCreateIn,
@@ -160,37 +162,185 @@ def _resolve_clickru_client(connection_id: int | None) -> ClickRUClient:
     return ClickRUClient(token=connection["token"], user_id=connection.get("user_id") or None)
 
 
+# --- Веб-кабинет Click.ru на уровне подключения (2026-11-10) ---------------
+# API Click.ru не умеет подключать Яндекс ID как Директ-интеграцию — это
+# делается Selenium'ом в веб-кабинете (ParsYa, WSL). Раньше логин/пароль
+# кабинета брались из .env ParsYa — одни на всех, независимо от выбранного
+# в визарде подключения, так что со вторым кабинетом аккаунты создавались
+# бы не там, где потом создаются кампании. Теперь каждое подключение хранит
+# свой логин, пароль и cookies сессии (Fernet, token_crypto.py), а WSL
+# получает их в запросе и возвращает обновлённые cookies.
+
+# Маркер в тексте ошибки скрипта ParsYa, когда не удался именно вход в
+# кабинет (неверный пароль, капча) — отличает это от прочих сбоев.
+CLICKRU_LOGIN_FAILED_MARKER = "[clickru-login-failed]"
+
+CLICKRU_WEB_STATUS_TEXT = {
+    "none": "Вход в кабинет не настроен",
+    "ok": "Вход в кабинет выполнен",
+    "relogin_required": "Нужен повторный вход",
+    "failed": "Вход в кабинет не удался",
+}
+
+
+def _public_clickru_connection(item: dict[str, Any]) -> dict[str, Any]:
+    """Только безопасные поля: пароль и cookies наружу не отдаются никогда."""
+    return {
+        "id": item["id"],
+        "label": item["label"],
+        "user_id": item["user_id"],
+        "token_preview": "…" + item["token"][-4:] if len(item["token"]) >= 4 else "…",
+        "created_at": item["created_at"],
+        "web_username": item.get("web_username") or "",
+        "has_web_password": bool(item.get("web_password_enc")),
+        "web_status": item.get("web_status") or "none",
+        "web_status_message": item.get("web_status_message") or "",
+        "web_checked_at": item.get("web_checked_at"),
+    }
+
+
+def _clickru_uses_env_web_login(connection: dict[str, Any]) -> bool:
+    """Подключение без своих логина/пароля может работать по-старому (через
+    CLICKRU_WEB_* из .env ParsYa) ТОЛЬКО если это тот же кабинет, что и
+    CLICKRU_API_TOKEN из .env — иначе аккаунты создались бы в чужом кабинете."""
+    env_token = os.getenv("CLICKRU_API_TOKEN", "").strip()
+    return bool(env_token) and connection["token"].strip() == env_token
+
+
+def _clickru_web_secrets(connection: dict[str, Any]) -> dict[str, Any] | None:
+    """Расшифрованные логин/пароль/cookies подключения или None, если их нет."""
+    if not (connection.get("web_username") and connection.get("web_password_enc")):
+        return None
+    try:
+        password = decrypt_secret(connection["web_password_enc"])
+        cookies_enc = connection.get("web_cookies_enc") or ""
+        cookies = json.loads(decrypt_secret(cookies_enc)) if cookies_enc else []
+    except (TokenCryptoError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось расшифровать данные входа Click.ru «{connection['label']}»: {exc}",
+        ) from exc
+    return {
+        "connection_id": connection["id"],
+        "username": connection["web_username"],
+        "password": password,
+        "cookies": cookies if isinstance(cookies, list) else [],
+    }
+
+
+def _clickru_provision_payload(connection: dict[str, Any]) -> dict[str, Any] | None:
+    """Что передать в провижининг ParsYa для этого подключения. None —
+    легаси-режим (.env ParsYa), допустим только для «.env-кабинета».
+    Ошибка 422 — подключение нельзя использовать для запуска."""
+    secrets_ = _clickru_web_secrets(connection)
+    if secrets_ is None:
+        if _clickru_uses_env_web_login(connection):
+            return None
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"У подключения Click.ru «{connection['label']}» не указан логин и пароль "
+                "веб-кабинета — добавьте их в разделе «Клик.ру»."
+            ),
+        )
+    if connection.get("web_status") == "failed":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Вход в кабинет Click.ru «{connection['label']}» не удался: "
+                f"{connection.get('web_status_message') or 'проверьте логин и пароль'}. "
+                "Обновите логин и пароль в разделе «Клик.ру»."
+            ),
+        )
+    return secrets_
+
+
+def _save_clickru_cookies(connection_id: int, cookies: Any, message: str) -> None:
+    if not isinstance(cookies, list) or not cookies:
+        return
+    db.set_clickru_web_session(connection_id, "ok", message, cookies_enc=encrypt_secret(json.dumps(cookies)))
+
+
+async def _clickru_web_login(connection_id: int) -> dict[str, Any]:
+    """Вход/проверка веб-сессии через Chrome в WSL и запись результата."""
+    connection = db.get_clickru_connection(connection_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Подключение Click.ru не найдено")
+    secrets_ = _clickru_web_secrets(connection)
+    if secrets_ is None:
+        raise HTTPException(status_code=422, detail="Сначала укажите логин и пароль веб-кабинета Click.ru.")
+    try:
+        result = await ParsYaPoolClient().clickru_web_login(
+            secrets_["username"], secrets_["password"], secrets_["cookies"],
+        )
+    except ParsYaPoolError as exc:
+        reason = str(exc).replace(CLICKRU_LOGIN_FAILED_MARKER, "").strip()
+        if exc.status_code == 409:
+            # Вход действительно не удался — старые cookies больше не верим.
+            db.set_clickru_web_session(connection_id, "failed", reason, cookies_enc="")
+        else:
+            # WSL/туннель недоступен и т.п. — про саму сессию ничего не
+            # узнали, статус и cookies не трогаем.
+            db.set_clickru_web_session(
+                connection_id, connection.get("web_status") or "none", f"Проверка не выполнена: {reason}",
+            )
+    else:
+        cookies = result.get("cookies")
+        if isinstance(cookies, list) and cookies:
+            _save_clickru_cookies(
+                connection_id, cookies,
+                "Вход выполнен по паролю" if result.get("relogged") else "Сессия активна",
+            )
+        else:
+            db.set_clickru_web_session(connection_id, "failed", "Click.ru не вернул cookies сессии", cookies_enc="")
+    updated = db.get_clickru_connection(connection_id)
+    assert updated is not None
+    return _public_clickru_connection(updated)
+
+
 @app.get("/api/clickru-connections")
 async def list_clickru_connections(_: AuthUser):
-    items = db.list_clickru_connections()
-    return {
-        "items": [
-            {
-                "id": item["id"],
-                "label": item["label"],
-                "user_id": item["user_id"],
-                "token_preview": "…" + item["token"][-4:] if len(item["token"]) >= 4 else "…",
-                "created_at": item["created_at"],
-            }
-            for item in items
-        ]
-    }
+    return {"items": [_public_clickru_connection(item) for item in db.list_clickru_connections()]}
 
 
 @app.post("/api/clickru-connections", status_code=201)
 async def add_clickru_connection(payload: ClickRUConnectionIn, _: AuthUser):
+    web_username = payload.web_username.strip()
+    web_password = payload.web_password
+    if bool(web_username) != bool(web_password):
+        raise HTTPException(status_code=422, detail="Укажите и логин, и пароль кабинета Click.ru (или оставьте оба пустыми).")
     client = ClickRUClient(token=payload.token, user_id=payload.user_id or None)
     try:
         await client.user()
     except ClickRUError as exc:
         raise HTTPException(status_code=422, detail=f"Токен не прошёл проверку Click.ru: {exc}") from exc
+    if web_username:
+        try:
+            password_enc = encrypt_secret(web_password)
+        except TokenCryptoError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
     connection = db.create_clickru_connection(payload.label.strip(), payload.token.strip(), payload.user_id.strip())
-    return {
-        "id": connection["id"],
-        "label": connection["label"],
-        "user_id": connection["user_id"],
-        "created_at": connection["created_at"],
-    }
+    if web_username:
+        db.set_clickru_web_credentials(connection["id"], web_username, password_enc)
+        return await _clickru_web_login(connection["id"])
+    return _public_clickru_connection(connection)
+
+
+@app.put("/api/clickru-connections/{connection_id}/web-credentials")
+async def set_clickru_web_credentials(connection_id: int, payload: ClickRUWebCredentialsIn, _: AuthUser):
+    if db.get_clickru_connection(connection_id) is None:
+        raise HTTPException(status_code=404, detail="Подключение Click.ru не найдено")
+    try:
+        password_enc = encrypt_secret(payload.web_password)
+    except TokenCryptoError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    db.set_clickru_web_credentials(connection_id, payload.web_username.strip(), password_enc)
+    return await _clickru_web_login(connection_id)
+
+
+@app.post("/api/clickru-connections/{connection_id}/web-check")
+async def check_clickru_web_session(connection_id: int, _: AuthUser):
+    return await _clickru_web_login(connection_id)
 
 
 @app.delete("/api/clickru-connections/{connection_id}")
@@ -237,14 +387,20 @@ async def click_connection(_: AuthUser, connection_id: int | None = Query(defaul
 
 
 @app.post("/api/accounts/direct", status_code=201)
-async def create_direct_account(payload: DirectAccountCreate, _: AuthUser):
+async def create_direct_account(
+    payload: DirectAccountCreate,
+    _: AuthUser,
+    connection_id: int | None = Query(default=None, ge=1),
+):
     """Not called from this app's own UI (see DirectAccountCreate) — this is
     a machine endpoint for ParsYa's connect_direct_account.py, which drives
     a real Click.ru web-login Selenium flow to connect a pool Yandex ID as
     a YANDEX_DIRECT integration, then calls this to create the actual
     Direct account under it. Do not remove without checking that script.
+    `connection_id` (с 2026-11-10) — тот же кабинет Click.ru, в котором
+    скрипт подключил интеграцию; без него — токен из .env (легаси).
     """
-    client = ClickRUClient()
+    client = _resolve_clickru_client(connection_id)
     if not client.configured:
         raise HTTPException(status_code=503, detail="Сначала укажите CLICKRU_API_TOKEN в серверном .env")
     try:
@@ -1166,6 +1322,11 @@ async def bulk_create_campaigns(project_id: int, payload: BulkCampaignCreateRequ
     client = _resolve_clickru_client(payload.connection_id)
     if not client.configured:
         raise HTTPException(status_code=503, detail="Выбранное подключение Click.ru не настроено")
+    # Проверить кабинет ДО старта: иначе каждый аккаунт пула был бы
+    # захвачен и тут же отпущен с одной и той же ошибкой входа.
+    connection = db.get_clickru_connection(payload.connection_id)
+    assert connection is not None  # _resolve_clickru_client уже вернул бы 404
+    _clickru_provision_payload(connection)
 
     pool_client = ParsYaPoolClient()
     if not pool_client.configured:
@@ -1208,7 +1369,27 @@ async def _run_bulk_job(
             counter_id: int | None = None
             goal_id: int | None = None
             try:
-                provisioned = await pool_client.provision_direct_account(account_name_prefix=project["name"][:10])
+                # Перечитываем подключение на каждой итерации: прошлая могла
+                # обновить cookies сессии кабинета.
+                connection = db.get_clickru_connection(payload.connection_id)
+                if connection is None:
+                    raise ParsYaPoolError("Подключение Click.ru удалено во время запуска")
+                try:
+                    clickru_web = _clickru_provision_payload(connection)
+                except HTTPException as exc:
+                    raise ParsYaPoolError(str(exc.detail)) from exc
+                try:
+                    provisioned = await pool_client.provision_direct_account(
+                        account_name_prefix=project["name"][:10], clickru=clickru_web,
+                    )
+                except ParsYaPoolError as exc:
+                    if CLICKRU_LOGIN_FAILED_MARKER in str(exc):
+                        reason = str(exc).replace(CLICKRU_LOGIN_FAILED_MARKER, "").strip()
+                        db.set_clickru_web_session(payload.connection_id, "failed", reason, cookies_enc="")
+                        raise ParsYaPoolError(f"Вход в кабинет Click.ru не удался: {reason}") from exc
+                    raise
+                if clickru_web is not None:
+                    _save_clickru_cookies(payload.connection_id, provisioned.get("clickru_cookies"), "Сессия активна")
                 pool_login = provisioned["pool_login"]
                 account_id = int(provisioned["account_id"])
 

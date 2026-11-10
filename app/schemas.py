@@ -25,6 +25,17 @@ class ClickRUConnectionIn(BaseModel):
     label: str = Field(min_length=2, max_length=120)
     token: str = Field(min_length=10, max_length=500)
     user_id: str = Field(default="", max_length=120)
+    # Логин/пароль веб-кабинета click.ru — для подключения Яндекс ID из пула
+    # как Директ-интеграции (в API Click.ru такого метода нет). Необязательны
+    # при создании, но без них подключение нельзя использовать для запуска
+    # (кроме случая, когда токен совпадает с CLICKRU_API_TOKEN из .env).
+    web_username: str = Field(default="", max_length=200)
+    web_password: str = Field(default="", max_length=200)
+
+
+class ClickRUWebCredentialsIn(BaseModel):
+    web_username: str = Field(min_length=2, max_length=200)
+    web_password: str = Field(min_length=1, max_length=200)
 
 
 class ClickRUConnectionOut(BaseModel):
