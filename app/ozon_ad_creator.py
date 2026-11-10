@@ -1016,11 +1016,18 @@ async def _call_gemini(
     for attempt in range(3):
         try:
             resp = await client.post(url, json=payload, headers=headers)
-        except (httpx.TimeoutException, httpx.TransportError) as e:  # таймаут / обрыв сети — повторяем
+        except httpx.TimeoutException as e:
+            # Зависшую модель не ждём ещё дважды по 300 с (прод 2026-11-10:
+            # gemini-3.7-flash молчала 300 с даже на «столица России?») —
+            # сразу к следующей модели в generate_ad_copy.
+            last_exc, resp = e, None
+            break
+        except httpx.TransportError as e:  # обрыв сети — повторяем
             last_exc, resp = e, None
             print(f"[gemini] попытка {attempt + 1}: {type(e).__name__}, повторяю", file=sys.stderr)
             continue
-        if resp.status_code not in (429, 500, 502, 503, 504):
+        # 504 — шлюз WSL сам ждал Google 300 с: тоже не повторяем ту же модель.
+        if resp.status_code not in (429, 500, 502, 503):
             break
         await asyncio.sleep(2 ** attempt * 2)
     if resp is None:
@@ -1167,7 +1174,7 @@ async def generate_ad_copy(
                 msg = str(e)
                 errors.append(f"{current}: {msg[:200]}")
                 # перегрузка / квота / модель снята / сеть — пробуем следующую модель, иначе ошибка
-                if any(code in msg for code in ("HTTP 429", "HTTP 503", "HTTP 500", "HTTP 404", "не ответил")):
+                if any(code in msg for code in ("HTTP 429", "HTTP 503", "HTTP 500", "HTTP 502", "HTTP 504", "HTTP 404", "не ответил")):
                     print(f"[gemini] {current} недоступна ({msg[:60]}...), пробую следующую", file=sys.stderr)
                     continue
                 raise

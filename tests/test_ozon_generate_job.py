@@ -255,3 +255,30 @@ def test_gemini_direct_mode_still_works(monkeypatch):
     import pytest
     with pytest.raises(oz.GeminiError):
         oz._gemini_gateway()
+
+
+def test_hung_model_is_not_retried_next_model_used(monkeypatch):
+    """Таймаут/504 шлюза — сразу следующая модель, без двух повторных ожиданий."""
+    import httpx
+    from app import ozon_ad_creator as oz
+    monkeypatch.delenv("GEMINI_VIA", raising=False)
+    monkeypatch.setenv("PARSYA_POOL_API_TOKEN", "pool-token")
+    calls = []
+    ad = {"yandex_direct": [{"title1": "Санта", "title2": "t", "text": "x", "angle": "a"}]}
+
+    def handler(request):
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        if model == "m-hung":
+            raise httpx.ReadTimeout("hung", request=request)
+        if model == "m-504":
+            return httpx.Response(504, json={"error": {"message": "Gemini не ответил за 300 с (WSL)"}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": json.dumps(ad)}]}}]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await oz.generate_ad_copy(oz.OzonProduct(url="u", title="Санта"), model="m-hung", images=0,
+                                             client=client, fix_issues=False, fallback_models=["m-504", "m-ok"])
+
+    result = asyncio.run(run())
+    assert calls == ["m-hung", "m-504", "m-ok"] and result.model_used == "m-ok"
