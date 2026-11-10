@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from fastapi.testclient import TestClient
@@ -100,3 +101,89 @@ def test_validation_errors_stay_synchronous(monkeypatch, tmp_path):
         assert client.post("/api/projects/9999/ozon-generate", auth=AUTH, json={}).status_code == 404
         project = _make_project(client, AUTH)
         assert client.post(f"/api/projects/{project['id']}/ozon-generate", auth=AUTH, json={}).status_code == 422
+
+
+# --- карточка через Chrome в WSL (parsya-control /api/addavto/ozon-fetch) ---
+
+DOM_PAGE = {
+    "widgetStates": {
+        "webProductHeading-1-default-1": '{"title": "Санта Клаус 3D"}',
+        "webGallery-2-default-1": '{"images": [{"src": "https://ir.ozone.ru/s3/a/wc1000/1.jpg"}]}',
+        "webPrice-3-default-1": '{"price": "291 ₽"}',
+    },
+    "seo": {"title": "Санта", "script": [{"innerHTML": '{"@type": "Product", "description": "Подвижная фигурка"}'}]},
+}
+
+
+def test_parse_ozon_product_uses_remote_fetch_only():
+    from app import ozon_ad_creator as oz
+
+    calls = []
+
+    async def remote(path, extra):
+        calls.append((path, extra))
+        return [DOM_PAGE, None]
+
+    product = asyncio.run(oz.parse_ozon_product(OZON_URL, remote_fetch=remote))
+    assert calls == [("/product/santa-3160445300/", ["/product/santa-3160445300/?layout_container=pdpPage2column&layout_page_index=2"])]
+    assert product.title == "Санта Клаус 3D" and product.price == "291 ₽"
+    assert product.description == "Подвижная фигурка" and len(product.images) == 1
+
+
+def _setup_remote(monkeypatch, tmp_path, pool_outcome):
+    _configure_test_env(monkeypatch, tmp_path / "ozon-remote.db")
+    main_module._OZON_JOBS.clear()
+    seen = {}
+
+    class Pool:
+        async def ozon_fetch_pages(self, path, extra_paths, session_id, label=""):
+            seen.update(path=path, session_id=session_id, label=label)
+            if isinstance(pool_outcome, Exception):
+                raise pool_outcome
+            return [DOM_PAGE, None]
+
+    async def fake_generate(product, **kwargs):
+        from app.ozon_ad_creator import AdCopy, YandexDirectAd
+        return AdCopy(yandex_direct=[YandexDirectAd(title1=product.title, title2="t", text="txt", angle="a")],
+                      keywords=["k"])
+
+    monkeypatch.setattr(main_module, "ParsYaPoolClient", Pool)
+    from app import ozon_ad_creator as oz
+    monkeypatch.setattr(oz, "generate_ad_copy", fake_generate)
+    return seen
+
+
+def test_job_fetches_card_via_wsl_with_its_captcha_session(monkeypatch, tmp_path):
+    seen = _setup_remote(monkeypatch, tmp_path, "ok")
+    with TestClient(main_module.app) as client:
+        project = _make_project(client, AUTH, launch_mode="ozon", ozon_url=OZON_URL)
+        started = client.post(f"/api/projects/{project['id']}/ozon-generate", auth=AUTH, json={}).json()
+        sid = started["captcha_session"]
+        assert sid and len(sid) >= 8
+        st = _poll(client, project["id"])
+        assert st["status"] == "done", st
+        assert seen["session_id"] == sid and seen["path"] == "/product/santa-3160445300/"
+        assert st["result"]["project"]["headlines"] == ["Санта Клаус 3D"]
+
+
+def test_wsl_failure_is_reported(monkeypatch, tmp_path):
+    from app.parsya_pool_client import ParsYaPoolError
+    _setup_remote(monkeypatch, tmp_path, ParsYaPoolError("Капчу Ozon никто не прошёл вовремя", 409))
+    with TestClient(main_module.app) as client:
+        project = _make_project(client, AUTH, launch_mode="ozon", ozon_url=OZON_URL)
+        client.post(f"/api/projects/{project['id']}/ozon-generate", auth=AUTH, json={})
+        st = _poll(client, project["id"])
+        assert st["status"] == "failed" and "Капчу Ozon никто не прошёл" in st["error"]
+
+
+def test_short_characteristics_from_page_dom():
+    from app import ozon_ad_creator as oz
+    state = {"characteristics": [
+        {"id": "Color_1", "title": {"textRs": [{"type": "text", "content": "Цвет"}]},
+         "values": [{"id": "Color_0", "text": "Красный с белым"}]},
+        {"id": "Material_2", "title": {"textRs": [{"type": "text", "content": "Материал"}]},
+         "values": [{"text": "PLA пластик"}]},
+    ]}
+    product = oz.OzonProduct(url="u")
+    oz._apply_pages(product, {"widgetStates": {"webShortCharacteristics-1-default-1": json.dumps(state)}}, None)
+    assert product.characteristics == {"Цвет": "Красный с белым", "Материал": "PLA пластик"}

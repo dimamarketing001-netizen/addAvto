@@ -1013,21 +1013,43 @@ async def update_project(project_id: int, project: ProjectIn, _: AuthUser):
 # отвечает 202, а фронт опрашивает GET того же адреса. Состояние — в памяти
 # процесса: uvicorn здесь один; после рестарта задачу просто запускают снова.
 _OZON_JOBS: dict[int, dict[str, Any]] = {}
-OZON_JOB_TIMEOUT_SECONDS = 600
+# Капча Ozon проходится вручную до 8 мин + Gemini — с запасом.
+OZON_JOB_TIMEOUT_SECONDS = 900
 
 
 def _ozon_job_public(job: dict[str, Any] | None) -> dict[str, Any]:
     if job is None:
         return {"status": "none"}
-    return {k: job.get(k) for k in ("status", "error", "result", "url", "started_at", "finished_at")}
+    return {k: job.get(k) for k in ("status", "error", "result", "url", "started_at", "finished_at", "captcha_session")}
 
 
-async def _ozon_generate_apply(project_id: int, url: str) -> dict[str, Any]:
+def _ozon_remote_fetch(project_id: int, session_id: str, label: str):
+    """Карточку Ozon открывает настоящий Chrome в WSL (parsya-control →
+    ozon_fetch.py): с IP этого сервера Ozon отдаёт 403 и Chromium, и Google
+    Chrome (проверено 2026-11-10). OZON_FETCH_VIA=local — старый путь
+    (HTTP + браузер в контейнере), например для запуска вне прода."""
+    if os.getenv("OZON_FETCH_VIA", "wsl").strip().lower() == "local":
+        return None
+
+    async def fetch(path: str, extra_paths: list[str]) -> list[dict[str, Any] | None]:
+        try:
+            return await ParsYaPoolClient().ozon_fetch_pages(path, extra_paths, session_id, label)
+        except ParsYaPoolError as e:
+            raise OzonParseError(f"Карточка Ozon не получена: {e}") from e
+
+    return fetch
+
+
+async def _ozon_generate_apply(project_id: int, url: str, captcha_session: str = "") -> dict[str, Any]:
     """Парсинг + Gemini + запись результата в проект. Возвращает
     OzonGenerateOut как dict; ошибки — OzonParseError/GeminiError."""
+    current = db.get_project(project_id) or {}
+    remote = _ozon_remote_fetch(project_id, captcha_session or secrets.token_urlsafe(12),
+                                f"проект #{project_id} {current.get('name') or ''}".strip())
     try:
         result = await asyncio.wait_for(
-            process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser),
+            process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser,
+                             remote_fetch=remote),
             timeout=OZON_JOB_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -1078,7 +1100,7 @@ async def _ozon_generate_apply(project_id: int, url: str) -> dict[str, Any]:
 
 async def _ozon_generate_job(project_id: int, url: str, job: dict[str, Any]) -> None:
     try:
-        job["result"] = await _ozon_generate_apply(project_id, url)
+        job["result"] = await _ozon_generate_apply(project_id, url, job.get("captcha_session") or "")
         job["status"] = "done"
     except (OzonParseError, GeminiError) as e:
         job["status"], job["error"] = "failed", str(e)
@@ -1117,7 +1139,8 @@ async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
     if current and current["status"] == "running":
         return _ozon_job_public(current)
     job: dict[str, Any] = {"status": "running", "error": None, "result": None, "url": url,
-                           "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None}
+                           "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
+                           "captcha_session": secrets.token_urlsafe(12)}
     _OZON_JOBS[project_id] = job
     task = asyncio.create_task(_ozon_generate_job(project_id, url, job))
     _BACKGROUND_JOB_TASKS.add(task)

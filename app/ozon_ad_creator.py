@@ -57,7 +57,7 @@ import re
 import sys
 from html import unescape
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlparse
 
 import httpx
@@ -470,6 +470,12 @@ def _parse_widgets(product: OzonProduct, states: dict[str, Any]) -> None:
             for d in _walk(data):
                 # формат: {"name"/"key": "...", "values": [{"text": "..."}]}
                 label = d.get("name") or d.get("title")
+                if isinstance(label, dict):
+                    # webShortCharacteristics со страницы (2026-11-10):
+                    # {"title": {"textRs": [{"content": "Цвет"}]}, "values": [...]}
+                    label = "".join(
+                        str(t.get("content") or "") for t in label.get("textRs") or [] if isinstance(t, dict)
+                    ) or None
                 values = d.get("values")
                 if isinstance(label, str) and isinstance(values, list):
                     vals = [v.get("text") for v in values if isinstance(v, dict) and v.get("text")]
@@ -653,12 +659,17 @@ async def parse_ozon_product(
     proxy: str | None = None,
     mode: str | None = None,
     browser: OzonBrowser | None = None,
+    remote_fetch: Callable[[str, list[str]], Awaitable[list[dict[str, Any] | None]]] | None = None,
 ) -> OzonProduct:
     """Главная функция парсинга. Возвращает OzonProduct (без скачивания картинок).
 
     mode: "auto" — сначала быстрый HTTP, при блокировке — браузер (по умолчанию);
           "http" — только HTTP; "browser" — сразу браузер.
     browser: общий экземпляр OzonBrowser (для FastAPI), иначе браузер запускается на один вызов.
+    remote_fetch: (path, extra_paths) -> страницы {widgetStates, seo} — внешний
+          настоящий браузер (addAvto: Chrome в WSL через parsya-control). Если
+          задан, используется вместо HTTP и локального браузера: с IP
+          прод-сервера Ozon блокирует и то и другое (2026-11-10).
     """
     cookies = cookies if cookies is not None else os.getenv("OZON_COOKIES")
     proxy = proxy if proxy is not None else os.getenv("OZON_PROXY")
@@ -670,7 +681,12 @@ async def parse_ozon_product(
     page2_path = f"{path}?layout_container=pdpPage2column&layout_page_index=2"
     product = OzonProduct(url=f"{OZON_BASE}{path}", sku=_extract_sku(path))
 
-    if mode in ("auto", "http"):
+    if remote_fetch is not None:
+        pages = await remote_fetch(path, [page2_path])
+        pages = (list(pages) + [None, None])[:2]
+        _apply_pages(product, pages[0], pages[1])
+        mode = "remote"
+    elif mode in ("auto", "http"):
         async with _OzonHttp(cookies=cookies, proxy=proxy) as http:
             # Страница 1: заголовок, галерея, цена. Страница 2: описание и характеристики.
             page1 = await _fetch_page_json(http, path)
@@ -679,7 +695,7 @@ async def parse_ozon_product(
             if mode == "http" and (not product.title or not product.images):
                 await _fallback_html(http, product, path)
 
-    if mode == "browser" or (mode == "auto" and not product.title):
+    if mode != "remote" and (mode == "browser" or (mode == "auto" and not product.title)):
         if mode == "auto":
             print("[ozon] HTTP заблокирован — переключаюсь на браузер (Playwright)", file=sys.stderr)
         if browser is not None:
@@ -701,7 +717,9 @@ async def parse_ozon_product(
 
     if not product.title:
         hint = ""
-        if mode == "http":
+        if mode == "remote":
+            hint = " Chrome в WSL открыл страницу, но данных товара на ней нет — проверьте ссылку."
+        elif mode == "http":
             hint = " Попробуйте режим браузера: mode='browser' / OZON_FETCH_MODE=browser."
         elif not HAS_PLAYWRIGHT:
             hint = " Установите Playwright: pip install playwright."
@@ -1162,12 +1180,14 @@ async def process_ozon_url(
     proxy: str | None = None,
     mode: str | None = None,
     browser: OzonBrowser | None = None,
+    remote_fetch: Callable[[str, list[str]], Awaitable[list[dict[str, Any] | None]]] | None = None,
 ) -> ProcessResult:
     """Полный цикл: парсинг → (скачивание картинок) → (генерация текстов) → (сохранение JSON).
 
     out_dir=None и download=False — ничего не пишет на диск (удобно для API-эндпоинта).
     """
-    product = await parse_ozon_product(url, cookies=cookies, proxy=proxy, mode=mode, browser=browser)
+    product = await parse_ozon_product(url, cookies=cookies, proxy=proxy, mode=mode, browser=browser,
+                                       remote_fetch=remote_fetch)
 
     target: Path | None = None
     if out_dir is not None:
