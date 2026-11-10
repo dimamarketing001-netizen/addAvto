@@ -297,7 +297,7 @@ class _OzonHttp:
         self.headers = dict(BROWSER_HEADERS)
         if cookies:
             self.headers["Cookie"] = cookies
-        self.proxy = proxy
+        self.proxy = proxy or None
         self.timeout = timeout
         self._curl = None
         self._httpx: httpx.AsyncClient | None = None
@@ -548,7 +548,7 @@ class OzonBrowser:
             headless = os.getenv("OZON_HEADLESS", "0").lower() not in ("0", "false", "no")
         self.headless = headless
         self.channel = channel if channel is not None else os.getenv("OZON_BROWSER_CHANNEL", OZON_BROWSER_CHANNEL_DEFAULT)
-        self.proxy = proxy if proxy is not None else os.getenv("OZON_PROXY")
+        self.proxy = (proxy if proxy is not None else os.getenv("OZON_PROXY")) or None
         self.timeout_ms = timeout_ms
         self._pw = None
         self._browser = None
@@ -672,7 +672,7 @@ async def parse_ozon_product(
           прод-сервера Ozon блокирует и то и другое (2026-11-10).
     """
     cookies = cookies if cookies is not None else os.getenv("OZON_COOKIES")
-    proxy = proxy if proxy is not None else os.getenv("OZON_PROXY")
+    proxy = (proxy if proxy is not None else os.getenv("OZON_PROXY")) or None
     mode = (mode or os.getenv("OZON_FETCH_MODE") or OZON_FETCH_MODE_DEFAULT).lower()
     if mode not in ("auto", "http", "browser"):
         raise ValueError(f"Неизвестный режим: {mode}")
@@ -742,7 +742,7 @@ async def download_images(
     urls = product.images[:limit] if limit else product.images
     saved: list[str] = []
 
-    async with _OzonHttp(proxy=proxy if proxy is not None else os.getenv("OZON_PROXY")) as http:
+    async with _OzonHttp(proxy=(proxy if proxy is not None else os.getenv("OZON_PROXY")) or None) as http:
         sem = asyncio.Semaphore(5)
 
         async def _one(i: int, src: str) -> str | None:
@@ -1109,7 +1109,9 @@ async def generate_ad_copy(
         fallback_models = [x.strip() for x in env_fb.split(",") if x.strip()] if env_fb is not None \
             else list(GEMINI_FALLBACK_MODELS_DEFAULT)
     models = [model] + [m_ for m_ in fallback_models if m_ != model]
-    proxy = proxy if proxy is not None else os.getenv("GEMINI_PROXY")
+    # Пустая строка из .env (GEMINI_PROXY=) — «без прокси»: httpx на proxy="" падает
+    # «Unknown scheme for proxy URL» (прод, 2026-11-10).
+    proxy = (proxy if proxy is not None else os.getenv("GEMINI_PROXY")) or None
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
 
     own_client = client is None

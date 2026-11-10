@@ -187,3 +187,30 @@ def test_short_characteristics_from_page_dom():
     product = oz.OzonProduct(url="u")
     oz._apply_pages(product, {"widgetStates": {"webShortCharacteristics-1-default-1": json.dumps(state)}}, None)
     assert product.characteristics == {"Цвет": "Красный с белым", "Материал": "PLA пластик"}
+
+
+def test_empty_proxy_env_means_no_proxy(monkeypatch):
+    """Прод .env: GEMINI_PROXY= и OZON_PROXY= пустые — это «без прокси», а
+    не proxy='' (httpx: Unknown scheme for proxy URL URL(''))."""
+    from app import ozon_ad_creator as oz
+    monkeypatch.setenv("GEMINI_PROXY", "")
+    monkeypatch.setenv("OZON_PROXY", "")
+    seen = {}
+    real = oz.httpx.AsyncClient
+
+    def spy(*a, **kw):
+        seen.setdefault("proxies", []).append(kw.get("proxy"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(oz.httpx, "AsyncClient", spy)
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+
+    async def run():
+        try:
+            await oz.generate_ad_copy(oz.OzonProduct(url="u", title="t"), api_key="x")
+        except Exception as e:  # сеть/ключ не важны — важно, что клиент создался без proxy=''
+            return e
+
+    asyncio.run(run())
+    assert seen["proxies"] and all(p is None for p in seen["proxies"])
+    assert oz.OzonBrowser().proxy is None and oz._OzonHttp(proxy="").proxy is None
