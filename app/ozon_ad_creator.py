@@ -78,6 +78,14 @@ except Exception:  # pragma: no cover
     HAS_PLAYWRIGHT = False
 
 
+def _browser_not_installed(exc: Exception) -> bool:
+    """Ошибка Playwright «нет такого браузера» (а не сбой уже запущенного):
+    'Chromium distribution 'chrome' is not found at ...' / 'Executable
+    doesn't exist at ...'."""
+    text = str(exc)
+    return "is not found at" in text or "Executable doesn't exist" in text
+
+
 # ============================================================================
 #                               НАСТРОЙКИ
 # ============================================================================
@@ -554,11 +562,27 @@ class OzonBrowser:
             "headless": self.headless,
             "args": ["--disable-blink-features=AutomationControlled", "--lang=ru-RU"],
         }
-        if self.channel:
-            launch["channel"] = self.channel
         if self.proxy:
             launch["proxy"] = {"server": self.proxy}
-        self._browser = await self._pw.chromium.launch(**launch)
+        if self.channel:
+            try:
+                self._browser = await self._pw.chromium.launch(channel=self.channel, **launch)
+            except Exception as exc:
+                # 2026-11-10, прод: OZON_BROWSER_CHANNEL=chrome, а в
+                # Docker-образе только встроенный Chromium Playwright (см.
+                # Dockerfile) — запуск падал «Chromium distribution 'chrome'
+                # is not found», и обход антибота Ozon не работал вовсе.
+                # Нет заказанного браузера — берём встроенный, а не 500.
+                if not _browser_not_installed(exc):
+                    raise
+                print(
+                    f"[ozon] браузер channel={self.channel!r} не установлен — "
+                    "запускаю встроенный Chromium Playwright",
+                    file=sys.stderr,
+                )
+                self.channel = ""
+        if self._browser is None:
+            self._browser = await self._pw.chromium.launch(**launch)
         self._context = await self._browser.new_context(
             locale="ru-RU",
             timezone_id="Europe/Moscow",
