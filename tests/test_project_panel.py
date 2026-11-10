@@ -86,7 +86,7 @@ def test_open_metrika_only_for_project_accounts(monkeypatch, tmp_path):
     opened = []
 
     class Pool:
-        async def open_pool_browser(self, login, target="metrika"):
+        async def open_pool_browser(self, login, target="metrika", org_login=""):
             opened.append((login, target))
             return {"ok": True, "logged_in": True, "url": "https://metrika.yandex.ru/list"}
 
@@ -102,7 +102,7 @@ def test_open_metrika_only_for_project_accounts(monkeypatch, tmp_path):
         assert any(e["kind"] == "browser_opened" for e in h["events"])
 
     class BadPool:
-        async def open_pool_browser(self, login, target="metrika"):
+        async def open_pool_browser(self, login, target="metrika", org_login=""):
             raise ParsYaPoolError("У аккаунта в пуле нет сохранённой сессии Яндекса", 409)
 
     monkeypatch.setattr(main_module, "ParsYaPoolClient", BadPool)
@@ -137,3 +137,26 @@ def test_account_endpoint_masks_service_password(monkeypatch, tmp_path):
     assert r.status_code == 200 and body["serviceLogin"] == "porg-abc"
     assert "servicePassword" not in body and "secret123" not in r.text
     assert body["has_service_password"] is True and body["service_password_length"] == 9
+
+
+def test_open_direct_uses_org_login(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "direct.db")
+    opened = []
+
+    async def accounts(self):
+        return [{"id": 501, "serviceLogin": "porg-abc"}]
+
+    class Pool:
+        async def open_pool_browser(self, login, target="metrika", org_login=""):
+            opened.append((login, target, org_login))
+            return {"ok": True, "logged_in": True, "url": "https://direct.yandex.ru/dna/grid/campaigns/"}
+
+    monkeypatch.setattr(main_module.ClickRUClient, "accounts", accounts)
+    monkeypatch.setattr(main_module, "ParsYaPoolClient", Pool)
+    with TestClient(main_module.app) as client:
+        p = _make_project(client, AUTH)
+        _seed(p["id"])
+        r = client.post(f"/api/projects/{p['id']}/accounts/501/open-direct", auth=AUTH)
+        assert r.status_code == 200 and r.json()["org_login"] == "porg-abc" and r.json()["logged_in"]
+        assert opened == [("pool-a", "direct", "porg-abc")]
+        assert client.post(f"/api/projects/{p['id']}/accounts/777/open-direct", auth=AUTH).status_code == 404

@@ -305,6 +305,9 @@ class BulkCampaignItemResult(BaseModel):
     note: str | None = None
     status: str  # "created" or "failed"
     error: str | None = None
+    # Порядковый номер аккаунта в запуске (для manual_per_account при
+    # продолжении — какие наборы креативов ещё не использованы).
+    index: int | None = None
 
 
 class BulkCampaignCreateResult(BaseModel):
@@ -354,6 +357,10 @@ class BulkJobOut(BaseModel):
     created: int
     items: list[BulkCampaignItemResult]
     error: str | None = None
+    # Продолжение прерванного запуска (2026-11-10).
+    resumed_from: int | None = None
+    can_resume: bool = False
+    remaining: int = 0
     warning: str = (
         "Каждая кампания создана ЧЕРНОВИКОМ (Status=DRAFT, State=OFF) — "
         "запуск не выполняется автоматически."

@@ -26,6 +26,7 @@ def _configure_test_env(monkeypatch, database_path):
     monkeypatch.setenv("APP_USERNAME", "test-admin")
     monkeypatch.setenv("APP_PASSWORD", "test-password-long-enough")
     monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("BULK_AUTO_RESUME", "0")  # автопродолжение проверяется отдельно
     monkeypatch.setenv("CLICKRU_API_TOKEN", "test-token-not-used-for-network")
     monkeypatch.setenv("PARSYA_POOL_API_TOKEN", "test-pool-token-not-used-for-network")
     # Fernet-ключ для логина/пароля/cookies кабинета Click.ru (2026-11-10).

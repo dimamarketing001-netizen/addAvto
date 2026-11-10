@@ -64,6 +64,10 @@ async def lifespan(_: FastAPI):
     interrupted = db.fail_interrupted_bulk_jobs()
     if interrupted:
         print(f"[startup] прерванные запуски помечены failed: {interrupted}", flush=True)
+        if os.getenv("BULK_AUTO_RESUME", "1") != "0":
+            task = asyncio.create_task(_auto_resume_interrupted(interrupted))
+            _BACKGROUND_JOB_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_JOB_TASKS.discard)
     lk.init_lk_db()
     worker = None
     if os.getenv("LK_WORKER", "1") != "0":
@@ -1103,7 +1107,8 @@ def _project_history(project: dict[str, Any]) -> dict[str, Any]:
         items = job.get("items") or []
         events.append({
             "kind": "launch_started", "at": job["started_at"], "job_id": job["id"],
-            "title": f"Запуск #{job['id']}: заказано аккаунтов — {job['requested']}", "detail": "",
+            "title": f"Запуск #{job['id']}: заказано аккаунтов — {job['requested']}"
+                     + (f" (продолжение #{job['resumed_from']})" if job.get("resumed_from") else ""), "detail": "",
         })
         if job.get("finished_at") or job["status"] != "running":
             failed = [i for i in items if i.get("status") != "created"]
@@ -1136,8 +1141,14 @@ def _project_history(project: dict[str, Any]) -> dict[str, Any]:
             "callouts_used": it.get("callouts_used"), "note": it.get("note"),
         })
     ozon = _OZON_JOBS.get(pid) or {}
+    resume = None
+    for job in db.list_bulk_jobs(pid):  # новые сверху — продолжать имеет смысл последний
+        plan = _resume_plan(job)
+        if plan:
+            resume = {"job_id": job["id"], "remaining": plan["remaining"], "reuse_accounts": len(plan["reuse"])}
+        break
     return {
-        "project_id": pid, "events": events, "accounts": accounts,
+        "project_id": pid, "events": events, "accounts": accounts, "resume": resume,
         "ozon_status": ozon.get("status"),
         "running_job_id": next((j["id"] for j in db.list_bulk_jobs(pid) if j["status"] == "running"), None),
     }
@@ -1211,6 +1222,29 @@ async def check_project_account(project_id: int, account_id: int, _: AuthUser):
             } for a in ads],
         })
     return out
+
+
+@app.post("/api/projects/{project_id}/accounts/{account_id}/open-direct")
+async def open_account_direct(project_id: int, account_id: int, _: AuthUser):
+    """Открывает Директ аккаунта Click.ru (porg-…) в Chrome на ПК в WSL:
+    cookies пулового Yandex ID → Яндекс ID → «Ваши организации» → организация
+    porg-… → Директ с её кампаниями (схема Dima, проверено 2026-11-10).
+    Только для аккаунтов кампаний этого проекта."""
+    row = _project_campaign_row(project_id, account_id)
+    if not row.get("pool_login"):
+        raise HTTPException(status_code=409, detail="У аккаунта нет логина пула")
+    client = _resolve_clickru_client(row.get("connection_id"))
+    try:
+        org_login = await _resolve_client_login(client, account_id)
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        result = await ParsYaPoolClient().open_pool_browser(row["pool_login"], "direct", org_login=org_login)
+    except ParsYaPoolError as exc:
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+    db.add_project_event(project_id, "browser_opened", f"Открыт Директ {org_login} в Chrome на ПК",
+                         "Вход выполнен" if result.get("logged_in") else (result.get("error") or "Войти не удалось"))
+    return {**result, "org_login": org_login}
 
 
 @app.post("/api/projects/{project_id}/accounts/{account_id}/open-metrika")
@@ -1693,6 +1727,21 @@ async def bulk_create_campaigns(project_id: int, payload: BulkCampaignCreateRequ
     running (409) — two concurrent batches would both draw from the same
     ParsYa pool and double-book accounts.
     """
+    job_id = _start_bulk_job(project_id, payload)
+    return BulkJobStartOut(job_id=job_id, project_id=project_id, status="running")
+
+
+def _start_bulk_job(
+    project_id: int,
+    payload: BulkCampaignCreateRequest,
+    reuse: list[dict[str, Any]] | None = None,
+    resumed_from: int | None = None,
+    indexes: list[int] | None = None,
+) -> int:
+    """Проверки + создание задания + запуск фоновой корутины. Общая часть
+    обычного запуска и продолжения прерванного (reuse — аккаунты, уже
+    созданные провижинингом, но без кампании; indexes — какие номера
+    аккаунтов исходного запуска ещё не сделаны)."""
     project = db.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
@@ -1735,11 +1784,15 @@ async def bulk_create_campaigns(project_id: int, payload: BulkCampaignCreateRequ
             detail="Массовый запуск для этого проекта уже выполняется — подождите его завершения.",
         )
 
-    job_id = db.create_bulk_job(project_id, payload.count)
-    task = asyncio.create_task(_run_bulk_job(job_id, project_id, project, project_host, phrases, client, pool_client, payload))
+    request = payload.model_dump(mode="json")
+    if indexes:
+        request["_indexes"] = indexes  # номера аккаунтов исходного запуска — для следующего продолжения
+    job_id = db.create_bulk_job(project_id, payload.count, request=request, resumed_from=resumed_from)
+    task = asyncio.create_task(_run_bulk_job(job_id, project_id, project, project_host, phrases, client, pool_client,
+                                             payload, reuse=reuse or [], indexes=indexes))
     _BACKGROUND_JOB_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_JOB_TASKS.discard)
-    return BulkJobStartOut(job_id=job_id, project_id=project_id, status="running")
+    return job_id
 
 
 async def _run_bulk_job(
@@ -1751,7 +1804,10 @@ async def _run_bulk_job(
     client: ClickRUClient,
     pool_client: ParsYaPoolClient,
     payload: BulkCampaignCreateRequest,
+    reuse: list[dict[str, Any]] | None = None,
+    indexes: list[int] | None = None,
 ) -> None:
+    reuse = list(reuse or [])
     headlines = project.get("headlines") or []
     ad_texts = project.get("ad_texts") or []
     sitelinks_pool = project.get("sitelinks_pool") or []
@@ -1765,30 +1821,40 @@ async def _run_bulk_job(
             account_id: int | None = None
             counter_id: int | None = None
             goal_id: int | None = None
+            campaign_id: int | None = None
+            # Номер аккаунта в ИСХОДНОМ запуске (при продолжении — не 0..N).
+            orig_index = indexes[index] if indexes and index < len(indexes) else index
             try:
-                # Перечитываем подключение на каждой итерации: прошлая могла
-                # обновить cookies сессии кабинета.
-                connection = db.get_clickru_connection(payload.connection_id)
-                if connection is None:
-                    raise ParsYaPoolError("Подключение Click.ru удалено во время запуска")
-                try:
-                    clickru_web = _clickru_provision_payload(connection)
-                except HTTPException as exc:
-                    raise ParsYaPoolError(str(exc.detail)) from exc
-                try:
-                    provisioned = await pool_client.provision_direct_account(
-                        account_name_prefix=project["name"][:10], clickru=clickru_web,
-                    )
-                except ParsYaPoolError as exc:
-                    if CLICKRU_LOGIN_FAILED_MARKER in str(exc):
-                        reason = str(exc).replace(CLICKRU_LOGIN_FAILED_MARKER, "").strip()
-                        db.set_clickru_web_session(payload.connection_id, "failed", reason, cookies_enc="")
-                        raise ParsYaPoolError(f"Вход в кабинет Click.ru не удался: {reason}") from exc
-                    raise
-                if clickru_web is not None:
-                    _save_clickru_cookies(payload.connection_id, provisioned.get("clickru_cookies"), "Сессия активна")
-                pool_login = provisioned["pool_login"]
-                account_id = int(provisioned["account_id"])
+                if reuse:
+                    # Продолжение: аккаунт уже создан прошлым запуском
+                    # (пул потрачен), кампании в нём нет — провижининг не нужен.
+                    again = reuse.pop(0)
+                    pool_login, account_id = again["pool_login"], int(again["account_id"])
+                else:
+                    # Перечитываем подключение на каждой итерации: прошлая могла
+                    # обновить cookies сессии кабинета.
+                    connection = db.get_clickru_connection(payload.connection_id)
+                    if connection is None:
+                        raise ParsYaPoolError("Подключение Click.ru удалено во время запуска")
+                    try:
+                        clickru_web = _clickru_provision_payload(connection)
+                    except HTTPException as exc:
+                        raise ParsYaPoolError(str(exc.detail)) from exc
+                    try:
+                        provisioned = await pool_client.provision_direct_account(
+                            account_name_prefix=project["name"][:10], clickru=clickru_web,
+                        )
+                    except ParsYaPoolError as exc:
+                        if CLICKRU_LOGIN_FAILED_MARKER in str(exc):
+                            reason = str(exc).replace(CLICKRU_LOGIN_FAILED_MARKER, "").strip()
+                            db.set_clickru_web_session(payload.connection_id, "failed", reason, cookies_enc="")
+                            raise ParsYaPoolError(f"Вход в кабинет Click.ru не удался: {reason}") from exc
+                        raise
+                    if clickru_web is not None:
+                        _save_clickru_cookies(payload.connection_id, provisioned.get("clickru_cookies"), "Сессия активна")
+                    pool_login = provisioned["pool_login"]
+                    account_id = int(provisioned["account_id"])
+                db.set_bulk_job_pending(job_id, {"pool_login": pool_login, "account_id": account_id, "index": orig_index})
 
                 client_login = await _resolve_client_login(client, account_id)
                 counter_id, goal_id = await _ensure_lead_goal_for_account(pool_login, project_host, project["name"])
@@ -1921,19 +1987,55 @@ async def _run_bulk_job(
                     ads_created=ads_created,
                     note=note,
                     status="created",
+                    index=orig_index,
                 ).model_dump())
+                db.set_bulk_job_pending(job_id, None)
             except (ParsYaPoolError, ClickRUError, MetrikaAPIError, httpx.HTTPError) as exc:
                 db.append_bulk_job_item(job_id, BulkCampaignItemResult(
                     pool_login=pool_login,
                     account_id=account_id,
                     counter_id=counter_id,
                     goal_id=goal_id,
+                    campaign_id=campaign_id,
                     status="failed",
                     error=str(exc),
+                    index=orig_index,
                 ).model_dump())
+                db.set_bulk_job_pending(job_id, None)
         db.finish_bulk_job(job_id, "done")
     except Exception as exc:  # pragma: no cover - safety net so a job never sticks at "running"
         db.finish_bulk_job(job_id, "failed", error=str(exc))
+
+
+def _resume_plan(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Что можно продолжить у завершённого/прерванного запуска: сколько
+    кампаний не хватает, какие уже созданные провижинингом аккаунты стоят
+    без кампании (их берём первыми — пул не тратим заново) и какие номера
+    аккаунтов исходного запуска ещё не сделаны. None — продолжать нечего
+    или запуск старый (до 2026-11-10 параметры запуска не сохранялись)."""
+    if job["status"] == "running" or not job.get("request"):
+        return None
+    remaining = int(job["requested"]) - int(job["created"])
+    if remaining <= 0:
+        return None
+    pid = job["project_id"]
+    used_accounts = {r.get("account_id") for r in db.list_bulk_campaigns(pid)}
+    # аккаунты, уже взятые в работу продолжениями этого запуска
+    for later in db.list_bulk_jobs(pid):
+        if later.get("resumed_from") == job["id"]:
+            return None  # уже продолжали — продолжать надо последний в цепочке
+    reuse: list[dict[str, Any]] = []
+    candidates = ([job["pending"]] if job.get("pending") else []) + [
+        it for it in job["items"] if it.get("status") != "created" and it.get("account_id") and not it.get("campaign_id")
+    ]
+    for c in candidates:
+        if c.get("account_id") and c.get("pool_login") and c["account_id"] not in used_accounts \
+                and all(r["account_id"] != c["account_id"] for r in reuse):
+            reuse.append({"pool_login": c["pool_login"], "account_id": int(c["account_id"])})
+    done = {it.get("index") for it in job["items"] if it.get("status") == "created"}
+    base = job["request"].get("_indexes") or list(range(int(job["requested"])))
+    left = [i for i in base if i not in done][:remaining] if None not in done else base[len(done):][:remaining]
+    return {"remaining": remaining, "reuse": reuse[:remaining], "indexes": left}
 
 
 @app.get("/api/projects/{project_id}/campaigns/bulk-jobs/{job_id}", response_model=BulkJobOut)
@@ -1941,6 +2043,7 @@ async def get_bulk_job(project_id: int, job_id: int, _: AuthUser):
     job = db.get_bulk_job(job_id)
     if job is None or job["project_id"] != project_id:
         raise HTTPException(status_code=404, detail="Запуск не найден")
+    plan = _resume_plan(job)
     return BulkJobOut(
         job_id=job["id"],
         project_id=job["project_id"],
@@ -1949,7 +2052,73 @@ async def get_bulk_job(project_id: int, job_id: int, _: AuthUser):
         created=job["created"],
         items=job["items"],
         error=job["error"],
+        resumed_from=job.get("resumed_from"),
+        can_resume=plan is not None,
+        remaining=plan["remaining"] if plan else 0,
     )
+
+
+def _resume_bulk_job(project_id: int, job: dict[str, Any]) -> int:
+    plan = _resume_plan(job)
+    if plan is None:
+        raise HTTPException(status_code=409, detail="Этот запуск продолжить нельзя: всё создано, он ещё идёт, "
+                                                    "уже продолжен или запущен до сохранения параметров")
+    req = dict(job["request"])
+    base = req.pop("_indexes", None) or list(range(int(job["requested"])))
+    if req.get("creative_mode") == "manual_per_account":
+        # creative_sets этого запуска идут в порядке base (номера исходного запуска)
+        pos = {orig: p for p, orig in enumerate(base)}
+        req["creative_sets"] = [req["creative_sets"][pos[i]] for i in plan["indexes"]]
+    payload = BulkCampaignCreateRequest(**{**req, "count": plan["remaining"]})
+    return _start_bulk_job(project_id, payload, reuse=plan["reuse"], resumed_from=job["id"], indexes=plan["indexes"])
+
+
+AUTO_RESUME_MAX_CHAIN = 3
+AUTO_RESUME_DELAY_SECONDS = 20
+
+
+async def _auto_resume_interrupted(job_ids: list[int]) -> None:
+    """После перезапуска сервиса сами продолжаем запуски, которые он
+    оборвал (просьба Dima 2026-11-10: «нажать продолжить или автоматом»).
+    Пауза — чтобы сервис поднялся; не больше 3 продолжений подряд в одной
+    цепочке, чтобы падающий запуск не крутился бесконечно."""
+    await asyncio.sleep(AUTO_RESUME_DELAY_SECONDS)
+    for job_id in job_ids:
+        job = db.get_bulk_job(job_id)
+        if job is None or _resume_plan(job) is None:
+            continue
+        depth, cur = 0, job
+        while cur and cur.get("resumed_from"):
+            depth += 1
+            cur = db.get_bulk_job(int(cur["resumed_from"]))
+        if depth >= AUTO_RESUME_MAX_CHAIN:
+            print(f"[auto-resume] #{job_id}: уже {depth} продолжений подряд — только вручную", flush=True)
+            continue
+        try:
+            new_id = _resume_bulk_job(job["project_id"], job)
+        except HTTPException as exc:
+            print(f"[auto-resume] #{job_id}: {exc.detail}", flush=True)
+            db.add_project_event(job["project_id"], "launch_failed", f"Автопродолжение запуска #{job_id} не удалось",
+                                 str(exc.detail))
+            continue
+        print(f"[auto-resume] #{job_id} → #{new_id}", flush=True)
+        db.add_project_event(job["project_id"], "launch_resumed",
+                             f"Запуск #{job_id} продолжен автоматически как #{new_id}",
+                             f"Осталось {job['requested'] - job['created']} — после перезапуска сервиса")
+
+
+@app.post("/api/projects/{project_id}/campaigns/bulk-jobs/{job_id}/resume", response_model=BulkJobStartOut, status_code=202)
+async def resume_bulk_job(project_id: int, job_id: int, _: AuthUser):
+    """«Продолжить запуск»: досоздаёт недостающие кампании прерванного или
+    частично неудачного запуска с теми же параметрами. Сначала — аккаунты,
+    которые провижининг уже создал, а кампания в них не появилась."""
+    job = db.get_bulk_job(job_id)
+    if job is None or job["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    new_id = _resume_bulk_job(project_id, job)
+    db.add_project_event(project_id, "launch_resumed", f"Запуск #{job_id} продолжен как #{new_id}",
+                         f"Осталось {job['requested'] - job['created']}")
+    return BulkJobStartOut(job_id=new_id, project_id=project_id, status="running")
 
 
 @app.get("/api/report")

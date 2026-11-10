@@ -153,6 +153,13 @@ def init_db() -> None:
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS ix_project_events_project ON project_events(project_id, id)")
+        # Продолжение прерванного запуска (2026-11-10): параметры запуска,
+        # аккаунт, уже созданный провижинингом, но ещё без кампании
+        # (pending), и ссылка на запуск, который продолжаем.
+        job_columns = {row["name"] for row in db.execute("PRAGMA table_info(bulk_jobs)")}
+        for column, ddl in (("request_json", "TEXT"), ("pending_json", "TEXT"), ("resumed_from", "INTEGER")):
+            if column not in job_columns:
+                db.execute(f"ALTER TABLE bulk_jobs ADD COLUMN {column} {ddl}")
         # Per-user Yandex OAuth connections — NOT used by this app's own
         # admin bulk-create flow (that's pool_login-only, see
         # _metrika_context in main.py), but needed by the /lk "Конверсии в
@@ -397,17 +404,29 @@ def delete_clickru_connection(connection_id: int) -> bool:
 def _dump_job(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     item["items"] = json.loads(item["items"] or "[]")
+    item["request"] = json.loads(item["request_json"]) if item.get("request_json") else None
+    item["pending"] = json.loads(item["pending_json"]) if item.get("pending_json") else None
     return item
 
 
-def create_bulk_job(project_id: int, requested: int) -> int:
+def create_bulk_job(
+    project_id: int, requested: int, request: dict[str, Any] | None = None, resumed_from: int | None = None,
+) -> int:
     with connect() as db:
         cursor = db.execute(
-            "INSERT INTO bulk_jobs(project_id, status, requested, created, items, started_at) "
-            "VALUES (?, 'running', ?, 0, '[]', ?)",
-            (project_id, requested, _now()),
+            "INSERT INTO bulk_jobs(project_id, status, requested, created, items, started_at, request_json, resumed_from) "
+            "VALUES (?, 'running', ?, 0, '[]', ?, ?, ?)",
+            (project_id, requested, _now(), json.dumps(request, ensure_ascii=False) if request else None, resumed_from),
         )
         return int(cursor.lastrowid)
+
+
+def set_bulk_job_pending(job_id: int, pending: dict[str, Any] | None) -> None:
+    """Аккаунт уже создан провижинингом (пул потрачен), кампании ещё нет —
+    если процесс умрёт сейчас, продолжение возьмёт именно его."""
+    with connect() as db:
+        db.execute("UPDATE bulk_jobs SET pending_json = ? WHERE id = ?",
+                   (json.dumps(pending, ensure_ascii=False) if pending else None, job_id))
 
 
 def has_bulk_job(project_id: int) -> bool:
