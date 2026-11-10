@@ -109,3 +109,16 @@ def test_open_metrika_only_for_project_accounts(monkeypatch, tmp_path):
     with TestClient(main_module.app) as client:
         r = client.post(f"/api/projects/{p['id']}/accounts/501/open-metrika", auth=AUTH)
         assert r.status_code == 409 and "сессии" in r.json()["detail"]
+
+
+def test_running_jobs_failed_on_startup(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "startup.db")
+    with TestClient(main_module.app) as client:
+        p = _make_project(client, AUTH)
+        job = db.create_bulk_job(p["id"], 3)  # «осиротевшее» задание
+    with TestClient(main_module.app) as client:  # новый старт сервиса
+        j = db.get_bulk_job(job)
+        assert j["status"] == "failed" and "перезапуском" in j["error"] and j["finished_at"]
+        assert db.get_running_bulk_job(p["id"]) is None
+        h = client.get(f"/api/projects/{p['id']}/history", auth=AUTH).json()
+        assert any(e["kind"] == "launch_failed" for e in h["events"])

@@ -61,6 +61,9 @@ _BACKGROUND_JOB_TASKS: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
+    interrupted = db.fail_interrupted_bulk_jobs()
+    if interrupted:
+        print(f"[startup] прерванные запуски помечены failed: {interrupted}", flush=True)
     lk.init_lk_db()
     worker = None
     if os.getenv("LK_WORKER", "1") != "0":

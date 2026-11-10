@@ -508,6 +508,21 @@ def append_bulk_job_item(job_id: int, item: dict[str, Any]) -> None:
         )
 
 
+def fail_interrupted_bulk_jobs() -> list[int]:
+    """При старте сервиса: задания в статусе running уже никто не выполняет
+    (их корутина умерла вместе с прошлым процессом) — иначе они висят
+    «Выполняется» вечно и блокируют новый запуск проекта (было 2026-11-10,
+    проект 7: запуск оборвала пересборка контейнера)."""
+    with connect() as db:
+        ids = [int(r["id"]) for r in db.execute("SELECT id FROM bulk_jobs WHERE status = 'running'").fetchall()]
+        if ids:
+            db.execute(
+                f"UPDATE bulk_jobs SET status = 'failed', finished_at = ?, error = ? WHERE id IN ({','.join('?' * len(ids))})",
+                (_now(), "Запуск прерван перезапуском сервиса — уже созданные кампании сохранены, запустите ещё раз", *ids),
+            )
+    return ids
+
+
 def finish_bulk_job(job_id: int, status: str, error: str | None = None) -> None:
     with connect() as db:
         db.execute(
