@@ -441,7 +441,20 @@ async def list_payers(_: AuthUser, connection_id: int | None = Query(default=Non
         payers = await client.payers()
     except ClickRUError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"items": payers}
+    return {"items": [_with_payer_name(p) for p in payers]}
+
+
+def _with_payer_name(payer: Any) -> Any:
+    """У физлиц и ИП Click.ru не отдаёт `name` — только lastName/firstName/
+    middleName, и визард показывал голый номер (2026-11-10, «#1480787» вместо
+    «Муфатыков Роман Маратович»). Собираем ФИО в `name`, если его нет."""
+    if not isinstance(payer, dict) or str(payer.get("name") or "").strip():
+        return payer
+    fio = " ".join(
+        str(payer.get(k) or "").strip() for k in ("lastName", "firstName", "middleName") if str(payer.get(k) or "").strip()
+    )
+    name = fio or str(payer.get("fullName") or payer.get("description") or "").strip()
+    return {**payer, "name": name} if name else payer
 
 
 def _build_payer_payload(payload: PayerCreateIn) -> dict[str, Any]:
