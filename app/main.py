@@ -1006,35 +1006,35 @@ async def update_project(project_id: int, project: ProjectIn, _: AuthUser):
     return item
 
 
-@app.post("/api/projects/{project_id}/ozon-generate", response_model=OzonGenerateOut)
-async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
-    """Директ-Озон режим (wizard шаг 1): парсит карточку Ozon и просит Gemini
-    написать рекламные тексты (app/ozon_ad_creator.py), затем ЗАПИСЫВАЕТ
-    результат прямо в project["domain"/"headlines"/"ad_texts"/"keywords"/
-    "negative_keywords"/"image_urls"] — ровно те же поля, что обычный
-    (ручной) режим заполняет через PUT /api/projects/{id}. Всё, что идёт
-    дальше (шаги 2-5 визарда, campaigns/bulk-create) не знает и не должно
-    знать, откуда взялись эти значения.
+# Генерация Ozon→Gemini идёт 1–5 минут (браузер + несколько вызовов
+# Gemini), а запрос из ЛК проходит nginx (120 с), parsya-control (30 с) и
+# nginx перед addAvto (60 с) — синхронный ответ обрывался по дороге
+# («addAvto unreachable»). Поэтому POST только ЗАПУСКАЕТ задачу и сразу
+# отвечает 202, а фронт опрашивает GET того же адреса. Состояние — в памяти
+# процесса: uvicorn здесь один; после рестарта задачу просто запускают снова.
+_OZON_JOBS: dict[int, dict[str, Any]] = {}
+OZON_JOB_TIMEOUT_SECONDS = 600
 
-    url в теле запроса — для одноразовой регенерации по другой ссылке без
-    предварительного PUT; пустая строка/отсутствие — берём project["ozon_url"].
-    """
+
+def _ozon_job_public(job: dict[str, Any] | None) -> dict[str, Any]:
+    if job is None:
+        return {"status": "none"}
+    return {k: job.get(k) for k in ("status", "error", "result", "url", "started_at", "finished_at")}
+
+
+async def _ozon_generate_apply(project_id: int, url: str) -> dict[str, Any]:
+    """Парсинг + Gemini + запись результата в проект. Возвращает
+    OzonGenerateOut как dict; ошибки — OzonParseError/GeminiError."""
+    try:
+        result = await asyncio.wait_for(
+            process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser),
+            timeout=OZON_JOB_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise OzonParseError(f"Генерация не уложилась в {OZON_JOB_TIMEOUT_SECONDS // 60} минут — попробуйте ещё раз.")
     project = db.get_project(project_id)
     if project is None:
-        raise HTTPException(status_code=404, detail="Проект не найден")
-    if db.has_bulk_job(project_id):
-        raise HTTPException(status_code=409, detail="Проект уже запущен — генерация недоступна.")
-
-    url = (payload.url or project.get("ozon_url") or "").strip()
-    if not url:
-        raise HTTPException(status_code=422, detail="Нужна ссылка на карточку Ozon (ozon_url)")
-
-    try:
-        result = await process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser)
-    except OzonParseError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except GeminiError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise OzonParseError("Проект удалён во время генерации")
 
     product, ad_copy = result.product, result.ad_copy
     assert ad_copy is not None  # use_ai=True всегда возвращает ad_copy или бросает GeminiError выше
@@ -1073,7 +1073,64 @@ async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
         project=updated,
         ad_copy=ad_copy.model_dump(mode="json"),
         warnings=ad_copy.warnings,
-    )
+    ).model_dump(mode="json")
+
+
+async def _ozon_generate_job(project_id: int, url: str, job: dict[str, Any]) -> None:
+    try:
+        job["result"] = await _ozon_generate_apply(project_id, url)
+        job["status"] = "done"
+    except (OzonParseError, GeminiError) as e:
+        job["status"], job["error"] = "failed", str(e)
+    except Exception as e:  # noqa: BLE001 — любую ошибку показываем в UI, а не теряем в фоне
+        print(f"[ozon-generate] project={project_id}: {type(e).__name__}: {e}", flush=True)
+        job["status"], job["error"] = "failed", f"Внутренняя ошибка генерации: {type(e).__name__}: {str(e)[:300]}"
+    finally:
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/api/projects/{project_id}/ozon-generate", status_code=202)
+async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
+    """Директ-Озон режим (wizard шаг 1): ЗАПУСКАЕТ фоном парсинг карточки
+    Ozon и тексты Gemini (app/ozon_ad_creator.py). По готовности результат
+    записывается прямо в project["domain"/"headlines"/"ad_texts"/"keywords"/
+    "negative_keywords"/"image_urls"] — те же поля, что ручной режим
+    заполняет через PUT /api/projects/{id}; шаги 2-5 и bulk-create не знают,
+    откуда они взялись. Ответ 202 со статусом задачи; итог — GET того же
+    адреса: done → result = {project, ad_copy, warnings}, failed → error.
+
+    url в теле — для одноразовой регенерации по другой ссылке без
+    предварительного PUT; пустая строка/отсутствие — берём project["ozon_url"].
+    Повторный POST, пока задача идёт, вторую не запускает — отдаёт текущую.
+    """
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    if db.has_bulk_job(project_id):
+        raise HTTPException(status_code=409, detail="Проект уже запущен — генерация недоступна.")
+
+    url = (payload.url or project.get("ozon_url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=422, detail="Нужна ссылка на карточку Ozon (ozon_url)")
+
+    current = _OZON_JOBS.get(project_id)
+    if current and current["status"] == "running":
+        return _ozon_job_public(current)
+    job: dict[str, Any] = {"status": "running", "error": None, "result": None, "url": url,
+                           "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None}
+    _OZON_JOBS[project_id] = job
+    task = asyncio.create_task(_ozon_generate_job(project_id, url, job))
+    _BACKGROUND_JOB_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_JOB_TASKS.discard)
+    return _ozon_job_public(job)
+
+
+@app.get("/api/projects/{project_id}/ozon-generate")
+async def ozon_generate_status(project_id: int, _: AuthUser):
+    """Статус фоновой генерации: none | running | done (+result) | failed (+error)."""
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    return _ozon_job_public(_OZON_JOBS.get(project_id))
 
 
 @app.post("/api/projects/{project_id}/duplicate", status_code=201)

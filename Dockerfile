@@ -16,7 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # докстринг ozon_ad_creator.py), а у контейнера нет своего дисплея — CMD
 # ниже запускает uvicorn под xvfb-run, чтобы "видимому" браузеру было что
 # открыть.
+# Плюс настоящий Google Chrome (OZON_BROWSER_CHANNEL=chrome): на проде
+# 2026-11-10 Ozon отдавал встроенному Chromium 403 даже в видимом окне, а
+# Google Chrome он пропускает. Chromium остаётся запасным — OzonBrowser
+# откатывается на него, если Chrome не найден.
 RUN playwright install --with-deps chromium && \
+    playwright install --with-deps chrome && \
     apt-get update && apt-get install -y --no-install-recommends xvfb xauth x11-utils && \
     rm -rf /var/lib/apt/lists/* && \
     chmod -R a+rX /opt/pw-browsers
