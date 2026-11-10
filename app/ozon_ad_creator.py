@@ -95,7 +95,12 @@ GEMINI_API_KEY_DEFAULT = ""  # <-- можно вписать токен сюда
 GEMINI_MODEL_DEFAULT = "gemini-3.8-flash"
 # Запасные модели — используются по очереди, если основная перегружена (503), упёрлась в квоту (429)
 # или недоступна (404). Переопределяется env GEMINI_FALLBACK_MODELS="m1,m2".
-GEMINI_FALLBACK_MODELS_DEFAULT = ("gemini-3.7-flash", "gemini-flash-latest", "gemini-3.5-flash")
+# 2026-11-10: расширено — у каждой модели своя загрузка/квота; при «high demand»
+# основной идём по цепочке (все есть на ключе, проверено списком models).
+GEMINI_FALLBACK_MODELS_DEFAULT = (
+    "gemini-3.7-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash",
+    "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-flash-lite-latest",
+)
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 OZON_BASE = "https://www.ozon.ru"
@@ -1138,8 +1143,10 @@ async def generate_ad_copy(
         raise GeminiError("Не задан токен Gemini: передайте api_key или установите GEMINI_API_KEY")
     model = model or os.getenv("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
     if fallback_models is None:
-        env_fb = os.getenv("GEMINI_FALLBACK_MODELS")
-        fallback_models = [x.strip() for x in env_fb.split(",") if x.strip()] if env_fb is not None \
+        # Пустое GEMINI_FALLBACK_MODELS= в .env — «по умолчанию», а не «без
+        # запасных» (прод 2026-11-10: из-за этого пробовалась одна 3.8-flash).
+        env_fb = (os.getenv("GEMINI_FALLBACK_MODELS") or "").strip()
+        fallback_models = [x.strip() for x in env_fb.split(",") if x.strip()] if env_fb \
             else list(GEMINI_FALLBACK_MODELS_DEFAULT)
     models = [model] + [m_ for m_ in fallback_models if m_ != model]
     # Пустая строка из .env (GEMINI_PROXY=) — «без прокси»: httpx на proxy="" падает

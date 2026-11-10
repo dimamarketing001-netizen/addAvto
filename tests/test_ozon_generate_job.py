@@ -282,3 +282,34 @@ def test_hung_model_is_not_retried_next_model_used(monkeypatch):
 
     result = asyncio.run(run())
     assert calls == ["m-hung", "m-504", "m-ok"] and result.model_used == "m-ok"
+
+
+def test_empty_fallback_env_uses_default_chain(monkeypatch):
+    """Прод .env: GEMINI_FALLBACK_MODELS= пустое — нужна цепочка по умолчанию,
+    а не одна основная модель (было: «Все модели недоступны: gemini-3.8-flash: 503»)."""
+    import httpx
+    from app import ozon_ad_creator as oz
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "")
+    monkeypatch.setenv("GEMINI_MODEL", "")
+    monkeypatch.delenv("GEMINI_VIA", raising=False)
+    monkeypatch.setenv("PARSYA_POOL_API_TOKEN", "pool-token")
+    calls = []
+    ad = {"yandex_direct": [{"title1": "Санта", "title2": "t", "text": "x", "angle": "a"}]}
+
+    def handler(request):
+        model = json.loads(request.content)["model"]
+        calls.append(model)
+        if model == oz.GEMINI_MODEL_DEFAULT:
+            return httpx.Response(503, json={"error": {"message": "high demand"}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": json.dumps(ad)}]}}]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await oz.generate_ad_copy(oz.OzonProduct(url="u", title="Санта"), images=0, client=client, fix_issues=False)
+
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(oz.asyncio, "sleep", lambda *_: real_sleep(0))
+    result = asyncio.run(run())
+    distinct = list(dict.fromkeys(calls))
+    assert distinct[0] == oz.GEMINI_MODEL_DEFAULT and distinct[1] == oz.GEMINI_FALLBACK_MODELS_DEFAULT[0]
+    assert result.model_used == distinct[-1] and result.model_used in oz.GEMINI_FALLBACK_MODELS_DEFAULT
