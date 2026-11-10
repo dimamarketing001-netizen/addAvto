@@ -122,3 +122,18 @@ def test_running_jobs_failed_on_startup(monkeypatch, tmp_path):
         assert db.get_running_bulk_job(p["id"]) is None
         h = client.get(f"/api/projects/{p['id']}/history", auth=AUTH).json()
         assert any(e["kind"] == "launch_failed" for e in h["events"])
+
+
+def test_account_endpoint_masks_service_password(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "acc.db")
+
+    async def account(self, account_id):
+        return {"id": account_id, "serviceLogin": "porg-abc", "servicePassword": "secret123", "service": "DIRECT"}
+
+    monkeypatch.setattr(main_module.ClickRUClient, "account", account)
+    with TestClient(main_module.app) as client:
+        r = client.get("/api/accounts/501", auth=AUTH)
+    body = r.json()
+    assert r.status_code == 200 and body["serviceLogin"] == "porg-abc"
+    assert "servicePassword" not in body and "secret123" not in r.text
+    assert body["has_service_password"] is True and body["service_password_length"] == 9

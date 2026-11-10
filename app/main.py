@@ -728,6 +728,28 @@ async def get_creative_image(name: str, _: AuthUser):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _mask_account(acc: dict[str, Any]) -> dict[str, Any]:
+    """Аккаунт Click.ru без секретов: servicePassword заменяем признаком."""
+    out = {k: v for k, v in acc.items() if k not in ("servicePassword", "password")}
+    pw = acc.get("servicePassword")
+    out["has_service_password"] = bool(pw)
+    out["service_password_length"] = len(pw) if isinstance(pw, str) else 0
+    return out
+
+
+@app.get("/api/accounts/{account_id}")
+async def get_clickru_account(
+    account_id: int, _: AuthUser, connection_id: int | None = Query(default=None, ge=1)
+):
+    """Один аккаунт Click.ru (GET /accounts/{id}) — пароль Директа
+    (servicePassword) не отдаётся, только признак, есть ли он."""
+    client = _resolve_clickru_client(connection_id)
+    try:
+        return _mask_account(await client.account(account_id))
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/api/accounts/{account_id}/marking-schema")
 async def get_marking_schema(
     account_id: int, _: AuthUser, connection_id: int | None = Query(default=None, ge=1)

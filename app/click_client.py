@@ -101,6 +101,17 @@ class ClickRUClient:
             return envelope.get("accounts", [])
         return envelope if isinstance(envelope, list) else []
 
+    async def account(self, account_id: int) -> dict[str, Any]:
+        """GET /accounts/{id}. По openapi.json Click.ru (Accounts.Account) тут
+        есть serviceLogin и servicePassword — «Пароль в системе DIRECT
+        (временный)», nullable. Пароль наружу не отдаём (см. main.py)."""
+        response = await self._request("GET", f"/accounts/{int(account_id)}")
+        data = response.json()
+        envelope = data.get("response", data)
+        if isinstance(envelope, dict) and isinstance(envelope.get("account"), dict):
+            return envelope["account"]
+        return envelope if isinstance(envelope, dict) else {}
+
     async def campaigns(self, account_id: int | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if account_id is not None:
