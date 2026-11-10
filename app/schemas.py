@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -205,7 +206,8 @@ class ProjectIn(BaseModel):
             item = item.strip()
             if not item:
                 continue
-            if item.startswith("data:image/"):
+            # "local:<sha>.jpg" — картинка уже на нашем диске (app/creative_images.py)
+            if item.startswith("data:image/") or re.match(r"^local:[0-9a-f]{32}\.(jpg|png|gif)$", item):
                 cleaned.append(item)
                 continue
             parsed = HttpUrl(item)

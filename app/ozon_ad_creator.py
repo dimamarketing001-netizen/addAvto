@@ -131,6 +131,10 @@ LIMITS = {
     "yandex_title2": 30,
     "yandex_text": 81,
     "yandex_callout": 25,
+    # Быстрые ссылки Директа: заголовок ≤30, описание ≤60; сумма заголовков
+    # ссылок 1–4 ≤66 — поэтому просим короткие (≤16), см. промпт.
+    "yandex_sitelink_title": 30,
+    "yandex_sitelink_desc": 60,
     "vk_title": 40,
     "vk_text": 220,
     "card_title": 200,
@@ -178,6 +182,17 @@ class OzonProduct(BaseModel):
     local_images: list[str] = Field(default_factory=list)
 
 
+# Куда ведёт быстрая ссылка — адрес строит скрипт из ссылки на товар
+# (build_ozon_sitelinks), Gemini выбирает только смысл и пишет текст.
+SITELINK_KINDS = ("reviews", "questions", "description", "characteristics", "main")
+
+
+class YandexSitelink(BaseModel):
+    kind: str = Field(default="main", description="reviews|questions|description|characteristics|main")
+    title: str = Field(description="Заголовок быстрой ссылки, до 16 символов")
+    description: str = Field(default="", description="Описание быстрой ссылки, до 60 символов")
+
+
 class YandexDirectAd(BaseModel):
     keyword_group: str = Field(default="", description="Группа ключевых фраз (интент), под которую объявление")
     title1: str = Field(description=f"Заголовок 1, до {LIMITS['yandex_title1']} символов")
@@ -211,6 +226,7 @@ class AdCopy(BaseModel):
     headlines: list[str] = Field(default_factory=list)
     yandex_direct: list[YandexDirectAd] = Field(default_factory=list)
     yandex_callouts: list[str] = Field(default_factory=list, description="Уточнения Директа")
+    yandex_sitelinks: list[YandexSitelink] = Field(default_factory=list, description="Быстрые ссылки Директа (без адресов)")
     vk_ads: list[VkAd] = Field(default_factory=list)
     keyword_groups: list[KeywordGroup] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list, description="Плоский список, собирается из keyword_groups")
@@ -649,6 +665,45 @@ class OzonBrowser:
         return out
 
 
+def _with_query(href: str, key: str, value: str) -> str:
+    base, hash_, frag = href.partition("#")
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{key}={quote(value)}{hash_}{frag}"
+
+
+def build_ozon_sitelinks(product_url: str, sitelinks: list[YandexSitelink], limit: int = 8) -> list[dict[str, str]]:
+    """Быстрые ссылки Директа {title, href, description} из текстов Gemini.
+    Адрес строит скрипт от ссылки на товар по смыслу (kind): отзывы, вопросы,
+    описание, характеристики, сама карточка. Адреса и заголовки в наборе не
+    повторяются (повтор адреса различаем utm_content)."""
+    base = product_url.split("#", 1)[0].split("?", 1)[0].rstrip("/") + "/"
+    by_kind = {
+        "reviews": base + "reviews/",
+        "questions": base + "questions/",
+        "description": base + "#section-description",
+        "characteristics": base + "#section-characteristics",
+        "main": base,
+    }
+    out: list[dict[str, str]] = []
+    titles: set[str] = set()
+    hrefs: set[str] = set()
+    for sl in sitelinks:
+        title = (sl.title or "").strip()
+        if not title or len(title) > LIMITS["yandex_sitelink_title"] or title.lower() in titles:
+            continue
+        href = by_kind.get(sl.kind, base)
+        if href in hrefs:
+            href = _with_query(href, "utm_content", f"sl{len(out) + 1}")
+        desc = (sl.description or "").strip()
+        out.append({"title": title, "href": href,
+                    "description": desc if len(desc) <= LIMITS["yandex_sitelink_desc"] else ""})
+        titles.add(title.lower())
+        hrefs.add(href)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _apply_pages(product: OzonProduct, page1: dict[str, Any] | None, page2: dict[str, Any] | None) -> None:
     if page1:
         _parse_widgets(product, _widget_states(page1))
@@ -687,8 +742,13 @@ async def parse_ozon_product(
     product = OzonProduct(url=f"{OZON_BASE}{path}", sku=_extract_sku(path))
 
     if remote_fetch is not None:
-        pages = await remote_fetch(path, [page2_path])
-        pages = (list(pages) + [None, None])[:2]
+        fetched: Any = await remote_fetch(path, [page2_path])
+        if isinstance(fetched, dict):
+            # {"pages": [...], "local_images": [пути]} — фото уже скачаны
+            # внешним браузером и сохранены на диск (CDN Ozon режет сервер).
+            product.local_images = [str(p) for p in fetched.get("local_images") or []]
+            fetched = fetched.get("pages") or []
+        pages = (list(fetched) + [None, None])[:2]
         _apply_pages(product, pages[0], pages[1])
         mode = "remote"
     elif mode in ("auto", "http"):
@@ -818,6 +878,12 @@ yandex_direct: по одному объявлению на каждую груп
 - angle: какой угол (выгода, подарок, социальное доказательство, сезон, решение боли, сравнение «вместо…»).
 yandex_callouts: 4 уточнения ≤ {LIMITS['yandex_callout']} символов — короткие факты \
 («Рейтинг 4,9», «Размер 5 см», «Скидка 43%»).
+yandex_sitelinks: 6 быстрых ссылок — только текст, адреса подставит скрипт. Для каждой kind — \
+куда ведёт: reviews (отзывы покупателей), questions (вопросы и ответы), description (описание \
+товара), characteristics (характеристики/размеры), main (сама карточка: цена, купить). \
+Используй разные kind, каждый не больше двух раз. title ≤ 16 символов (у четырёх ссылок \
+вместе ≤ 66) — коротко и по делу: «Отзывы 4,9★», «Размеры и цвет», «Купить за 291 ₽»; \
+description ≤ {LIMITS['yandex_sitelink_desc']} — конкретика из фактов. Заголовки не повторяются.
 
 ══════ ШАГ 4. ЛЕНТА: VK РЕКЛАМА ══════
 vk_ads: 3 объявления, человек НЕ ищет товар — его надо остановить в ленте:
@@ -890,7 +956,7 @@ def _response_schema() -> dict[str, Any]:
     arr = {"type": "ARRAY", "items": s}
     order = [
         "facts", "big_idea", "product_summary", "target_audience", "pains", "usp",
-        "keyword_groups", "yandex_direct", "yandex_callouts", "vk_ads",
+        "keyword_groups", "yandex_direct", "yandex_callouts", "yandex_sitelinks", "vk_ads",
         "card_title", "card_description", "bullets", "headlines", "banner_texts", "cta",
         "negative_keywords",
     ]
@@ -909,6 +975,12 @@ def _response_schema() -> dict[str, Any]:
             "propertyOrdering": ["keyword_group", "angle", "title1", "title2", "text"],
         }},
         "yandex_callouts": arr,
+        "yandex_sitelinks": {"type": "ARRAY", "items": {
+            "type": "OBJECT",
+            "properties": {"kind": {"type": "STRING", "enum": list(SITELINK_KINDS)}, "title": s, "description": s},
+            "required": ["kind", "title", "description"],
+            "propertyOrdering": ["kind", "title", "description"],
+        }},
         "vk_ads": {"type": "ARRAY", "items": {
             "type": "OBJECT",
             "properties": {"angle": s, "title": s, "text": s},
@@ -971,6 +1043,9 @@ def _collect_issues(ad: AdCopy, check_card_description: bool = True) -> list[_Is
     chk("card_title", ad.card_title, LIMITS["card_title"], attr_setter(ad, "card_title"))
     if check_card_description:
         chk("card_description", ad.card_description, None, attr_setter(ad, "card_description"))
+    for i, sl in enumerate(ad.yandex_sitelinks, 1):
+        chk(f"Быстрая ссылка #{i} title", sl.title, LIMITS["yandex_sitelink_title"], attr_setter(sl, "title"))
+        chk(f"Быстрая ссылка #{i} description", sl.description, LIMITS["yandex_sitelink_desc"], attr_setter(sl, "description"))
     for name, key in (("yandex_callouts", "yandex_callout"), ("bullets", "bullet"),
                       ("headlines", "headline"), ("banner_texts", "banner"), ("cta", "cta")):
         lst = getattr(ad, name)

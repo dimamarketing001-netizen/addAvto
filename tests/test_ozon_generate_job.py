@@ -15,6 +15,8 @@ from test_bulk_campaign_create import _configure_test_env, _make_project
 
 AUTH = ("test-admin", "test-password-long-enough")
 OZON_URL = "https://www.ozon.ru/product/santa-3160445300/"
+# минимальный валидный JPEG (сигнатура FFD8FF)
+JPEG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAAKAAoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAA/AL+AD//Z"
 
 
 def _result():
@@ -136,16 +138,22 @@ def _setup_remote(monkeypatch, tmp_path, pool_outcome):
     seen = {}
 
     class Pool:
-        async def ozon_fetch_pages(self, path, extra_paths, session_id, label=""):
-            seen.update(path=path, session_id=session_id, label=label)
+        async def ozon_fetch_pages(self, path, extra_paths, session_id, label="", max_images=0):
+            seen.update(path=path, session_id=session_id, label=label, max_images=max_images, seen_by_gemini=None)
             if isinstance(pool_outcome, Exception):
                 raise pool_outcome
-            return [DOM_PAGE, None]
+            return {"pages": [DOM_PAGE, None], "images": [
+                {"url": "https://ir.ozone.ru/1.jpg", "mime": "image/jpeg", "b64": JPEG_B64},
+                {"url": "https://ir.ozone.ru/bad.webp", "mime": "image/webp", "b64": "UklGRg=="},
+            ]}
 
     async def fake_generate(product, **kwargs):
-        from app.ozon_ad_creator import AdCopy, YandexDirectAd
+        from app.ozon_ad_creator import AdCopy, YandexDirectAd, YandexSitelink
+        seen["seen_by_gemini"] = list(product.local_images)
         return AdCopy(yandex_direct=[YandexDirectAd(title1=product.title, title2="t", text="txt", angle="a")],
-                      keywords=["k"])
+                      keywords=["k"], yandex_callouts=["Рейтинг 4,9", "Слишком длинное уточнение больше 25"],
+                      yandex_sitelinks=[YandexSitelink(kind="reviews", title="Отзывы 4,9★", description="515 отзывов"),
+                                        YandexSitelink(kind="main", title="Купить за 291 ₽", description="")])
 
     monkeypatch.setattr(main_module, "ParsYaPoolClient", Pool)
     from app import ozon_ad_creator as oz
@@ -163,7 +171,16 @@ def test_job_fetches_card_via_wsl_with_its_captcha_session(monkeypatch, tmp_path
         st = _poll(client, project["id"])
         assert st["status"] == "done", st
         assert seen["session_id"] == sid and seen["path"] == "/product/santa-3160445300/"
-        assert st["result"]["project"]["headlines"] == ["Санта Клаус 3D"]
+        p = st["result"]["project"]
+        assert p["headlines"] == ["Санта Клаус 3D"]
+        # фото: скачаны в WSL, лежат у нас, в проекте — local: (webp отброшен)
+        assert seen["max_images"] == main_module.OZON_MAX_IMAGES
+        assert len(p["image_urls"]) == 1 and p["image_urls"][0].startswith("local:") and p["image_urls"][0].endswith(".jpg")
+        assert seen["seen_by_gemini"] and seen["seen_by_gemini"][0].endswith(p["image_urls"][0][6:])
+        # уточнения/быстрые ссылки от Gemini, адреса — от ссылки на товар
+        assert p["callouts_pool"] == ["Рейтинг 4,9"]
+        assert [s["href"] for s in p["sitelinks_pool"]] == [
+            "https://www.ozon.ru/product/santa-3160445300/reviews/", "https://www.ozon.ru/product/santa-3160445300/"]
 
 
 def test_wsl_failure_is_reported(monkeypatch, tmp_path):
@@ -313,3 +330,53 @@ def test_empty_fallback_env_uses_default_chain(monkeypatch):
     distinct = list(dict.fromkeys(calls))
     assert distinct[0] == oz.GEMINI_MODEL_DEFAULT and distinct[1] == oz.GEMINI_FALLBACK_MODELS_DEFAULT[0]
     assert result.model_used == distinct[-1] and result.model_used in oz.GEMINI_FALLBACK_MODELS_DEFAULT
+
+
+def test_build_ozon_sitelinks_unique_hrefs_and_limits():
+    from app.ozon_ad_creator import YandexSitelink, build_ozon_sitelinks
+    sl = build_ozon_sitelinks("https://www.ozon.ru/product/x-1/?utm=1", [
+        YandexSitelink(kind="reviews", title="Отзывы", description="d" * 61),
+        YandexSitelink(kind="questions", title="Вопросы", description="Ответы продавца"),
+        YandexSitelink(kind="main", title="Купить", description=""),
+        YandexSitelink(kind="main", title="Цена со скидкой", description=""),
+        YandexSitelink(kind="description", title="отзывы", description=""),  # дубль заголовка
+        YandexSitelink(kind="characteristics", title="Т" * 31, description=""),  # длиннее 30
+    ])
+    assert [s["title"] for s in sl] == ["Отзывы", "Вопросы", "Купить", "Цена со скидкой"]
+    assert sl[0]["href"] == "https://www.ozon.ru/product/x-1/reviews/" and sl[0]["description"] == ""
+    assert sl[1]["href"] == "https://www.ozon.ru/product/x-1/questions/"
+    assert sl[2]["href"] == "https://www.ozon.ru/product/x-1/"
+    assert sl[3]["href"] == "https://www.ozon.ru/product/x-1/?utm_content=sl4"
+    assert len({s["href"] for s in sl}) == len(sl)
+
+
+def test_pick_sitelinks_fits_66_chars():
+    pool = [{"title": t, "href": f"https://x.ru/{i}"} for i, t in enumerate(
+        ["А" * 30, "Б" * 30, "В" * 10, "Г" * 10, "Д" * 5, "Е" * 5])]
+    for shuffle in (False, True):
+        for _ in range(20):
+            got = main_module._pick_sitelinks(pool, shuffle=shuffle)
+            assert sum(len(s["title"]) for s in got) <= 66 and got
+    assert len(main_module._pick_sitelinks(pool, shuffle=True)) == 4
+
+
+def test_creative_image_upload_get_and_launch_bytes(monkeypatch, tmp_path):
+    import base64
+    _configure_test_env(monkeypatch, tmp_path / "img.db")
+    raw = base64.b64decode(JPEG_B64)
+    with TestClient(main_module.app) as client:
+        r = client.post("/api/creative-images", auth=AUTH, content=raw, headers={"Content-Type": "image/jpeg"})
+        assert r.status_code == 201, r.text
+        ref = r.json()["ref"]
+        assert ref.startswith("local:") and ref.endswith(".jpg")
+        again = client.post("/api/creative-images", auth=AUTH, content=raw, headers={"Content-Type": "image/jpeg"})
+        assert again.json()["ref"] == ref  # без дублей
+        bad = client.post("/api/creative-images", auth=AUTH, content=b"RIFF0000WEBPVP8 ", headers={"Content-Type": "image/webp"})
+        assert bad.status_code == 422 and "JPG" in bad.json()["detail"]
+        got = client.get(f"/api/creative-images/{ref[6:]}", auth=AUTH).json()
+        assert got["data_url"] == "data:image/jpeg;base64," + base64.b64encode(raw).decode()
+        assert client.get("/api/creative-images/../../etc", auth=AUTH).status_code == 404
+        # проект принимает local:-ссылку, при запуске уходят байты файла
+        project = _make_project(client, AUTH, image_urls=[ref])
+        assert project["image_urls"] == [ref]
+    assert asyncio.run(main_module._download_image_base64(ref)) == base64.b64encode(raw).decode()

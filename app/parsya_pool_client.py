@@ -114,22 +114,24 @@ class ParsYaPoolClient:
         )
 
     async def ozon_fetch_pages(
-        self, path: str, extra_paths: list[str], session_id: str, label: str = "",
-    ) -> list[dict[str, Any] | None]:
+        self, path: str, extra_paths: list[str], session_id: str, label: str = "", max_images: int = 0,
+    ) -> dict[str, Any]:
         """Карточка Ozon через настоящий Chrome в WSL (с IP прод-сервера Ozon
-        отдаёт 403 любому браузеру). Возвращает страницы в формате
-        {widgetStates, seo} — как отдавал JSON API Ozon. Если Ozon показал
-        капчу, её проходит человек (окно в визарде / ссылка в Telegram,
-        session_id) — поэтому таймаут до ~11 минут.
+        отдаёт 403 любому браузеру). Ответ: {"pages": [{widgetStates, seo}
+        | None, ...], "images": [{url, mime, b64}, ...]} — страницы в формате
+        JSON API Ozon и до max_images фото товара, скачанных тем же Chrome
+        (CDN Ozon режет сервер). Если Ozon показал капчу, её проходит человек
+        (окно в визарде / ссылка в Telegram, session_id) — таймаут до ~11 мин.
         ParsYaPoolError: 409 — капчу не прошли вовремя, 503 — Chrome занят.
         """
         result = await self._post(
             "/api/addavto/ozon-fetch",
-            {"path": path, "extra_paths": extra_paths, "session_id": session_id, "label": label},
+            {"path": path, "extra_paths": extra_paths, "session_id": session_id, "label": label,
+             "max_images": max_images},
             660.0,
             "Chrome в WSL не вернул карточку Ozon вовремя.",
         )
-        return list(result.get("pages") or [])
+        return {"pages": list(result.get("pages") or []), "images": list(result.get("images") or [])}
 
     async def clickru_web_login(
         self, username: str, password: str, cookies: list[dict[str, Any]] | None = None,

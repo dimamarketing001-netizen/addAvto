@@ -20,10 +20,10 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import db, lk
+from . import creative_images, db, lk
 from .click_client import ClickRUClient, ClickRUError
 from .metrika_client import MetrikaAPIError, YandexMetrikaClient
-from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, process_ozon_url
+from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozon_sitelinks, process_ozon_url
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from .schemas import (
     BulkCampaignCreateRequest,
@@ -701,6 +701,30 @@ async def get_geo_regions(_: AuthUser):
     return geo
 
 
+@app.post("/api/creative-images", status_code=201)
+async def upload_creative_image(request: Request, _: AuthUser):
+    """Картинка креатива с компьютера (визард, шаг 5). Тело — сам файл
+    (Content-Type: image/jpeg|png|gif), не base64: nginx перед addAvto
+    пропускает до 10 МБ, а base64 раздул бы файл на треть. Ответ —
+    {"ref": "local:<sha>.jpg"}, его кладут в image_urls проекта; при
+    запуске байты уйдут в Директ через AdImages.add."""
+    data = await request.body()
+    try:
+        ref = creative_images.save_image(data)
+    except creative_images.CreativeImageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ref": ref}
+
+
+@app.get("/api/creative-images/{name}")
+async def get_creative_image(name: str, _: AuthUser):
+    """Превью для визарда — JSON с data URL (прокси ЛК отдаёт только JSON)."""
+    try:
+        return {"ref": creative_images.REF_PREFIX + name, "data_url": creative_images.data_url(name)}
+    except creative_images.CreativeImageError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.get("/api/accounts/{account_id}/marking-schema")
 async def get_marking_schema(
     account_id: int, _: AuthUser, connection_id: int | None = Query(default=None, ge=1)
@@ -1065,19 +1089,38 @@ def _ozon_job_public(job: dict[str, Any] | None) -> dict[str, Any]:
     return {k: job.get(k) for k in ("status", "error", "result", "url", "started_at", "finished_at", "captcha_session")}
 
 
-def _ozon_remote_fetch(project_id: int, session_id: str, label: str):
+OZON_MAX_IMAGES = 10
+
+
+def _ozon_remote_fetch(project_id: int, session_id: str, label: str, image_refs: list[str]):
     """Карточку Ozon открывает настоящий Chrome в WSL (parsya-control →
     ozon_fetch.py): с IP этого сервера Ozon отдаёт 403 и Chromium, и Google
     Chrome (проверено 2026-11-10). OZON_FETCH_VIA=local — старый путь
-    (HTTP + браузер в контейнере), например для запуска вне прода."""
+    (HTTP + браузер в контейнере), например для запуска вне прода.
+
+    Фото товара тот же Chrome скачивает из открытой страницы (CDN Ozon режет
+    и сервер, и curl) — сохраняем их в data/creative-images/ и кладём
+    ссылки "local:..." в image_refs: при запуске в Директ уйдут байты."""
     if os.getenv("OZON_FETCH_VIA", "wsl").strip().lower() == "local":
         return None
 
-    async def fetch(path: str, extra_paths: list[str]) -> list[dict[str, Any] | None]:
+    async def fetch(path: str, extra_paths: list[str]) -> dict[str, Any]:
         try:
-            return await ParsYaPoolClient().ozon_fetch_pages(path, extra_paths, session_id, label)
+            got = await ParsYaPoolClient().ozon_fetch_pages(path, extra_paths, session_id, label,
+                                                             max_images=OZON_MAX_IMAGES)
         except ParsYaPoolError as e:
             raise OzonParseError(f"Карточка Ozon не получена: {e}") from e
+        local_paths: list[str] = []
+        for img in got.get("images") or []:
+            try:
+                ref = creative_images.save_image(base64.b64decode(img.get("b64") or ""))
+            except (creative_images.CreativeImageError, ValueError) as e:
+                print(f"[ozon] фото {img.get('url')} не сохранено: {e}", flush=True)
+                continue
+            if ref not in image_refs:
+                image_refs.append(ref)
+                local_paths.append(str(creative_images.path_of(ref)))
+        return {"pages": got.get("pages") or [], "local_images": local_paths}
 
     return fetch
 
@@ -1086,8 +1129,9 @@ async def _ozon_generate_apply(project_id: int, url: str, captcha_session: str =
     """Парсинг + Gemini + запись результата в проект. Возвращает
     OzonGenerateOut как dict; ошибки — OzonParseError/GeminiError."""
     current = db.get_project(project_id) or {}
+    image_refs: list[str] = []
     remote = _ozon_remote_fetch(project_id, captcha_session or secrets.token_urlsafe(12),
-                                f"проект #{project_id} {current.get('name') or ''}".strip())
+                                f"проект #{project_id} {current.get('name') or ''}".strip(), image_refs)
     try:
         result = await asyncio.wait_for(
             process_ozon_url(url, out_dir=None, download=False, use_ai=True, browser=_ozon_browser,
@@ -1115,9 +1159,16 @@ async def _ozon_generate_apply(project_id: int, url: str, captcha_session: str =
         "ozon_url": url,
         "keywords": "\n".join(ad_copy.keywords),
         "negative_keywords": "\n".join(ad_copy.negative_keywords),
-        "image_urls": product.images[:20],
+        # Скачанные в WSL фото ("local:..."); ссылки CDN Ozon — только если
+        # шли старым путём (OZON_FETCH_VIA=local), сервер их всё равно не скачает.
+        "image_urls": (image_refs or product.images)[:20],
         "headlines": headlines,
         "ad_texts": ad_texts,
+        # Уточнения и быстрые ссылки пишет Gemini; адреса ссылок строит
+        # скрипт от ссылки на товар (отзывы/вопросы/описание/характеристики).
+        "callouts_pool": list(dict.fromkeys(c.strip() for c in ad_copy.yandex_callouts
+                                            if c.strip() and len(c.strip()) <= 25))[:200],
+        "sitelinks_pool": build_ozon_sitelinks(product.url, ad_copy.yandex_sitelinks),
     }
     # launch_mode остаётся "ozon" (bulk-create его не читает вовсе — только
     # headlines/ad_texts/keywords/image_urls/domain выше, которые уже
@@ -1336,7 +1387,39 @@ async def _resolve_client_login(client: ClickRUClient, account_id: int) -> str:
     raise ClickRUError(f"У аккаунта {account_id} нет serviceLogin после создания")
 
 
+SITELINK_TITLES_MAX_TOTAL = 66  # Директ: сумма заголовков быстрых ссылок 1–4
+
+
+def _pick_sitelinks(pool: list[dict[str, Any]], shuffle: bool, count: int = 4) -> list[dict[str, Any]]:
+    """До 4 быстрых ссылок, у которых сумма заголовков ≤ 66 символов —
+    иначе Директ отклоняет весь набор. shuffle — случайный набор на
+    аккаунт; иначе по порядку пула. Не влезает четыре — берём меньше."""
+    if not pool:
+        return []
+    order = list(pool)
+    best: list[dict[str, Any]] = []
+    for _ in range(30 if shuffle else 1):
+        if shuffle:
+            random.shuffle(order)
+        picked: list[dict[str, Any]] = []
+        total = 0
+        for sl in order:
+            n = len(str(sl.get("title") or ""))
+            if total + n <= SITELINK_TITLES_MAX_TOTAL:
+                picked.append(sl)
+                total += n
+            if len(picked) == count:
+                return picked
+        if len(picked) > len(best):
+            best = picked
+    return best
+
+
 async def _download_image_base64(url: str) -> str:
+    # "local:<sha>.jpg" — картинка уже у нас на диске (фото Ozon, скачанное
+    # Chrome в WSL, или файл, загруженный с компьютера) — app/creative_images.py.
+    if creative_images.is_ref(url):
+        return creative_images.read_b64(url)
     # "data:image/...;base64,..." — файл, загруженный пользователем прямо
     # с компьютера (визард, шаг 5) — уже сырые base64-байты, скачивать
     # нечего, просто отрезаем заголовок data-URI.
@@ -1533,10 +1616,10 @@ async def _run_bulk_job(
                     this_sitelinks = [sl.model_dump() for sl in creative.sitelinks]
                     this_callouts = list(creative.callouts)
                 elif payload.creative_mode == "duplicate_single":
-                    this_sitelinks = sitelinks_pool[:4]
+                    this_sitelinks = _pick_sitelinks(sitelinks_pool, shuffle=False)
                     this_callouts = callouts_pool[:5]
                 else:  # shuffle
-                    this_sitelinks = random.sample(sitelinks_pool, k=min(4, len(sitelinks_pool))) if sitelinks_pool else []
+                    this_sitelinks = _pick_sitelinks(sitelinks_pool, shuffle=True)
                     this_callouts = random.sample(callouts_pool, k=min(5, len(callouts_pool))) if callouts_pool else []
 
                 sitelink_set_id = None
