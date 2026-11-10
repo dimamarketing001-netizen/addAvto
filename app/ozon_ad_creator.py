@@ -981,10 +981,36 @@ def _check_limits(ad: AdCopy) -> list[str]:
 # ---------------------------------------------------------------------------- вызов Gemini
 
 
+def _gemini_gateway() -> tuple[str, str] | None:
+    """Шлюз Gemini в WSL (parsya-control POST /api/addavto/gemini/generate):
+    там ключ и сеть до Google (WireGuard), как у остального бэка ParsYa.
+    GEMINI_VIA=wsl — всегда через шлюз; direct — напрямую с GEMINI_API_KEY и
+    GEMINI_PROXY; не задано — через шлюз, если есть PARSYA_POOL_API_TOKEN."""
+    via = (os.getenv("GEMINI_VIA") or "").strip().lower()
+    token = os.getenv("PARSYA_POOL_API_TOKEN", "").strip()
+    if via == "direct" or (via != "wsl" and not token):
+        return None
+    if not token:
+        raise GeminiError("GEMINI_VIA=wsl, но PARSYA_POOL_API_TOKEN не задан")
+    base = os.getenv("PARSYA_POOL_API_URL", "http://127.0.0.1:8091").rstrip("/")
+    return f"{base}/api/addavto/gemini/generate", token
+
+
 async def _call_gemini(
     client: httpx.AsyncClient, url: str, headers: dict[str, str], payload: dict[str, Any]
 ) -> str:
-    """POST в Gemini с ретраями на 429/5xx/таймауты. Возвращает текст ответа (JSON-строку)."""
+    """ЕДИНАЯ точка всех запросов к Gemini: POST с ретраями на 429/5xx/таймауты.
+    Возвращает текст ответа (JSON-строку). По умолчанию запрос уходит через
+    шлюз в WSL (_gemini_gateway) — тело generateContent то же, ответ Google
+    приходит как есть, поэтому разбор и ретраи ниже не меняются."""
+    gateway = _gemini_gateway()
+    if gateway is not None:
+        m = re.search(r"/models/([^/:]+):generateContent", url)
+        if not m:
+            raise GeminiError(f"Не удалось определить модель Gemini из {url}")
+        gw_url, gw_token = gateway
+        url, payload = gw_url, {"model": m.group(1), "body": payload}
+        headers = {"Authorization": f"Bearer {gw_token}", "Content-Type": "application/json"}
     resp = None
     last_exc: Exception | None = None
     for attempt in range(3):
@@ -1101,7 +1127,7 @@ async def generate_ad_copy(
     proxy — для серверов в РФ Gemini API напрямую недоступен (env GEMINI_PROXY).
     """
     api_key = api_key or os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_DEFAULT
-    if not api_key:
+    if not api_key and _gemini_gateway() is None:  # через шлюз WSL ключ здесь не нужен
         raise GeminiError("Не задан токен Gemini: передайте api_key или установите GEMINI_API_KEY")
     model = model or os.getenv("GEMINI_MODEL") or GEMINI_MODEL_DEFAULT
     if fallback_models is None:
@@ -1112,7 +1138,7 @@ async def generate_ad_copy(
     # Пустая строка из .env (GEMINI_PROXY=) — «без прокси»: httpx на proxy="" падает
     # «Unknown scheme for proxy URL» (прод, 2026-11-10).
     proxy = (proxy if proxy is not None else os.getenv("GEMINI_PROXY")) or None
-    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    headers = {"x-goog-api-key": api_key or "", "Content-Type": "application/json"}
 
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=timeout, proxy=proxy, follow_redirects=True)

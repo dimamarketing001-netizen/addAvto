@@ -195,6 +195,7 @@ def test_empty_proxy_env_means_no_proxy(monkeypatch):
     from app import ozon_ad_creator as oz
     monkeypatch.setenv("GEMINI_PROXY", "")
     monkeypatch.setenv("OZON_PROXY", "")
+    monkeypatch.setenv("GEMINI_VIA", "direct")
     seen = {}
     real = oz.httpx.AsyncClient
 
@@ -214,3 +215,43 @@ def test_empty_proxy_env_means_no_proxy(monkeypatch):
     asyncio.run(run())
     assert seen["proxies"] and all(p is None for p in seen["proxies"])
     assert oz.OzonBrowser().proxy is None and oz._OzonHttp(proxy="").proxy is None
+
+
+def test_gemini_goes_through_wsl_gateway(monkeypatch):
+    """Все запросы к Gemini — через шлюз parsya-control (ключ и WireGuard в WSL)."""
+    import httpx
+    from app import ozon_ad_creator as oz
+    monkeypatch.delenv("GEMINI_VIA", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("PARSYA_POOL_API_TOKEN", "pool-token")
+    monkeypatch.setenv("PARSYA_POOL_API_URL", "http://wsl.test:8091")
+    sent = []
+    ad = {"yandex_direct": [{"title1": "Санта", "title2": "t", "text": "Подвижная фигурка", "angle": "a"}],
+          "keyword_groups": [{"name": "g", "phrases": ["санта фигурка"]}]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((str(request.url), request.headers.get("authorization"), json.loads(request.content)))
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": json.dumps(ad, ensure_ascii=False)}]}}]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await oz.generate_ad_copy(oz.OzonProduct(url="u", title="Санта"), images=0,
+                                             client=client, fix_issues=False, fallback_models=[])
+
+    result = asyncio.run(run())
+    url, auth, body = sent[0]
+    assert url == "http://wsl.test:8091/api/addavto/gemini/generate" and auth == "Bearer pool-token"
+    assert body["model"] == oz.GEMINI_MODEL_DEFAULT and "contents" in body["body"]
+    assert "x-goog-api-key" not in json.dumps(body)
+    assert result.yandex_direct[0].title1 == "Санта" and result.keywords == ["санта фигурка"]
+
+
+def test_gemini_direct_mode_still_works(monkeypatch):
+    from app import ozon_ad_creator as oz
+    monkeypatch.setenv("GEMINI_VIA", "direct")
+    assert oz._gemini_gateway() is None
+    monkeypatch.setenv("GEMINI_VIA", "wsl")
+    monkeypatch.delenv("PARSYA_POOL_API_TOKEN", raising=False)
+    import pytest
+    with pytest.raises(oz.GeminiError):
+        oz._gemini_gateway()
