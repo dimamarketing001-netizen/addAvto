@@ -138,6 +138,21 @@ def init_db() -> None:
                 finished_at TEXT
             )
         """)
+        # Журнал проекта для таймлайна в ЛК (2026-11-10): то, что иначе
+        # нигде не остаётся — генерации Ozon (их задачи живут в памяти),
+        # открытия аккаунтов в браузере. Запуски bulk-create сюда не
+        # пишутся: их история и так в bulk_jobs (с итогом по каждому аккаунту).
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS project_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS ix_project_events_project ON project_events(project_id, id)")
         # Per-user Yandex OAuth connections — NOT used by this app's own
         # admin bulk-create flow (that's pool_login-only, see
         # _metrika_context in main.py), but needed by the /lk "Конверсии в
@@ -413,6 +428,64 @@ def get_running_bulk_job(project_id: int) -> dict[str, Any] | None:
             (project_id,),
         ).fetchone()
     return _dump_job(row) if row else None
+
+
+def list_bulk_jobs(project_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute("SELECT * FROM bulk_jobs WHERE project_id = ? ORDER BY id DESC", (project_id,)).fetchall()
+    return [_dump_job(row) for row in rows]
+
+
+def add_project_event(project_id: int, kind: str, title: str, detail: str = "") -> None:
+    with connect() as db:
+        db.execute(
+            "INSERT INTO project_events(project_id, kind, title, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+            (project_id, kind, title[:300], (detail or "")[:2000], _now()),
+        )
+
+
+def list_project_events(project_id: int) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            "SELECT * FROM project_events WHERE project_id = ? ORDER BY id DESC LIMIT 500", (project_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def project_stats() -> dict[int, dict[str, Any]]:
+    """Сводка для списка проектов (фильтры/сортировка в ЛК): запуски,
+    последний запуск, созданные кампании, юрлица и подключения Click.ru."""
+    stats: dict[int, dict[str, Any]] = {}
+
+    def entry(pid: int) -> dict[str, Any]:
+        return stats.setdefault(pid, {
+            "jobs_count": 0, "last_job_status": None, "last_job_at": None, "running_job_id": None,
+            "campaigns_count": 0, "payer_ids": [], "connection_ids": [], "last_campaign_at": None,
+        })
+
+    with connect() as db:
+        for row in db.execute(
+            "SELECT project_id, COUNT(*) n, MAX(id) last_id FROM bulk_jobs GROUP BY project_id"
+        ).fetchall():
+            e = entry(int(row["project_id"]))
+            e["jobs_count"] = int(row["n"])
+            last = db.execute("SELECT status, started_at, finished_at, id FROM bulk_jobs WHERE id = ?",
+                              (row["last_id"],)).fetchone()
+            e["last_job_status"] = last["status"]
+            e["last_job_at"] = last["finished_at"] or last["started_at"]
+            if last["status"] == "running":
+                e["running_job_id"] = int(last["id"])
+        for row in db.execute(
+            "SELECT project_id, COUNT(*) n, MAX(created_at) last_at, "
+            "GROUP_CONCAT(DISTINCT payer_id) payers, GROUP_CONCAT(DISTINCT connection_id) conns "
+            "FROM bulk_campaigns GROUP BY project_id"
+        ).fetchall():
+            e = entry(int(row["project_id"]))
+            e["campaigns_count"] = int(row["n"])
+            e["last_campaign_at"] = row["last_at"]
+            e["payer_ids"] = sorted({int(x) for x in (row["payers"] or "").split(",") if x})
+            e["connection_ids"] = sorted({int(x) for x in (row["conns"] or "").split(",") if x})
+    return stats
 
 
 def get_bulk_job(job_id: int) -> dict[str, Any] | None:

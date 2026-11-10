@@ -1049,9 +1049,161 @@ async def list_parsya_pool_accounts(_: AuthUser):
 @app.get("/api/projects")
 async def get_projects(_: AuthUser):
     items = db.list_projects()
+    stats = db.project_stats()
     for item in items:
-        item["has_launched"] = db.has_bulk_job(item["id"])
+        st = stats.get(item["id"]) or {}
+        item["has_launched"] = bool(st.get("jobs_count"))
+        # Для фильтров/сортировки списка в ЛК (2026-11-10).
+        item["stats"] = {
+            "jobs_count": st.get("jobs_count", 0), "last_job_status": st.get("last_job_status"),
+            "last_job_at": st.get("last_job_at"), "running_job_id": st.get("running_job_id"),
+            "campaigns_count": st.get("campaigns_count", 0), "payer_ids": st.get("payer_ids", []),
+            "connection_ids": st.get("connection_ids", []),
+            "ozon_running": (_OZON_JOBS.get(item["id"]) or {}).get("status") == "running",
+        }
     return {"items": items}
+
+
+def _project_history(project: dict[str, Any]) -> dict[str, Any]:
+    """Таймлайн проекта: создание, генерации Ozon и прочие события журнала,
+    запуски bulk-create с итогом по каждому аккаунту — новые сверху."""
+    pid = project["id"]
+    events: list[dict[str, Any]] = [{
+        "kind": "created", "at": project.get("created_at"), "title": "Проект создан",
+        "detail": f"{'Директ Озон' if project.get('launch_mode') == 'ozon' else 'Директ'} · {project.get('domain') or ''}",
+    }]
+    for ev in db.list_project_events(pid):
+        events.append({"kind": ev["kind"], "at": ev["created_at"], "title": ev["title"], "detail": ev["detail"]})
+    for job in db.list_bulk_jobs(pid):
+        items = job.get("items") or []
+        events.append({
+            "kind": "launch_started", "at": job["started_at"], "job_id": job["id"],
+            "title": f"Запуск #{job['id']}: заказано аккаунтов — {job['requested']}", "detail": "",
+        })
+        if job.get("finished_at") or job["status"] != "running":
+            failed = [i for i in items if i.get("status") != "created"]
+            events.append({
+                "kind": "launch_" + ("done" if job["status"] == "done" else job["status"]),
+                "at": job.get("finished_at") or job["started_at"], "job_id": job["id"],
+                "title": f"Запуск #{job['id']} {'завершён' if job['status'] == 'done' else 'с ошибкой' if job['status'] == 'failed' else 'идёт'}: "
+                         f"создано {job['created']} из {job['requested']}",
+                "detail": job.get("error") or ("; ".join(
+                    f"{i.get('pool_login') or 'аккаунт'}: {i.get('error') or 'ошибка'}" for i in failed[:5]) if failed else ""),
+                "items": items,
+            })
+    events.sort(key=lambda e: e.get("at") or "", reverse=True)
+
+    # Аккаунты, в которых реально есть кампании проекта, + итог их запуска.
+    by_login: dict[str, dict[str, Any]] = {}
+    for job in db.list_bulk_jobs(pid):
+        for it in job.get("items") or []:
+            if it.get("pool_login") and it["pool_login"] not in by_login:
+                by_login[it["pool_login"]] = {**it, "job_id": job["id"]}
+    accounts = []
+    for row in db.list_bulk_campaigns(pid):
+        it = by_login.get(row.get("pool_login") or "", {})
+        accounts.append({
+            "pool_login": row.get("pool_login"), "account_id": row.get("account_id"),
+            "campaign_id": row.get("campaign_id"), "connection_id": row.get("connection_id"),
+            "payer_id": row.get("payer_id"), "created_at": row.get("created_at"),
+            "job_id": it.get("job_id"), "headline": it.get("headline"), "ads_created": it.get("ads_created"),
+            "image_used": it.get("image_used"), "sitelinks_used": it.get("sitelinks_used"),
+            "callouts_used": it.get("callouts_used"), "note": it.get("note"),
+        })
+    ozon = _OZON_JOBS.get(pid) or {}
+    return {
+        "project_id": pid, "events": events, "accounts": accounts,
+        "ozon_status": ozon.get("status"),
+        "running_job_id": next((j["id"] for j in db.list_bulk_jobs(pid) if j["status"] == "running"), None),
+    }
+
+
+@app.get("/api/projects/{project_id}/history")
+async def get_project_history(project_id: int, _: AuthUser):
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    return _project_history(project)
+
+
+def _project_campaign_row(project_id: int, account_id: int) -> dict[str, Any]:
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    row = next((r for r in db.list_bulk_campaigns(project_id) if r.get("account_id") == account_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="В этом проекте нет кампаний в таком аккаунте")
+    return row
+
+
+@app.get("/api/projects/{project_id}/accounts/{account_id}/check")
+async def check_project_account(project_id: int, account_id: int, _: AuthUser):
+    """Что реально лежит в Директе у аккаунта проекта (2026-11-10): кампания
+    (статус/состояние), группы, объявления с модерацией, ключи, картинка,
+    быстрые ссылки и уточнения — живым запросом к Direct API через Click.ru.
+
+    Кампании создаются в отдельном аккаунте Click.ru (логин вида porg-…),
+    в который пуловый Яндекс ID войти не может (проверено) — поэтому
+    проверка через API, а не через браузер."""
+    row = _project_campaign_row(project_id, account_id)
+    client = _resolve_clickru_client(row.get("connection_id"))
+    try:
+        login = await _resolve_client_login(client, account_id)
+        out: dict[str, Any] = {"account_id": account_id, "client_login": login, "pool_login": row.get("pool_login"),
+                               "campaigns": []}
+        cid = row.get("campaign_id")
+        if not cid:
+            return out
+        camps = (await client.direct_api(login, "campaigns", {"method": "get", "params": {
+            "SelectionCriteria": {"Ids": [cid]},
+            "FieldNames": ["Id", "Name", "Status", "State", "StatusClarification", "StatusPayment", "Type"],
+        }})).get("result", {}).get("Campaigns", [])
+        groups = (await client.direct_api(login, "adgroups", {"method": "get", "params": {
+            "SelectionCriteria": {"CampaignIds": [cid]}, "FieldNames": ["Id", "Name", "Status", "RegionIds"],
+        }})).get("result", {}).get("AdGroups", [])
+        ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
+            "SelectionCriteria": {"CampaignIds": [cid]},
+            "FieldNames": ["Id", "AdGroupId", "Status", "StatusClarification", "State", "Type"],
+            "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "AdImageHash", "SitelinkSetId", "AdExtensions"],
+        }})).get("result", {}).get("Ads", [])
+        kw = (await client.direct_api(login, "keywords", {"method": "get", "params": {
+            "SelectionCriteria": {"CampaignIds": [cid]}, "FieldNames": ["Id", "Status"],
+        }})).get("result", {}).get("Keywords", [])
+    except ClickRUError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    for c in camps:
+        out["campaigns"].append({
+            **{k: c.get(k) for k in ("Id", "Name", "Status", "State", "StatusClarification", "StatusPayment", "Type")},
+            "ad_groups": len(groups), "keywords": len(kw),
+            "keywords_by_status": {s: sum(1 for k in kw if k.get("Status") == s) for s in {k.get("Status") for k in kw}},
+            "ads": [{
+                "id": a.get("Id"), "status": a.get("Status"), "state": a.get("State"),
+                "clarification": a.get("StatusClarification"),
+                "title": (a.get("TextAd") or {}).get("Title"), "title2": (a.get("TextAd") or {}).get("Title2"),
+                "text": (a.get("TextAd") or {}).get("Text"), "href": (a.get("TextAd") or {}).get("Href"),
+                "has_image": bool((a.get("TextAd") or {}).get("AdImageHash")),
+                "has_sitelinks": bool((a.get("TextAd") or {}).get("SitelinkSetId")),
+                "callouts": len(((a.get("TextAd") or {}).get("AdExtensions") or [])),
+            } for a in ads],
+        })
+    return out
+
+
+@app.post("/api/projects/{project_id}/accounts/{account_id}/open-metrika")
+async def open_account_metrika(project_id: int, account_id: int, _: AuthUser):
+    """Открывает Яндекс Метрику пулового Яндекс ID аккаунта (там скрипт
+    создаёт счётчик и цель «лид») в Chrome на ПК в WSL с cookies из пула —
+    глазами проверить счётчик и цель. Только для аккаунтов кампаний этого
+    проекта — произвольный логин пула из ЛК не открыть."""
+    row = _project_campaign_row(project_id, account_id)
+    if not row.get("pool_login"):
+        raise HTTPException(status_code=409, detail="У аккаунта нет логина пула")
+    try:
+        result = await ParsYaPoolClient().open_pool_browser(row["pool_login"], "metrika")
+    except ParsYaPoolError as exc:
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+    db.add_project_event(project_id, "browser_opened", f"Открыта Метрика логина {row['pool_login']} в Chrome на ПК",
+                         "Вход выполнен" if result.get("logged_in") else "Сессия Яндекса устарела — нужен вход вручную")
+    return result
 
 
 @app.post("/api/projects", status_code=201)
@@ -1202,6 +1354,20 @@ async def _ozon_generate_job(project_id: int, url: str, job: dict[str, Any]) -> 
         job["status"], job["error"] = "failed", f"Внутренняя ошибка генерации: {type(e).__name__}: {str(e)[:300]}"
     finally:
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            if job["status"] == "done":
+                res = job.get("result") or {}
+                p, ad = res.get("project") or {}, res.get("ad_copy") or {}
+                db.add_project_event(
+                    project_id, "ozon_done", "Gemini написал тексты по карточке Ozon",
+                    f"Модель {ad.get('model_used') or '—'}: {len(p.get('headlines') or [])} заголовков, "
+                    f"{len(p.get('ad_texts') or [])} текстов, {len(p.get('image_urls') or [])} фото, "
+                    f"{len(p.get('callouts_pool') or [])} уточнений, {len(p.get('sitelinks_pool') or [])} быстрых ссылок",
+                )
+            else:
+                db.add_project_event(project_id, "ozon_failed", "Генерация по Ozon не удалась", job.get("error") or "")
+        except Exception as exc:  # noqa: BLE001 — журнал не должен ронять генерацию
+            print(f"[project-events] {exc}", flush=True)
 
 
 @app.post("/api/projects/{project_id}/ozon-generate", status_code=202)
@@ -1235,6 +1401,7 @@ async def ozon_generate(project_id: int, payload: OzonGenerateIn, _: AuthUser):
                            "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
                            "captcha_session": secrets.token_urlsafe(12)}
     _OZON_JOBS[project_id] = job
+    db.add_project_event(project_id, "ozon_started", "Запущена генерация по карточке Ozon", url)
     task = asyncio.create_task(_ozon_generate_job(project_id, url, job))
     _BACKGROUND_JOB_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_JOB_TASKS.discard)

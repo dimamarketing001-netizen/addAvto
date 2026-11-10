@@ -133,6 +133,17 @@ class ParsYaPoolClient:
         )
         return {"pages": list(result.get("pages") or []), "images": list(result.get("images") or [])}
 
+    async def open_pool_browser(self, login: str, target: str = "metrika") -> dict[str, Any]:
+        """Открывает сервис Яндекса (target: metrika|direct) пулового логина
+        в Chrome на ПК в WSL с его cookies из пула. Окно остаётся открытым
+        для человека. Ответ: {"ok", "logged_in", "url"}."""
+        return await self._post(
+            "/api/addavto/open-pool-browser",
+            {"login": login, "target": target},
+            120.0,
+            "Chrome в WSL не открылся вовремя.",
+        )
+
     async def clickru_web_login(
         self, username: str, password: str, cookies: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
