@@ -348,7 +348,10 @@ async def create_payer(
 
 
 GEO_RUSSIA_ID = 225
-GEO_CACHE_KEY = "geo_regions_ru_tree_v2"
+GEO_CACHE_KEY = "geo_regions_ru_tree_v3"
+# Живой ответ Директа (проверено 2026-11-10): субъект РФ — "Federation subject".
+# "Administrative area" — вариант из документации, оставлен на всякий случай.
+GEO_AREA_TYPES = {"Federation subject", "Administrative area"}
 
 
 def _geo_sort_key(name: str) -> str:
@@ -359,8 +362,9 @@ def build_russia_geo(raw: list[dict[str, Any]]) -> dict[str, Any]:
     """Дерево «субъект РФ → города» из Dictionaries.get GeoRegions.
 
     Реальный формат строки Директа API v5: GeoRegionId, GeoRegionName,
-    GeoRegionType ("Country", "Administrative area", "City", "District",
-    "Village", ...) и ParentId. Никаких списков имён родителей там нет —
+    GeoRegionType (живьём: "Country", "Federal district", "Federation
+    subject", "City", "Federal subject district", "Village", "Rural
+    settlement", ...) и ParentId. Никаких списков имён родителей там нет —
     прежняя версия фильтровала по несуществующему ParentGeoRegionNames и
     на проде всегда отдавала пустой справочник (найдено 2026-11-10).
 
@@ -407,7 +411,7 @@ def build_russia_geo(raw: list[dict[str, Any]]) -> dict[str, Any]:
         chain = ancestors(node["id"])
         if GEO_RUSSIA_ID not in chain or not node["name"]:
             continue
-        if node["type"] == "Administrative area":
+        if node["type"] in GEO_AREA_TYPES:
             areas[node["id"]] = {"value": str(node["id"]), "label": node["name"], "children": []}
             items.append(node)
         elif node["type"] == "City":
