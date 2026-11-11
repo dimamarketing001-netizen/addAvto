@@ -1324,15 +1324,21 @@ def _ozon_remote_fetch(project_id: int, session_id: str, label: str, image_refs:
         local_paths: list[str] = []
         for img in got.get("images") or []:
             try:
-                ref = creative_images.save_image(base64.b64decode(img.get("b64") or ""))
+                raw = base64.b64decode(img.get("b64") or "")
+                ref = creative_images.save_image(raw)
             except (creative_images.CreativeImageError, ValueError) as e:
                 print(f"[ozon] фото {img.get('url')} не сохранено: {e}", flush=True)
                 continue
-            if ref not in image_refs:
+            path = str(creative_images.path_of(ref))
+            if path not in local_paths:
+                local_paths.append(path)  # Gemini смотрит все фото
+            # в объявления — только те, что примет Директ (стороны/пропорции)
+            if ref not in image_refs and creative_images.direct_image_ok(raw):
                 image_refs.append(ref)
-                local_paths.append(str(creative_images.path_of(ref)))
+        fetch.used = True  # фото брались через Chrome — ссылки CDN Ozon в проект не пишем
         return {"pages": got.get("pages") or [], "local_images": local_paths}
 
+    fetch.used = False
     return fetch
 
 
@@ -1372,7 +1378,7 @@ async def _ozon_generate_apply(project_id: int, url: str, captcha_session: str =
         "negative_keywords": "\n".join(ad_copy.negative_keywords),
         # Скачанные в WSL фото ("local:..."); ссылки CDN Ozon — только если
         # шли старым путём (OZON_FETCH_VIA=local), сервер их всё равно не скачает.
-        "image_urls": (image_refs or product.images)[:20],
+        "image_urls": (image_refs if getattr(remote, "used", False) else product.images)[:20],
         "headlines": headlines,
         "ad_texts": ad_texts,
         # Уточнения и быстрые ссылки пишет Gemini; адреса ссылок строит
@@ -1998,8 +2004,23 @@ async def _run_bulk_job(
 
                     ad_image_hash = None
                     if this_image_url:
-                        image_b64 = await _download_image_base64(this_image_url)
-                        ad_image_hash = await client.upload_ad_image(client_login, project["name"][:40], image_b64)
+                        # Картинка необязательна: неподходящую по размеру/пропорциям
+                        # пропускаем, пробуем другие из пула, иначе объявление без
+                        # картинки — но аккаунт с кампанией не валим (2026-11-11).
+                        tries = [this_image_url] + [u for u in image_urls if u != this_image_url][:3]
+                        img_errors: list[str] = []
+                        for url_try in tries:
+                            try:
+                                image_b64 = await _download_image_base64(url_try)
+                                if not creative_images.direct_image_ok(base64.b64decode(image_b64)):
+                                    img_errors.append("размер/пропорции не подходят Директу")
+                                    continue
+                                ad_image_hash = await client.upload_ad_image(client_login, project["name"][:40], image_b64)
+                                break
+                            except (ClickRUError, httpx.HTTPError, creative_images.CreativeImageError, ValueError) as img_exc:
+                                img_errors.append(str(img_exc)[:120])
+                        if ad_image_hash is None and img_errors:
+                            note = ((note + "; ") if note else "") + "Объявление без картинки: " + img_errors[-1]
 
                     await client.create_text_ad(
                         client_login,

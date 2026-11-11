@@ -15,8 +15,15 @@ from test_bulk_campaign_create import _configure_test_env, _make_project
 
 AUTH = ("test-admin", "test-password-long-enough")
 OZON_URL = "https://www.ozon.ru/product/santa-3160445300/"
-# минимальный валидный JPEG (сигнатура FFD8FF)
-JPEG_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAAKAAoBAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAA/AL+AD//Z"
+# JPEG-заголовок 1000×1000: Директ принимает (стороны 450–5000, пропорции 3:4–4:3)
+import base64 as _b64
+import struct as _st
+
+JPEG_B64 = _b64.b64encode(
+    b"\xff\xd8\xff\xe0" + _st.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9
+    + b"\xff\xc0" + _st.pack(">H", 17) + b"\x08" + _st.pack(">HH", 1000, 1000) + b"\x03" + b"\x00" * 9
+    + b"\xff\xd9"
+).decode()
 
 
 def _result():
