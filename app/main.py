@@ -1870,12 +1870,16 @@ async def _run_bulk_job(
             campaign_id: int | None = None
             # Номер аккаунта в ИСХОДНОМ запуске (при продолжении — не 0..N).
             orig_index = indexes[index] if indexes and index < len(indexes) else index
+            existing_campaign_id: int | None = None
             try:
                 if reuse:
                     # Продолжение: аккаунт уже создан прошлым запуском
                     # (пул потрачен), кампании в нём нет — провижининг не нужен.
                     again = reuse.pop(0)
                     pool_login, account_id = again["pool_login"], int(again["account_id"])
+                    # кампания уже создана прошлым запуском, но не доделана —
+                    # доделываем её, а не создаём вторую (2026-11-11)
+                    existing_campaign_id = again.get("campaign_id")
                 else:
                     # Перечитываем подключение на каждой итерации: прошлая могла
                     # обновить cookies сессии кабинета.
@@ -1942,7 +1946,10 @@ async def _run_bulk_job(
 
                 # ЕПК: кампания, группа (UnifiedAdGroup), фразы и объявления — Direct API v501
                 is_epk = project["campaign_mode"] == "single_epk"
-                if is_epk:
+                api_v = {"api_version": "v501"} if is_epk else {}
+                if existing_campaign_id:
+                    campaign_id = int(existing_campaign_id)
+                elif is_epk:
                     campaign_id = await client.create_draft_unified_campaign(
                         client_login,
                         project["name"],
@@ -1960,9 +1967,9 @@ async def _run_bulk_job(
                         goal_id=goal_id,
                     )
 
-                note: str | None = None
+                note: str | None = "Доделана кампания прошлого запуска" if existing_campaign_id else None
                 mobile_pct = project.get("mobile_bid_adjustment_percent")
-                if mobile_pct is not None:
+                if mobile_pct is not None and not existing_campaign_id:
                     try:
                         await client.add_mobile_bid_adjustment(client_login, campaign_id, int(mobile_pct))
                     except ClickRUError as exc:
@@ -1971,12 +1978,26 @@ async def _run_bulk_job(
                         # sink the whole account.
                         note = f"Корректировка для мобильных не применена: {exc}"
 
-                ad_group_id = await client.create_adgroup(
-                    client_login, campaign_id, project["name"], project["region_ids"],
-                    negative_keywords=negative_keywords or None,
-                    **({"unified": True} if is_epk else {}),
-                )
-                await client.add_keywords(client_login, ad_group_id, phrases, **({"api_version": "v501"} if is_epk else {}))
+                ad_group_id = None
+                has_keywords = False
+                if existing_campaign_id:
+                    groups = (await client.direct_api(client_login, "adgroups", {"method": "get", "params": {
+                        "SelectionCriteria": {"CampaignIds": [campaign_id]}, "FieldNames": ["Id"],
+                    }}, **api_v)).get("result", {}).get("AdGroups") or []
+                    if groups:
+                        ad_group_id = int(groups[0]["Id"])
+                        kws = (await client.direct_api(client_login, "keywords", {"method": "get", "params": {
+                            "SelectionCriteria": {"AdGroupIds": [ad_group_id]}, "FieldNames": ["Id"],
+                        }}, **api_v)).get("result", {}).get("Keywords") or []
+                        has_keywords = bool(kws)
+                if ad_group_id is None:
+                    ad_group_id = await client.create_adgroup(
+                        client_login, campaign_id, project["name"], project["region_ids"],
+                        negative_keywords=negative_keywords or None,
+                        **({"unified": True} if is_epk else {}),
+                    )
+                if not has_keywords:
+                    await client.add_keywords(client_login, ad_group_id, phrases, **api_v)
 
                 # ads_per_group (wizard step 4, "структура объявлений"): >1
                 # only with creative_mode=shuffle (schema-enforced) — each
@@ -2104,12 +2125,14 @@ def _resume_plan(job: dict[str, Any]) -> dict[str, Any] | None:
         return None
     reuse: list[dict[str, Any]] = []
     candidates = ([job["pending"]] if job.get("pending") else []) + [
-        it for it in job["items"] if it.get("status") != "created" and it.get("account_id") and not it.get("campaign_id")
+        # и аккаунты с недоделанной кампанией (campaign_id есть, item failed) — их доделаем
+        it for it in job["items"] if it.get("status") != "created" and it.get("account_id")
     ]
     for c in candidates:
         if c.get("account_id") and c.get("pool_login") and c["account_id"] not in used_accounts \
                 and all(r["account_id"] != c["account_id"] for r in reuse):
-            reuse.append({"pool_login": c["pool_login"], "account_id": int(c["account_id"])})
+            reuse.append({"pool_login": c["pool_login"], "account_id": int(c["account_id"]),
+                          "campaign_id": c.get("campaign_id")})
     done = {it.get("index") for it in job["items"] if it.get("status") == "created"}
     base = job["request"].get("_indexes") or list(range(int(job["requested"])))
     if None in done:

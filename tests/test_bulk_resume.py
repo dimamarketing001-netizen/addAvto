@@ -118,3 +118,38 @@ def test_resume_in_parts_with_limit(monkeypatch, tmp_path):
         assert second["created"] == 1 and second["items"][0]["index"] == 2
         assert FakeParsYaPoolClient._counter == 1
         assert client.get(f"/api/projects/{project['id']}/history", auth=AUTH).json()["resume"] is None
+
+
+def test_resume_finishes_half_created_campaign(monkeypatch, tmp_path):
+    """Аккаунт, где кампания создана, а группа/объявления — нет (Директ
+    ответил 1000 «временно недоступен»): продолжение доделывает ЭТУ кампанию,
+    вторую не создаёт и пул не трогает."""
+    _configure_test_env(monkeypatch, tmp_path / "finish.db")
+    _fakes(monkeypatch)
+    created_campaigns = []
+    orig_text = FakeClickRUClient.create_draft_text_campaign
+
+    async def track_campaign(self, *a, **kw):
+        cid = await orig_text(self, *a, **kw)
+        created_campaigns.append(cid)
+        return cid
+
+    async def direct_api(self, client_login, method_path, body, **kw):
+        return {"result": {"AdGroups": []} if method_path == "adgroups" else {"Keywords": []}}
+
+    monkeypatch.setattr(FakeClickRUClient, "create_draft_text_campaign", track_campaign)
+    monkeypatch.setattr(FakeClickRUClient, "direct_api", direct_api, raising=False)
+    with TestClient(main_module.app) as client:
+        project = _make_project(client, AUTH)
+        cid = _seed_connection()
+        req = BulkCampaignCreateRequest(count=1, connection_id=cid).model_dump(mode="json")
+        job = db.create_bulk_job(project["id"], 1, request=req)
+        db.append_bulk_job_item(job, {"pool_login": "half@pool", "account_id": 9107, "campaign_id": 55555,
+                                      "status": "failed", "error": "Yandex Direct API error 1000", "index": 0})
+        db.finish_bulk_job(job, "done")
+        r = client.post(f"/api/projects/{project['id']}/campaigns/bulk-jobs/{job}/resume", auth=AUTH)
+        new = _wait_for_job(client, AUTH, project["id"], r.json()["job_id"])
+        it = new["items"][0]
+        assert new["created"] == 1 and it["campaign_id"] == 55555 and it["account_id"] == 9107
+        assert "Доделана кампания" in (it.get("note") or "")
+        assert created_campaigns == [] and FakeParsYaPoolClient._counter == 0

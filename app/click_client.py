@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import os
@@ -7,6 +8,10 @@ from datetime import date
 from typing import Any
 
 import httpx
+
+
+# Временные ошибки Direct API: сервис недоступен/перегружен — повторяем.
+TRANSIENT_DIRECT_ERRORS = {"52", "1000", "1001", "1002"}
 
 
 class ClickRUError(RuntimeError):
@@ -231,21 +236,30 @@ class ClickRUClient:
             # Direct локализует справочники (названия регионов и т.п.) по
             # Accept-Language; без него может отдать английские названия.
             headers["Accept-Language"] = accept_language
-        response = await self._request(
-            "POST",
-            "/api_proxy/yandex_direct",
-            params={"url": url},
-            headers=headers,
-            json=body,
-        )
-        data = response.json()
-        if isinstance(data, dict) and "error" in data:
-            error = data["error"]
-            raise ClickRUError(
-                f"Yandex Direct API error {error.get('error_code')}: "
-                f"{error.get('error_string')} — {error.get('error_detail')}",
-                response.status_code,
+        # Временные ошибки Директа («The service is temporarily unavailable»,
+        # код 1000 — живой запуск 2026-11-11 оставил аккаунт с недоделанной
+        # кампанией) повторяем: запрос с такой ошибкой Директ не выполнял.
+        for attempt in range(3):
+            response = await self._request(
+                "POST",
+                "/api_proxy/yandex_direct",
+                params={"url": url},
+                headers=headers,
+                json=body,
             )
+            data = response.json()
+            if isinstance(data, dict) and "error" in data:
+                error = data["error"]
+                code = str(error.get("error_code"))
+                if code in TRANSIENT_DIRECT_ERRORS and attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+                    continue
+                raise ClickRUError(
+                    f"Yandex Direct API error {error.get('error_code')}: "
+                    f"{error.get('error_string')} — {error.get('error_detail')}",
+                    response.status_code,
+                )
+            return data
         return data
 
     async def create_draft_text_campaign(
