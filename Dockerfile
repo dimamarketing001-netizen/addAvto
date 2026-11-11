@@ -20,7 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 2026-11-10 Ozon отдавал встроенному Chromium 403 даже в видимом окне, а
 # Google Chrome он пропускает. Chromium остаётся запасным — OzonBrowser
 # откатывается на него, если Chrome не найден.
-RUN playwright install --with-deps chromium && \
+# libatomic1: node внутри Playwright ≥1.65 без неё не запускается
+# («libatomic.so.1: cannot open shared object file», сборка 2026-11-11).
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 && \
+    playwright install --with-deps chromium && \
     playwright install --with-deps chrome && \
     apt-get update && apt-get install -y --no-install-recommends xvfb xauth x11-utils && \
     rm -rf /var/lib/apt/lists/* && \
