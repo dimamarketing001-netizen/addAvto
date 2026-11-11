@@ -1247,6 +1247,34 @@ async def open_account_direct(project_id: int, account_id: int, _: AuthUser):
     return {**result, "org_login": org_login}
 
 
+@app.post("/api/projects/{project_id}/metrika-grants")
+async def grant_project_metrika(project_id: int, _: AuthUser):
+    """Для уже созданных кампаний проекта: выдать организации Директа
+    (porg-…) доступ «на просмотр» к счётчику Метрики пулового Yandex ID,
+    где лежит цель lead. Идемпотентно — существующий доступ не дублируется."""
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    project = db.get_project(project_id)
+    from urllib.parse import urlsplit
+    host = (urlsplit(project["domain"]).hostname or "").strip().lower().rstrip(".")
+    results = []
+    for row in db.list_bulk_campaigns(project_id):
+        res: dict[str, Any] = {"account_id": row.get("account_id"), "pool_login": row.get("pool_login")}
+        try:
+            client = _resolve_clickru_client(row.get("connection_id"))
+            org_login = await _resolve_client_login(client, int(row["account_id"]))
+            counter_id, _goal = await _ensure_lead_goal_for_account(row["pool_login"], host, project["name"])
+            err = await _grant_metrika_to_org(row["pool_login"], counter_id, org_login)
+            res.update(org_login=org_login, counter_id=counter_id, ok=err is None, error=err)
+        except (ClickRUError, MetrikaAPIError, HTTPException, httpx.HTTPError) as exc:
+            res.update(ok=False, error=str(getattr(exc, "detail", None) or exc)[:300])
+        results.append(res)
+    ok = sum(1 for r in results if r.get("ok"))
+    db.add_project_event(project_id, "metrika_grants", f"Доступ к счётчикам Метрики выдан организациям: {ok} из {len(results)}",
+                         "; ".join(r["error"] for r in results if r.get("error"))[:1500])
+    return {"items": results, "ok": ok, "total": len(results)}
+
+
 @app.post("/api/projects/{project_id}/accounts/{account_id}/open-metrika")
 async def open_account_metrika(project_id: int, account_id: int, _: AuthUser):
     """Открывает Яндекс Метрику пулового Яндекс ID аккаунта (там скрипт
@@ -1704,6 +1732,20 @@ async def _download_image_base64(url: str) -> str:
         return base64.b64encode(response.content).decode("ascii")
 
 
+async def _grant_metrika_to_org(pool_login: str, counter_id: int, org_login: str) -> str | None:
+    """Выдаёт логину организации Директа (porg-…) доступ «на просмотр» к
+    счётчику пулового Yandex ID (2026-11-11, Dima: «у организации нет
+    доступа к счётчику»). Возвращает текст ошибки или None. Не роняет запуск:
+    кампания без доступа к цели всё равно создаётся, ошибка видна в note."""
+    try:
+        metrika = await _metrika_context(pool_login=pool_login)
+        await metrika.ensure_grant(counter_id, org_login, "view", comment="addAvto: Директ организации Click.ru")
+        return None
+    except (MetrikaAPIError, HTTPException, httpx.HTTPError) as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        return f"Доступ к счётчику {counter_id} для {org_login} не выдан: {str(detail)[:200]}"
+
+
 async def _ensure_lead_goal_for_account(pool_login: str, project_host: str, project_name: str) -> tuple[int, int]:
     """Every pool Yandex ID gets its OWN Metrika counter + 'lead' goal —
     by product decision, never shared across accounts (sharing one counter
@@ -1908,6 +1950,9 @@ async def _run_bulk_job(
 
                 client_login = await _resolve_client_login(client, account_id)
                 counter_id, goal_id = await _ensure_lead_goal_for_account(pool_login, project_host, project["name"])
+                # Счётчик в Метрике пулового ID, кампания — в организации porg-…:
+                # даём организации доступ к счётчику, иначе её Директ не видит цель.
+                grant_note = await _grant_metrika_to_org(pool_login, counter_id, client_login)
                 # Seen live: a just-created goal isn't immediately visible to
                 # the Direct API's own GoalId validation (same "just created,
                 # not indexed yet" lag as the Click.ru integration/account
@@ -1967,7 +2012,8 @@ async def _run_bulk_job(
                         goal_id=goal_id,
                     )
 
-                note: str | None = "Доделана кампания прошлого запуска" if existing_campaign_id else None
+                note: str | None = "; ".join(x for x in (
+                    "Доделана кампания прошлого запуска" if existing_campaign_id else None, grant_note) if x) or None
                 mobile_pct = project.get("mobile_bid_adjustment_percent")
                 if mobile_pct is not None and not existing_campaign_id:
                     try:

@@ -128,6 +128,12 @@ class FakeYandexMetrikaClient:
         return {"id": counter_id + 1, "name": "lead", "type": "action",
                 "conditions": [{"type": "exact", "url": "lead"}]}
 
+    grants: list = []
+
+    async def ensure_grant(self, counter_id, user_login, perm="view", comment=""):
+        FakeYandexMetrikaClient.grants.append((counter_id, user_login, perm))
+        return "granted"
+
 
 def _seed_connection() -> int:
     """Подключение со своим логином/паролем кабинета (2026-11-10): без них

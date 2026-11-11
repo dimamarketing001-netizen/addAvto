@@ -120,6 +120,28 @@ class YandexMetrikaClient:
             raise MetrikaAPIError("Метрика не вернула ID созданной цели lead.")
         return created
 
+    async def list_grants(self, counter_id: int) -> list[dict[str, Any]]:
+        data = await self._request("GET", f"/management/v1/counter/{int(counter_id)}/grants")
+        items = data.get("grants", [])
+        return items if isinstance(items, list) else []
+
+    async def ensure_grant(self, counter_id: int, user_login: str, perm: str = "view",
+                           comment: str = "") -> str:
+        """Доступ к счётчику для другого логина Яндекса (2026-11-11): счётчик
+        и цель lead создаются в Метрике ПУЛОВОГО Yandex ID, а кампания живёт
+        в организации Click.ru (porg-…) — без доступа Директ организации не
+        видит цель. Возвращает "exists" или "granted"."""
+        login = (user_login or "").strip().lower()
+        for g in await self.list_grants(counter_id):
+            if str(g.get("user_login", "")).strip().lower() == login and g.get("perm") in (perm, "edit"):
+                return "exists"
+        await self._request(
+            "POST",
+            f"/management/v1/counter/{int(counter_id)}/grants",
+            json={"grant": {"user_login": user_login, "perm": perm, "comment": comment[:255]}},
+        )
+        return "granted"
+
     async def upload_offline_conversions(self, counter_id: int, csv_text: str) -> dict[str, Any]:
         """Загрузка офлайн-конверсий (тот же формат, что у offCon-hourly)."""
         url = f"{self.BASE_URL}/management/v1/counter/{int(counter_id)}/offline_conversions/upload"
