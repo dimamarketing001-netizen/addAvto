@@ -34,6 +34,7 @@ def test_epk_calls_use_v501_and_unified_group():
     assert camp[0] == "campaigns" and camp[1] == "v501"
     uc = camp[2]["params"]["Campaigns"][0]["UnifiedCampaign"]
     assert uc["CounterIds"] == {"Items": [99]} and uc["BiddingStrategy"]["Search"]["AverageCrr"] == {"Crr": 30, "GoalId": 5}
+    assert uc["BiddingStrategy"]["Network"] == {"BiddingStrategyType": "NETWORK_DEFAULT"}
     assert group[1] == "v501" and group[2]["params"]["AdGroups"][0]["UnifiedAdGroup"] == {"OfferRetargeting": "NO"}
     assert kw[1] == "v501" and ad[1] == "v501"
     assert plain[1] == "v5" and "UnifiedAdGroup" not in plain[2]["params"]["AdGroups"][0]

@@ -363,10 +363,9 @@ class ClickRUClient:
                                     "BiddingStrategyType": "AVERAGE_CRR",
                                     "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
                                 },
-                                "Network": {
-                                    "BiddingStrategyType": "NETWORK_DEFAULT",
-                                    "NetworkDefault": {"LimitPercent": 100},
-                                },
+                                # В ЕПК у NETWORK_DEFAULT нет объекта NetworkDefault
+                                # (v501: «unknown parameter …Network.NetworkDefault», 2026-11-11).
+                                "Network": {"BiddingStrategyType": "NETWORK_DEFAULT"},
                             },
                             **({"CounterIds": {"Items": [int(counter_id)]}} if counter_id else {}),
                         },
