@@ -49,16 +49,16 @@ class FakeClickRUClient:
         assert goal_id is not None  # per-account goal, created by FakeYandexMetrikaClient below
         return 70000 + int(client_login.split("-")[1])
 
-    async def create_draft_unified_campaign(self, client_login, name, start_date, target_drr, goal_id):
+    async def create_draft_unified_campaign(self, client_login, name, start_date, target_drr, goal_id, counter_id=None):
         assert target_drr == 30.0
         assert goal_id is not None
         return 60000 + int(client_login.split("-")[1])
 
-    async def create_adgroup(self, client_login, campaign_id, name, region_ids, negative_keywords=None):
+    async def create_adgroup(self, client_login, campaign_id, name, region_ids, negative_keywords=None, unified=False):
         assert region_ids == [225]
         return 80000 + campaign_id
 
-    async def add_keywords(self, client_login, ad_group_id, phrases):
+    async def add_keywords(self, client_login, ad_group_id, phrases, api_version="v5"):
         assert phrases == ["юридическая консультация"]
         return [90001, 90002]
 

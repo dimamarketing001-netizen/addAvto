@@ -95,3 +95,26 @@ def test_old_job_without_request_cannot_resume(monkeypatch, tmp_path):
         st = client.get(f"/api/projects/{project['id']}/campaigns/bulk-jobs/{job}", auth=AUTH).json()
         assert st["can_resume"] is False
         assert client.post(f"/api/projects/{project['id']}/campaigns/bulk-jobs/{job}/resume", auth=AUTH).status_code == 409
+
+
+def test_resume_in_parts_with_limit(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "parts.db")
+    _fakes(monkeypatch)
+    with TestClient(main_module.app) as client:
+        project = _make_project(client, AUTH)
+        cid = _seed_connection()
+        job = _orphan_job(project["id"], cid)
+    with TestClient(main_module.app) as client:
+        r = client.post(f"/api/projects/{project['id']}/campaigns/bulk-jobs/{job}/resume?limit=1", auth=AUTH)
+        first = _wait_for_job(client, AUTH, project["id"], r.json()["job_id"])
+        assert first["requested"] == 1 and first["created"] == 1
+        assert first["items"][0]["pool_login"] == "spent@pool" and first["items"][0]["index"] == 1
+        assert FakeParsYaPoolClient._counter == 0  # пул не тронут
+        # остаток (1) у исходного запуска всё ещё можно продолжить
+        h = client.get(f"/api/projects/{project['id']}/history", auth=AUTH).json()
+        assert h["resume"] == {"job_id": job, "remaining": 1, "reuse_accounts": 0}
+        r2 = client.post(f"/api/projects/{project['id']}/campaigns/bulk-jobs/{job}/resume", auth=AUTH)
+        second = _wait_for_job(client, AUTH, project["id"], r2.json()["job_id"])
+        assert second["created"] == 1 and second["items"][0]["index"] == 2
+        assert FakeParsYaPoolClient._counter == 1
+        assert client.get(f"/api/projects/{project['id']}/history", auth=AUTH).json()["resume"] is None

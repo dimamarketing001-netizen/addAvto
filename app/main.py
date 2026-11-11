@@ -1142,11 +1142,11 @@ def _project_history(project: dict[str, Any]) -> dict[str, Any]:
         })
     ozon = _OZON_JOBS.get(pid) or {}
     resume = None
-    for job in db.list_bulk_jobs(pid):  # новые сверху — продолжать имеет смысл последний
+    for job in db.list_bulk_jobs(pid):  # новые сверху; при продолжении частями остаток может быть у старого
         plan = _resume_plan(job)
         if plan:
             resume = {"job_id": job["id"], "remaining": plan["remaining"], "reuse_accounts": len(plan["reuse"])}
-        break
+            break
     return {
         "project_id": pid, "events": events, "accounts": accounts, "resume": resume,
         "ozon_status": ozon.get("status"),
@@ -1934,13 +1934,16 @@ async def _run_bulk_job(
                 this_callouts = [c for c in dict.fromkeys(_direct_safe_text(t)[:25] for t in this_callouts) if c]
                 ad_extension_ids = [await client.create_callout(client_login, text) for text in this_callouts]
 
-                if project["campaign_mode"] == "single_epk":
+                # ЕПК: кампания, группа (UnifiedAdGroup), фразы и объявления — Direct API v501
+                is_epk = project["campaign_mode"] == "single_epk"
+                if is_epk:
                     campaign_id = await client.create_draft_unified_campaign(
                         client_login,
                         project["name"],
                         date.today().isoformat(),
                         target_drr=project["target_drr"],
                         goal_id=goal_id,
+                        counter_id=counter_id,
                     )
                 else:
                     campaign_id = await client.create_draft_text_campaign(
@@ -1965,8 +1968,9 @@ async def _run_bulk_job(
                 ad_group_id = await client.create_adgroup(
                     client_login, campaign_id, project["name"], project["region_ids"],
                     negative_keywords=negative_keywords or None,
+                    **({"unified": True} if is_epk else {}),
                 )
-                await client.add_keywords(client_login, ad_group_id, phrases)
+                await client.add_keywords(client_login, ad_group_id, phrases, **({"api_version": "v501"} if is_epk else {}))
 
                 # ads_per_group (wizard step 4, "структура объявлений"): >1
                 # only with creative_mode=shuffle (schema-enforced) — each
@@ -2006,6 +2010,7 @@ async def _run_bulk_job(
                         ad_image_hash=ad_image_hash,
                         sitelink_set_id=sitelink_set_id,
                         ad_extension_ids=ad_extension_ids or None,
+                        **({"api_version": "v501"} if is_epk else {}),
                     )
                     ads_created += 1
                     if ad_index == 0:
@@ -2062,10 +2067,20 @@ def _resume_plan(job: dict[str, Any]) -> dict[str, Any] | None:
         return None
     pid = job["project_id"]
     used_accounts = {r.get("account_id") for r in db.list_bulk_campaigns(pid)}
-    # аккаунты, уже взятые в работу продолжениями этого запуска
-    for later in db.list_bulk_jobs(pid):
-        if later.get("resumed_from") == job["id"]:
-            return None  # уже продолжали — продолжать надо последний в цепочке
+    # Продолжения этого запуска (можно частями, limit): их номера аккаунтов
+    # и взятые ими аккаунты уже не наши — остаток продолжается дальше.
+    children = [later for later in db.list_bulk_jobs(pid) if later.get("resumed_from") == job["id"]]
+    if any(ch["status"] == "running" for ch in children):
+        return None
+    taken_idx: set[int] = set()
+    for ch in children:
+        taken_idx.update((ch.get("request") or {}).get("_indexes") or [])
+        used_accounts.update(it.get("account_id") for it in ch["items"] if it.get("account_id"))
+        if ch.get("pending"):
+            used_accounts.add(ch["pending"].get("account_id"))
+    remaining -= sum(int(ch["requested"]) for ch in children)
+    if remaining <= 0:
+        return None
     reuse: list[dict[str, Any]] = []
     candidates = ([job["pending"]] if job.get("pending") else []) + [
         it for it in job["items"] if it.get("status") != "created" and it.get("account_id") and not it.get("campaign_id")
@@ -2076,7 +2091,11 @@ def _resume_plan(job: dict[str, Any]) -> dict[str, Any] | None:
             reuse.append({"pool_login": c["pool_login"], "account_id": int(c["account_id"])})
     done = {it.get("index") for it in job["items"] if it.get("status") == "created"}
     base = job["request"].get("_indexes") or list(range(int(job["requested"])))
-    left = [i for i in base if i not in done][:remaining] if None not in done else base[len(done):][:remaining]
+    if None in done:
+        left = base[len(done):]
+    else:
+        left = [i for i in base if i not in done]
+    left = [i for i in left if i not in taken_idx][:remaining]
     return {"remaining": remaining, "reuse": reuse[:remaining], "indexes": left}
 
 
@@ -2100,11 +2119,14 @@ async def get_bulk_job(project_id: int, job_id: int, _: AuthUser):
     )
 
 
-def _resume_bulk_job(project_id: int, job: dict[str, Any]) -> int:
+def _resume_bulk_job(project_id: int, job: dict[str, Any], limit: int | None = None) -> int:
     plan = _resume_plan(job)
     if plan is None:
         raise HTTPException(status_code=409, detail="Этот запуск продолжить нельзя: всё создано, он ещё идёт, "
                                                     "уже продолжен или запущен до сохранения параметров")
+    if limit:  # частями: например, сначала один аккаунт для проверки
+        n = min(plan["remaining"], limit)
+        plan = {"remaining": n, "reuse": plan["reuse"][:n], "indexes": plan["indexes"][:n]}
     req = dict(job["request"])
     base = req.pop("_indexes", None) or list(range(int(job["requested"])))
     if req.get("creative_mode") == "manual_per_account":
@@ -2150,14 +2172,17 @@ async def _auto_resume_interrupted(job_ids: list[int]) -> None:
 
 
 @app.post("/api/projects/{project_id}/campaigns/bulk-jobs/{job_id}/resume", response_model=BulkJobStartOut, status_code=202)
-async def resume_bulk_job(project_id: int, job_id: int, _: AuthUser):
+async def resume_bulk_job(
+    project_id: int, job_id: int, _: AuthUser, limit: int | None = Query(default=None, ge=1, le=20),
+):
     """«Продолжить запуск»: досоздаёт недостающие кампании прерванного или
     частично неудачного запуска с теми же параметрами. Сначала — аккаунты,
-    которые провижининг уже создал, а кампания в них не появилась."""
+    которые провижининг уже создал, а кампания в них не появилась.
+    limit — продолжить частями (остаток можно продолжить следующим вызовом)."""
     job = db.get_bulk_job(job_id)
     if job is None or job["project_id"] != project_id:
         raise HTTPException(status_code=404, detail="Запуск не найден")
-    new_id = _resume_bulk_job(project_id, job)
+    new_id = _resume_bulk_job(project_id, job, limit=limit)
     db.add_project_event(project_id, "launch_resumed", f"Запуск #{job_id} продолжен как #{new_id}",
                          f"Осталось {job['requested'] - job['created']}")
     return BulkJobStartOut(job_id=new_id, project_id=project_id, status="running")

@@ -329,8 +329,14 @@ class ClickRUClient:
         start_date: str,
         target_drr: float,
         goal_id: int,
+        counter_id: int | None = None,
     ) -> int:
-        """Creates a minimal valid UnifiedCampaign (ЕПК — Search + РСЯ in
+        """ЕПК идут ТОЛЬКО через Direct API v501 (документация: «Для работы с
+        единой перфоманс-кампанией используется адрес .../v501/»); в v5
+        Click.ru-прокси отвечал «unknown parameter UnifiedCampaign» (живой
+        запуск 2026-11-11). Группы ЕПК — UnifiedAdGroup, тоже v501.
+
+        Creates a minimal valid UnifiedCampaign (ЕПК — Search + РСЯ in
         one campaign). NOT yet confirmed live against the real Direct API
         the way create_draft_text_campaign is (that one has "seen live"
         notes throughout from iterative real testing) — this mirrors the
@@ -362,15 +368,16 @@ class ClickRUClient:
                                     "NetworkDefault": {"LimitPercent": 100},
                                 },
                             },
+                            **({"CounterIds": {"Items": [int(counter_id)]}} if counter_id else {}),
                         },
                     }
                 ]
             },
         }
-        return await self._add_campaign(client_login, body)
+        return await self._add_campaign(client_login, body, api_version="v501")
 
-    async def _add_campaign(self, client_login: str, body: dict[str, Any]) -> int:
-        data = await self.direct_api(client_login, "campaigns", body)
+    async def _add_campaign(self, client_login: str, body: dict[str, Any], api_version: str = "v5") -> int:
+        data = await self.direct_api(client_login, "campaigns", body, api_version=api_version)
         add_results = (data.get("result") or {}).get("AddResults") or []
         if not add_results:
             raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
@@ -387,8 +394,11 @@ class ClickRUClient:
         name: str,
         region_ids: list[int],
         negative_keywords: list[str] | None = None,
+        unified: bool = False,
     ) -> int:
-        """AdGroups.add for a TextAdGroup — minimal required fields
+        """unified=True — группа ЕПК (UnifiedAdGroup, Direct API v501).
+
+        AdGroups.add for a TextAdGroup — minimal required fields
         (Name, CampaignId, RegionIds) plus optional NegativeKeywords
         (shared by every keyword in the group; Yandex caps this at 3
         phrases, <=7 words each, <=4096 chars combined — not pre-validated
@@ -399,11 +409,14 @@ class ClickRUClient:
         group: dict[str, Any] = {"Name": name, "CampaignId": campaign_id, "RegionIds": region_ids}
         if negative_keywords:
             group["NegativeKeywords"] = {"Items": negative_keywords}
+        if unified:
+            # По схеме v501 OfferRetargeting обязателен (хотя помечен устаревшим).
+            group["UnifiedAdGroup"] = {"OfferRetargeting": "NO"}
         body = {
             "method": "add",
             "params": {"AdGroups": [group]},
         }
-        data = await self.direct_api(client_login, "adgroups", body)
+        data = await self.direct_api(client_login, "adgroups", body, api_version="v501" if unified else "v5")
         add_results = (data.get("result") or {}).get("AddResults") or []
         if not add_results:
             raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
@@ -413,7 +426,7 @@ class ClickRUClient:
             raise ClickRUError(f"Не удалось создать группу объявлений: {errors}")
         return int(first["Id"])
 
-    async def add_keywords(self, client_login: str, ad_group_id: int, phrases: list[str]) -> list[int]:
+    async def add_keywords(self, client_login: str, ad_group_id: int, phrases: list[str], api_version: str = "v5") -> list[int]:
         """Keywords.add — one call for all phrases in this ad group. Partial
         failure (some phrases rejected, others fine) raises with every
         rejected phrase named, rather than silently dropping any.
@@ -424,7 +437,7 @@ class ClickRUClient:
             "method": "add",
             "params": {"Keywords": [{"Keyword": phrase, "AdGroupId": ad_group_id} for phrase in phrases]},
         }
-        data = await self.direct_api(client_login, "keywords", body)
+        data = await self.direct_api(client_login, "keywords", body, api_version=api_version)
         add_results = (data.get("result") or {}).get("AddResults") or []
         ids: list[int] = []
         failures: list[str] = []
@@ -449,6 +462,7 @@ class ClickRUClient:
         ad_image_hash: str | None = None,
         sitelink_set_id: int | None = None,
         ad_extension_ids: list[int] | None = None,
+        api_version: str = "v5",
     ) -> int:
         """Ads.add for a single TextAd. Title <=56 chars, Text <=81 chars,
         Title2 <=30 chars — Yandex Direct enforces this itself with a clear
@@ -469,7 +483,7 @@ class ClickRUClient:
             "method": "add",
             "params": {"Ads": [{"AdGroupId": ad_group_id, "TextAd": text_ad}]},
         }
-        data = await self.direct_api(client_login, "ads", body)
+        data = await self.direct_api(client_login, "ads", body, api_version=api_version)
         add_results = (data.get("result") or {}).get("AddResults") or []
         if not add_results:
             raise ClickRUError(f"Yandex Direct API вернул пустой результат: {data}")
