@@ -380,3 +380,21 @@ def test_creative_image_upload_get_and_launch_bytes(monkeypatch, tmp_path):
         project = _make_project(client, AUTH, image_urls=[ref])
         assert project["image_urls"] == [ref]
     assert asyncio.run(main_module._download_image_base64(ref)) == base64.b64encode(raw).decode()
+
+
+def test_direct_safe_text_strips_forbidden_symbols():
+    """Живая ошибка 2026-11-11: «Отзывы 4.9★» — Директ отклонил набор
+    быстрых ссылок (и кампанию) из-за символа ★."""
+    f = main_module._direct_safe_text
+    assert f("Отзывы 4.9★") == "Отзывы 4.9"
+    assert f("Купить! Сейчас?") == "Купить Сейчас"
+    assert f("Скидка 63% 🎁\nна Ozon") == "Скидка 63% на Ozon"
+    assert f("Цена 291 ₽ «хит»") == "Цена 291 ₽ «хит»"
+    picked = main_module._pick_sitelinks([
+        {"title": "Отзывы 4.9★", "href": "https://x.ru/1", "description": "516 отзывов 👍"},
+        {"title": "Отзывы 4.9", "href": "https://x.ru/2", "description": ""},  # дубль после очистки
+        {"title": "🎁", "href": "https://x.ru/3", "description": ""},          # пустой после очистки
+        {"title": "Размеры", "href": "https://x.ru/4", "description": ""},
+    ], shuffle=False)
+    assert [p["title"] for p in picked] == ["Отзывы 4.9", "Размеры"]
+    assert picked[0]["description"] == "516 отзывов"

@@ -1616,10 +1616,50 @@ async def _resolve_client_login(client: ClickRUClient, account_id: int) -> str:
 SITELINK_TITLES_MAX_TOTAL = 66  # Директ: сумма заголовков быстрых ссылок 1–4
 
 
+import unicodedata as _ud
+
+# Директ (2026-11-11, живая ошибка): «Sitelink titles may contain letters …,
+# digits, and punctuation. The characters "!" and "?", line breaks, and
+# emojis are not allowed» — Gemini написал «Отзывы 4.9★», и весь набор
+# быстрых ссылок (а с ним кампания) не создался, хотя аккаунт уже был создан.
+_DIRECT_SAFE_PUNCT = set(" .,:;-–—\"'«»()/%№+&*#@₽$€")
+
+
+def _direct_safe_text(text: str, allow_marks: bool = False) -> str:
+    """Оставляет буквы любых алфавитов, цифры, пробел и обычную пунктуацию;
+    убирает эмодзи, «★»-подобные символы, переводы строк; «!» и «?» —
+    только если allow_marks."""
+    out = []
+    for ch in str(text or ""):
+        cat = _ud.category(ch)
+        if cat[0] in ("L", "N") or ch in _DIRECT_SAFE_PUNCT or (allow_marks and ch in "!?"):
+            out.append(ch)
+        elif ch in "\n\r\t":
+            out.append(" ")
+    return " ".join("".join(out).split())
+
+
+def _safe_sitelink(sl: dict[str, Any]) -> dict[str, Any] | None:
+    title = _direct_safe_text(sl.get("title"))[:30]
+    if not title:
+        return None
+    return {**sl, "title": title, "description": _direct_safe_text(sl.get("description"))[:60]}
+
+
 def _pick_sitelinks(pool: list[dict[str, Any]], shuffle: bool, count: int = 4) -> list[dict[str, Any]]:
     """До 4 быстрых ссылок, у которых сумма заголовков ≤ 66 символов —
     иначе Директ отклоняет весь набор. shuffle — случайный набор на
     аккаунт; иначе по порядку пула. Не влезает четыре — берём меньше."""
+    # Чистим ДО подсчёта 66 символов: очистка укорачивает заголовки; дубли
+    # заголовков после очистки Директ тоже отклонит — оставляем первый.
+    seen_titles: set[str] = set()
+    cleaned: list[dict[str, Any]] = []
+    for sl in pool or []:
+        safe = _safe_sitelink(sl)
+        if safe and safe["title"].lower() not in seen_titles:
+            seen_titles.add(safe["title"].lower())
+            cleaned.append(safe)
+    pool = cleaned
     if not pool:
         return []
     order = list(pool)
@@ -1871,7 +1911,7 @@ async def _run_bulk_job(
                 # are worth rotating within a group, see ads_per_group below).
                 if payload.creative_mode == "manual_per_account":
                     creative = payload.creative_sets[index]
-                    this_sitelinks = [sl.model_dump() for sl in creative.sitelinks]
+                    this_sitelinks = [s for s in (_safe_sitelink(sl.model_dump()) for sl in creative.sitelinks) if s]
                     this_callouts = list(creative.callouts)
                 elif payload.creative_mode == "duplicate_single":
                     this_sitelinks = _pick_sitelinks(sitelinks_pool, shuffle=False)
@@ -1890,6 +1930,8 @@ async def _run_bulk_job(
                         ],
                     )
 
+                # те же ограничения символов у уточнений (эмодзи, «★» и т.п.)
+                this_callouts = [c for c in dict.fromkeys(_direct_safe_text(t)[:25] for t in this_callouts) if c]
                 ad_extension_ids = [await client.create_callout(client_login, text) for text in this_callouts]
 
                 if project["campaign_mode"] == "single_epk":
