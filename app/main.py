@@ -1247,6 +1247,52 @@ async def open_account_direct(project_id: int, account_id: int, _: AuthUser):
     return {**result, "org_login": org_login}
 
 
+@app.post("/api/projects/{project_id}/fund-and-start")
+async def fund_and_start_project(project_id: int, payload: dict[str, Any], _: AuthUser):
+    """Пополнить и/или запустить уже созданные кампании проекта.
+    Тело: {"amount_rub": 1220, "start": true, "account_ids": [...] (необязательно,
+    по умолчанию все)}. Пополнение НЕ идемпотентно — каждый вызов списывает
+    деньги заново, поэтому ЛК спрашивает подтверждение с итоговой суммой."""
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    try:
+        amount = float(payload.get("amount_rub") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="amount_rub — число")
+    if amount < 0 or amount > 100000:
+        raise HTTPException(status_code=422, detail="Сумма пополнения — от 0 до 100 000 ₽")
+    start = bool(payload.get("start"))
+    if not amount and not start:
+        raise HTTPException(status_code=422, detail="Укажите сумму пополнения и/или запуск")
+    wanted = {int(x) for x in payload.get("account_ids") or []}
+    rows = [r for r in db.list_bulk_campaigns(project_id) if not wanted or r.get("account_id") in wanted]
+    if not rows:
+        raise HTTPException(status_code=404, detail="Нет кампаний для пополнения/запуска")
+    is_epk = project.get("campaign_mode") == "single_epk"
+    results = []
+    for row in rows:
+        res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id")}
+        try:
+            client = _resolve_clickru_client(row.get("connection_id"))
+            login = await _resolve_client_login(client, int(row["account_id"]))
+            post = await _fund_and_start(client, int(row["account_id"]), login, int(row["campaign_id"]),
+                                         row.get("payer_id"), amount, start, is_epk)
+            res.update(post)
+        except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+            res.update(notes=[str(getattr(exc, "detail", None) or exc)[:300]], started=False, topup_status="ERROR")
+        results.append(res)
+    funded = sum(1 for r in results if r.get("topup_status") == "SUCCESS")
+    started = sum(1 for r in results if r.get("started"))
+    db.add_project_event(
+        project_id, "fund_start",
+        f"Пополнение/запуск: пополнено {funded} из {len(results)}" + (f" по {amount:g} ₽" if amount else "")
+        + (f", запущено {started}" if start else ""),
+        "; ".join(f"{r['account_id']}: " + ", ".join(r.get("notes") or []) for r in results)[:1500],
+    )
+    return {"items": results, "funded": funded, "started": started, "total": len(results)}
+
+
 @app.post("/api/projects/{project_id}/metrika-grants")
 async def grant_project_metrika(project_id: int, _: AuthUser):
     """Для уже созданных кампаний проекта: выдать организации Директа
@@ -1732,6 +1778,64 @@ async def _download_image_base64(url: str) -> str:
         return base64.b64encode(response.content).decode("ascii")
 
 
+TOPUP_STATUS_WAIT_SECONDS = 60
+
+
+async def _fund_and_start(
+    client: ClickRUClient, account_id: int, client_login: str, campaign_id: int,
+    payer_id: int | None, amount_rub: float | None, start: bool, is_epk: bool,
+) -> dict[str, Any]:
+    """После создания кампании (2026-11-12, Dima: «автоматом пополнялись с
+    Click.ru по 1220 ₽ с НДС и автоматом запускались»):
+      1) пополнение аккаунта с баланса Click.ru (payments/add_money, сумма с
+         НДС, с юрлица запуска) и ожидание статуса до 60 с;
+      2) запуск: маркировка ОРД/ERID должна быть настроена → объявления на
+         модерацию (ads.moderate) → campaigns.resume.
+    НИКОГДА не бросает: кампания уже создана, ошибки уходят в notes."""
+    out: dict[str, Any] = {"topup_rub": None, "topup_status": None, "started": False, "notes": []}
+    if amount_rub and amount_rub > 0:
+        out["topup_rub"] = round(float(amount_rub), 2)
+        try:
+            task_id = await client.add_money(account_id, amount_rub, payer_id)
+            status = "SENT"
+            if task_id:
+                for _ in range(TOPUP_STATUS_WAIT_SECONDS // 5):
+                    status = await client.add_money_status(task_id) or status
+                    if status in ("SUCCESS", "ERROR", "CANCELLED"):
+                        break
+                    await asyncio.sleep(5)
+            out["topup_status"] = status
+            if status == "SUCCESS":
+                out["notes"].append(f"Пополнено на {amount_rub:g} ₽ с НДС")
+            elif status in ("ERROR", "CANCELLED"):
+                out["notes"].append(f"Пополнение на {amount_rub:g} ₽ не прошло ({status}, задача {task_id})")
+            else:
+                out["notes"].append(f"Пополнение на {amount_rub:g} ₽ в обработке (задача {task_id})")
+        except (ClickRUError, httpx.HTTPError) as exc:
+            out["topup_status"] = "ERROR"
+            out["notes"].append(f"Пополнение не выполнено: {str(exc)[:200]}")
+    if start:
+        try:
+            schema = await client.marking_schema(account_id)
+            if not schema.get("configured", schema.get("isConfigured", False)):
+                out["notes"].append("Не запущено: у аккаунта не настроена маркировка (ОРД/ERID) в Click.ru")
+                return out
+            sent = await client.moderate_campaign_ads(client_login, campaign_id, **({"api_version": "v501"} if is_epk else {}))
+            try:
+                await client.resume_campaign(client_login, campaign_id)
+            except ClickRUError as exc:
+                # новая кампания обычно уже «включена» — Директ может ответить,
+                # что возобновлять нечего; модерация при этом отправлена
+                if sent == 0:
+                    raise
+                out["notes"].append(f"resume: {str(exc)[:120]}")
+            out["started"] = True
+            out["notes"].append(f"Запущено: на модерацию отправлено объявлений — {sent}")
+        except (ClickRUError, httpx.HTTPError) as exc:
+            out["notes"].append(f"Не запущено: {str(exc)[:200]}")
+    return out
+
+
 async def _grant_metrika_to_org(pool_login: str, counter_id: int, org_login: str) -> str | None:
     """Выдаёт логину организации Директа (porg-…) доступ «на просмотр» к
     счётчику пулового Yandex ID (2026-11-11, Dima: «у организации нет
@@ -2108,7 +2212,14 @@ async def _run_bulk_job(
                     project_id, pool_login, account_id, campaign_id,
                     connection_id=payload.connection_id, payer_id=payload.payer_id,
                 )
+                post = await _fund_and_start(
+                    client, account_id, client_login, campaign_id, payload.payer_id,
+                    payload.topup_amount_rub, payload.auto_start, is_epk,
+                )
+                if post["notes"]:
+                    note = "; ".join(x for x in [note, *post["notes"]] if x)
                 db.append_bulk_job_item(job_id, BulkCampaignItemResult(
+                    topup_rub=post["topup_rub"], topup_status=post["topup_status"], started=post["started"],
                     pool_login=pool_login,
                     account_id=account_id,
                     counter_id=counter_id,

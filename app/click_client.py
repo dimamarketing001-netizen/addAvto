@@ -549,6 +549,44 @@ class ClickRUClient:
             raise ClickRUError(f"Не удалось создать уточнение: {errors}")
         return int(first["Id"])
 
+    async def add_money(self, account_id: int, amount_rub: float, payer_id: int | None = None) -> int | None:
+        """POST /payments/add_money — пополнить рекламный аккаунт с баланса
+        менеджерского аккаунта Click.ru. amount — «в рублях в т.ч. НДС»
+        (openapi.json), payerId — юрлицо, с баланса которого (0 — физлицо).
+        РЕАЛЬНОЕ списание денег. Возвращает task_id для статуса."""
+        response = await self._request("POST", "/payments/add_money", json={
+            "accountId": int(account_id), "payerId": int(payer_id or 0), "amount": round(float(amount_rub), 2),
+        })
+        data = response.json()
+        envelope = data.get("response", data) if isinstance(data, dict) else {}
+        task_id = envelope.get("task_id") if isinstance(envelope, dict) else None
+        return int(task_id) if task_id else None
+
+    async def add_money_status(self, task_id: int) -> str:
+        """NEW | PROCESSING | ERROR | CANCELLED | SUCCESS."""
+        response = await self._request("GET", "/payments/add_money/status", params={"task_id": int(task_id)})
+        data = response.json()
+        envelope = data.get("response", data) if isinstance(data, dict) else {}
+        return str((envelope or {}).get("status") or "")
+
+    async def moderate_campaign_ads(self, client_login: str, campaign_id: int, api_version: str = "v5") -> int:
+        """Отправить на модерацию все черновики объявлений кампании
+        (Ads.moderate принимает только статус DRAFT). Возвращает сколько ушло."""
+        ads = (await self.direct_api(client_login, "ads", {"method": "get", "params": {
+            "SelectionCriteria": {"CampaignIds": [int(campaign_id)]}, "FieldNames": ["Id", "Status"],
+        }}, api_version=api_version)).get("result", {}).get("Ads") or []
+        draft_ids = [int(a["Id"]) for a in ads if a.get("Status") == "DRAFT"]
+        if not draft_ids:
+            return 0
+        data = await self.direct_api(client_login, "ads", {"method": "moderate", "params": {
+            "SelectionCriteria": {"Ids": draft_ids},
+        }}, api_version=api_version)
+        errors = [e for r in (data.get("result") or {}).get("ModerateResults") or [] for e in r.get("Errors") or []]
+        if errors:
+            raise ClickRUError("Не удалось отправить на модерацию: " + "; ".join(
+                f"{e.get('Message')} ({e.get('Details')})" for e in errors[:3]))
+        return len(draft_ids)
+
     async def resume_campaign(self, client_login: str, campaign_id: int) -> None:
         """Campaigns.resume — the ONLY step in this whole app that actually
         makes a campaign eligible to serve and spend budget (every campaign

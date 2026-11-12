@@ -264,6 +264,11 @@ class BulkCampaignCreateRequest(BaseModel):
     # give every account exactly one deliberately-chosen creative; >1
     # identical or >1 hand-picked-but-then-duplicated ads isn't useful).
     ads_per_group: int = Field(default=1, ge=1, le=50)
+    # После создания кампании (2026-11-12, Dima): пополнить аккаунт с баланса
+    # Click.ru на эту сумму в рублях С НДС (None/0 — не пополнять) и сразу
+    # запустить: модерация объявлений + включение. Это РЕАЛЬНЫЕ деньги.
+    topup_amount_rub: float | None = Field(default=None, ge=0, le=100000)
+    auto_start: bool = False
 
     @field_validator("creative_sets")
     @classmethod
@@ -308,6 +313,10 @@ class BulkCampaignItemResult(BaseModel):
     # Порядковый номер аккаунта в запуске (для manual_per_account при
     # продолжении — какие наборы креативов ещё не использованы).
     index: int | None = None
+    # Пополнение и запуск после создания (2026-11-12)
+    topup_rub: float | None = None
+    topup_status: str | None = None
+    started: bool = False
 
 
 class BulkCampaignCreateResult(BaseModel):
