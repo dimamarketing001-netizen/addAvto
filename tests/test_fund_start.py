@@ -13,14 +13,14 @@ from test_bulk_campaign_create import (
 AUTH = ("test-admin", "test-password-long-enough")
 
 
-def _setup(monkeypatch, tmp_path, name, *, marking=True, topup_status="SUCCESS"):
+def _setup(monkeypatch, tmp_path, name, *, marking=True, topup_status="SUCCESS", schema_create_error=None):
     _configure_test_env(monkeypatch, tmp_path / name)
     monkeypatch.setattr(main_module, "ClickRUClient", FakeClickRUClient)
     monkeypatch.setattr(main_module, "ParsYaPoolClient", FakeParsYaPoolClient)
     monkeypatch.setattr(main_module, "YandexMetrikaClient", FakeYandexMetrikaClient)
     monkeypatch.setattr(main_module, "TOPUP_STATUS_WAIT_SECONDS", 5)
     FakeParsYaPoolClient._counter = 0
-    calls = {"money": [], "moderate": [], "resume": []}
+    calls = {"money": [], "moderate": [], "resume": [], "schema_create": []}
 
     async def add_money(self, account_id, amount_rub, payer_id=None):
         calls["money"].append((account_id, amount_rub, payer_id))
@@ -30,7 +30,13 @@ def _setup(monkeypatch, tmp_path, name, *, marking=True, topup_status="SUCCESS")
         return topup_status
 
     async def marking_schema(self, account_id):
-        return {"configured": marking}
+        return {"schemas": [{"schemeId": 1, "schemaType": "END_ADVERTISER"}] if marking else []}
+
+    async def create_marking_schema(self, account_id, payer_id, schema_type="END_ADVERTISER", account_schema_type="MAIN"):
+        if schema_create_error:
+            raise main_module.ClickRUError(schema_create_error, 422)
+        calls["schema_create"].append((account_id, payer_id, schema_type))
+        return 4242
 
     async def moderate_campaign_ads(self, client_login, campaign_id, api_version="v5"):
         calls["moderate"].append((client_login, campaign_id))
@@ -40,6 +46,7 @@ def _setup(monkeypatch, tmp_path, name, *, marking=True, topup_status="SUCCESS")
         calls["resume"].append(campaign_id)
 
     for n, f in (("add_money", add_money), ("add_money_status", add_money_status), ("marking_schema", marking_schema),
+                 ("create_marking_schema", create_marking_schema),
                  ("moderate_campaign_ads", moderate_campaign_ads), ("resume_campaign", resume_campaign)):
         monkeypatch.setattr(FakeClickRUClient, n, f, raising=False)
     return calls
@@ -73,16 +80,29 @@ def test_default_launch_spends_nothing(monkeypatch, tmp_path):
     assert all(not it["started"] and it["topup_status"] is None for it in job["items"])
 
 
-def test_no_marking_means_not_started_but_created(monkeypatch, tmp_path):
-    calls = _setup(monkeypatch, tmp_path, "nomark.db", marking=False, topup_status="ERROR")
+def test_missing_marking_is_created_then_funded(monkeypatch, tmp_path):
+    calls = _setup(monkeypatch, tmp_path, "mkcreate.db", marking=False)
+    with TestClient(main_module.app) as client:
+        p = _make_project(client, AUTH)
+        job = _launch(client, p["id"], _seed_connection(), topup_amount_rub=1220, auto_start=True)
+    assert job["created"] == 2
+    assert [c[1:] for c in calls["schema_create"]] == [(1480787, "END_ADVERTISER")] * 2
+    assert len(calls["money"]) == 2 and len(calls["resume"]) == 2
+    it = job["items"][0]
+    assert it["started"] is True and it["topup_status"] == "SUCCESS"
+    assert "создана схема" in it["note"] and "4242" in it["note"]
+
+
+def test_marking_failure_skips_topup_and_start(monkeypatch, tmp_path):
+    calls = _setup(monkeypatch, tmp_path, "nomark.db", marking=False, schema_create_error="bad schema")
     with TestClient(main_module.app) as client:
         p = _make_project(client, AUTH)
         job = _launch(client, p["id"], _seed_connection(), topup_amount_rub=1220, auto_start=True)
     assert job["created"] == 2  # кампании созданы, несмотря на отказ
     it = job["items"][0]
-    assert it["started"] is False and it["topup_status"] == "ERROR"
-    assert "не прошло" in it["note"] and "маркировка" in it["note"]
-    assert calls["moderate"] == []
+    assert it["started"] is False and it["topup_status"] == "SKIPPED"
+    assert "маркировка" in it["note"] and "bad schema" in it["note"]
+    assert calls["money"] == [] and calls["moderate"] == []
 
 
 def test_fund_and_start_existing(monkeypatch, tmp_path):
@@ -98,3 +118,24 @@ def test_fund_and_start_existing(monkeypatch, tmp_path):
         assert calls["money"] == [(9105, 1220.0, 1480787)] and calls["resume"] == [77]
         h = client.get(f"/api/projects/{p['id']}/history", auth=AUTH).json()
         assert any(e["kind"] == "fund_start" for e in h["events"])
+
+
+def test_clickru_retries_429(monkeypatch):
+    import asyncio
+    import httpx
+    from app import click_client
+
+    hits = []
+
+    def handler(request):
+        hits.append(request.url.path)
+        if len(hits) < 3:
+            return httpx.Response(429, json={"message": "limit"})
+        return httpx.Response(200, json={"response": {"task_id": 9}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(click_client.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(click_client, "CLICKRU_429_BACKOFF", (0.0, 0.0, 0.0))
+    c = click_client.ClickRUClient(token="t")
+    assert asyncio.run(c.add_money(1, 1220, 5)) == 9
+    assert len(hits) == 3

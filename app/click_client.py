@@ -12,6 +12,8 @@ import httpx
 
 # Временные ошибки Direct API: сервис недоступен/перегружен — повторяем.
 TRANSIENT_DIRECT_ERRORS = {"52", "1000", "1001", "1002"}
+# Паузы между повторами при 429 Click.ru (секунды).
+CLICKRU_429_BACKOFF = (3.0, 8.0, 15.0)
 
 
 class ClickRUError(RuntimeError):
@@ -51,13 +53,25 @@ class ClickRUClient:
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         headers = self._headers()
         headers.update(kwargs.pop("headers", {}))
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
-                response = await client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
-        except httpx.TimeoutException as exc:
-            raise ClickRUError("Click.ru не ответил вовремя. Проверьте сеть и тайм-аут.") from exc
-        except httpx.HTTPError as exc:
-            raise ClickRUError(f"Ошибка соединения с Click.ru: {type(exc).__name__}") from exc
+        # 429: Click.ru отклонил запрос из-за лимита — он НЕ выполнен, поэтому
+        # повтор безопасен даже для POST (в т.ч. add_money). Ждём Retry-After
+        # (не дольше 30 с) или 3/8/15 с.
+        for attempt in range(len(CLICKRU_429_BACKOFF) + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                    response = await client.request(method, f"{self.base_url}{path}", headers=headers, **kwargs)
+            except httpx.TimeoutException as exc:
+                raise ClickRUError("Click.ru не ответил вовремя. Проверьте сеть и тайм-аут.") from exc
+            except httpx.HTTPError as exc:
+                raise ClickRUError(f"Ошибка соединения с Click.ru: {type(exc).__name__}") from exc
+            if response.status_code != 429 or attempt >= len(CLICKRU_429_BACKOFF):
+                break
+            delay = CLICKRU_429_BACKOFF[attempt]
+            try:
+                delay = min(30.0, max(1.0, float(response.headers.get("Retry-After", ""))))
+            except ValueError:
+                pass
+            await asyncio.sleep(delay)
 
         if response.status_code >= 400:
             details = "Не удалось выполнить запрос к Click.ru."
@@ -548,6 +562,23 @@ class ClickRUClient:
             errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
             raise ClickRUError(f"Не удалось создать уточнение: {errors}")
         return int(first["Id"])
+
+    async def create_marking_schema(
+        self, account_id: int, payer_id: int, schema_type: str = "END_ADVERTISER", account_schema_type: str = "MAIN",
+    ) -> int | None:
+        """POST /markings/schemas/create — схема маркировки (ОРД/ERID) для
+        рекламного аккаунта. Без неё Click.ru не даёт пополнить аккаунт
+        («заполните схему маркировки»). END_ADVERTISER — юрлицо-плательщик
+        само является конечным рекламодателем, посредники не нужны.
+        Возвращает schemeId."""
+        response = await self._request("POST", "/markings/schemas/create", json={
+            "accountId": int(account_id), "accountSchemaType": account_schema_type,
+            "schemaType": schema_type, "payerId": int(payer_id), "items": [], "agreeWithNotices": True,
+        })
+        data = response.json()
+        envelope = data.get("response", data) if isinstance(data, dict) else {}
+        scheme_id = envelope.get("schemeId") if isinstance(envelope, dict) else None
+        return int(scheme_id) if scheme_id else None
 
     async def add_money(self, account_id: int, amount_rub: float, payer_id: int | None = None) -> int | None:
         """POST /payments/add_money — пополнить рекламный аккаунт с баланса

@@ -1674,7 +1674,7 @@ async def activate_campaign(
         schema = await client.marking_schema(account_id)
     except ClickRUError as exc:
         raise HTTPException(status_code=502, detail=f"Не удалось проверить схему маркировки: {exc}") from exc
-    if not schema.get("configured", schema.get("isConfigured", False)):
+    if not _marking_ok(schema):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1825,6 +1825,31 @@ def _ad_href(project: dict[str, Any]) -> str:
 
 
 TOPUP_STATUS_WAIT_SECONDS = 60
+# Тип схемы маркировки, создаваемой автоматически перед пополнением/запуском.
+MARKING_SCHEMA_TYPE = os.getenv("CLICKRU_MARKING_SCHEMA_TYPE", "END_ADVERTISER").strip() or "END_ADVERTISER"
+
+
+def _marking_ok(schema: dict[str, Any]) -> bool:
+    """GET /markings/schemas/account отвечает {"schemas": [...]}; пустой
+    список = маркировка не настроена."""
+    return bool(schema.get("schemas") or schema.get("configured") or schema.get("isConfigured"))
+
+
+async def _ensure_marking(client: ClickRUClient, account_id: int, payer_id: int | None) -> tuple[bool, str | None]:
+    """Схема маркировки обязательна и для пополнения, и для запуска
+    (2026-11-12: «Для пополнения рекламного аккаунта заполните схему
+    маркировки»). Если её нет — создаём «Конечный рекламодатель» (основная)
+    на юрлицо запуска. Возвращает (готово, заметка)."""
+    try:
+        if _marking_ok(await client.marking_schema(account_id)):
+            return True, None
+        if not payer_id:
+            return False, "маркировка не настроена, а юрлицо для схемы не выбрано"
+        scheme_id = await client.create_marking_schema(account_id, int(payer_id), MARKING_SCHEMA_TYPE)
+        label = "Конечный рекламодатель" if MARKING_SCHEMA_TYPE == "END_ADVERTISER" else MARKING_SCHEMA_TYPE
+        return True, f"Маркировка: создана схема «{label}» на юрлицо #{payer_id}" + (f" (№{scheme_id})" if scheme_id else "")
+    except (ClickRUError, httpx.HTTPError) as exc:
+        return False, f"маркировка не настроена: {str(exc)[:200]}"
 
 
 async def _fund_and_start(
@@ -1835,11 +1860,23 @@ async def _fund_and_start(
     Click.ru по 1220 ₽ с НДС и автоматом запускались»):
       1) пополнение аккаунта с баланса Click.ru (payments/add_money, сумма с
          НДС, с юрлица запуска) и ожидание статуса до 60 с;
-      2) запуск: маркировка ОРД/ERID должна быть настроена → объявления на
-         модерацию (ads.moderate) → campaigns.resume.
+      0) маркировка ОРД/ERID: нет схемы → создаём (_ensure_marking), иначе
+         ни пополнение, ни запуск Click.ru не пропустит;
+      2) запуск: объявления на модерацию (ads.moderate) → campaigns.resume.
     НИКОГДА не бросает: кампания уже создана, ошибки уходят в notes."""
     out: dict[str, Any] = {"topup_rub": None, "topup_status": None, "started": False, "notes": []}
-    if amount_rub and amount_rub > 0:
+    want_topup = bool(amount_rub and amount_rub > 0)
+    if want_topup or start:
+        marked, note = await _ensure_marking(client, account_id, payer_id)
+        if not marked:
+            if want_topup:
+                out["topup_rub"] = round(float(amount_rub), 2)
+                out["topup_status"] = "SKIPPED"
+            out["notes"].append(f"Не пополнено и не запущено: {note}")
+            return out
+        if note:
+            out["notes"].append(note)
+    if want_topup:
         out["topup_rub"] = round(float(amount_rub), 2)
         try:
             task_id = await client.add_money(account_id, amount_rub, payer_id)
@@ -1862,10 +1899,6 @@ async def _fund_and_start(
             out["notes"].append(f"Пополнение не выполнено: {str(exc)[:200]}")
     if start:
         try:
-            schema = await client.marking_schema(account_id)
-            if not schema.get("configured", schema.get("isConfigured", False)):
-                out["notes"].append("Не запущено: у аккаунта не настроена маркировка (ОРД/ERID) в Click.ru")
-                return out
             sent = await client.moderate_campaign_ads(client_login, campaign_id, **({"api_version": "v501"} if is_epk else {}))
             try:
                 await client.resume_campaign(client_login, campaign_id)
