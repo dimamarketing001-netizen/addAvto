@@ -1412,6 +1412,32 @@ def _strategy_for_update(obj: Any) -> Any:
     return obj
 
 
+# Стратегии «за клики» → их вариант «оплата за конверсии» (те же настройки).
+_PAY_FOR_CONVERSION = {
+    "AVERAGE_CRR": ("PAY_FOR_CONVERSION_CRR", "AverageCrr", "PayForConversionCrr", ("Crr", "GoalId", "WeeklySpendLimit")),
+    "AVERAGE_CPA": ("PAY_FOR_CONVERSION", "AverageCpa", "PayForConversion", ("AverageCpa", "GoalId", "WeeklySpendLimit")),
+}
+
+
+def _to_pay_for_conversions(search: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Переводит стратегию поиска на оплату за конверсии. Уже за конверсии —
+    без изменений. Неизвестный тип — ClickRUError (лучше явно, чем угадывать)."""
+    stype = search.get("BiddingStrategyType") or ""
+    if stype.startswith("PAY_FOR_CONVERSION"):
+        return search, False
+    if stype not in _PAY_FOR_CONVERSION:
+        raise ClickRUError(f"стратегию {stype or '—'} нельзя автоматически перевести на оплату за конверсии")
+    new_type, src, dst, keys = _PAY_FOR_CONVERSION[stype]
+    cfg = search.get(src) or {}
+    body = {k: cfg[k] for k in keys if cfg.get(k) is not None}
+    if stype == "AVERAGE_CPA":
+        body["Cpa"] = body.pop("AverageCpa", None)
+    out = {"BiddingStrategyType": new_type, dst: body}
+    if search.get("PlacementTypes"):
+        out["PlacementTypes"] = search["PlacementTypes"]
+    return out, True
+
+
 def _raise_update_errors(data: dict[str, Any]) -> None:
     errs = [e for r in (data.get("result") or {}).get("UpdateResults") or [] for e in r.get("Errors") or []]
     if errs:
@@ -1424,6 +1450,7 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
       button_action — кнопку во всех объявлениях (пусто — не трогать);
       maps_off — выключить Яндекс Карты в площадках поиска (только ЕПК).
       display_url_path — отображаемая ссылка во всех объявлениях (пусто — не трогать).
+      pay_for_conversions — стратегия поиска «оплата за конверсии» (ДРР и цель те же).
     Изменение объявления Директ отправит на перемодерацию."""
     project = db.get_project(project_id)
     if project is None:
@@ -1437,35 +1464,45 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     is_epk = project.get("campaign_mode") == "single_epk"
     maps_off = bool(payload.get("maps_off")) and is_epk
-    if not button and not maps_off and not display_path:
-        raise HTTPException(status_code=422, detail="Нечего применять: кнопка, отображаемая ссылка или выключение Карт (только ЕПК)")
+    pay_conv = bool(payload.get("pay_for_conversions"))
+    if not button and not maps_off and not display_path and not pay_conv:
+        raise HTTPException(status_code=422, detail="Нечего применять: кнопка, отображаемая ссылка, оплата за конверсии или выключение Карт (только ЕПК)")
     api_v = {"api_version": "v501"} if is_epk else {}
     href = _ad_href(project)
     results = []
     for row in db.list_bulk_campaigns(project_id):
         res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id"),
-                               "ads_updated": 0, "maps_off": False}
+                               "ads_updated": 0, "maps_off": False, "pay_for_conversions": False}
         try:
             client = _resolve_clickru_client(row.get("connection_id"))
             login = await _resolve_client_login(client, int(row["account_id"]))
             cid = int(row["campaign_id"])
-            if maps_off:
+            if maps_off or pay_conv:
                 # Директ требует в update всю стратегию поиска (тип + настройки):
                 # берём текущую, убираем null и read-only ExplorationBudget.
+                ckey = "UnifiedCampaign" if is_epk else "TextCampaign"
                 got = await client.direct_api(login, "campaigns", {"method": "get", "params": {
                     "SelectionCriteria": {"Ids": [cid]}, "FieldNames": ["Id"],
-                    "UnifiedCampaignFieldNames": ["BiddingStrategy"]}}, **api_v)
+                    f"{ckey}FieldNames": ["BiddingStrategy"]}}, **api_v)
                 camps = (got.get("result") or {}).get("Campaigns") or []
                 search = _strategy_for_update(
-                    ((camps[0].get("UnifiedCampaign") or {}).get("BiddingStrategy") or {}).get("Search") if camps else None)
+                    ((camps[0].get(ckey) or {}).get("BiddingStrategy") or {}).get("Search") if camps else None)
                 if not search:
                     raise ClickRUError("не удалось прочитать стратегию поиска кампании")
-                search["PlacementTypes"] = {"Maps": "NO"}
-                data = await client.direct_api(login, "campaigns", {"method": "update", "params": {"Campaigns": [{
-                    "Id": cid, "UnifiedCampaign": {"BiddingStrategy": {"Search": search}},
-                }]}}, **api_v)
-                _raise_update_errors(data)
-                res["maps_off"] = True
+                changed = False
+                if pay_conv:
+                    search, conv_changed = _to_pay_for_conversions(search)
+                    changed = changed or conv_changed
+                if maps_off:
+                    search["PlacementTypes"] = {"Maps": "NO"}
+                    changed = True
+                if changed:
+                    data = await client.direct_api(login, "campaigns", {"method": "update", "params": {"Campaigns": [{
+                        "Id": cid, ckey: {"BiddingStrategy": {"Search": search}},
+                    }]}}, **api_v)
+                    _raise_update_errors(data)
+                res["maps_off"] = maps_off
+                res["pay_for_conversions"] = pay_conv and search.get("BiddingStrategyType", "").startswith("PAY_FOR_CONVERSION")
             if button or display_path:
                 ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
                     "SelectionCriteria": {"CampaignIds": [cid]}, "FieldNames": ["Id"],
@@ -1496,11 +1533,14 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
         parts.append(f"кнопка «{BUTTON_ACTIONS[button]}» — объявлений {sum(r['ads_updated'] for r in results)}")
     if display_path:
         parts.append(f"отображаемая ссылка «{display_path}»" + ("" if button else f" — объявлений {sum(r['ads_updated'] for r in results)}"))
+    if pay_conv:
+        parts.append(f"оплата за конверсии — кампаний {sum(1 for r in results if r['pay_for_conversions'])}")
     if maps_off:
         parts.append(f"Карты выключены — кампаний {sum(1 for r in results if r['maps_off'])}")
     errors = "; ".join(f"{r['account_id']}: {r['error']}" for r in results if r.get("error"))
     db.add_project_event(project_id, "ad_settings", "Настройки объявлений: " + "; ".join(parts), errors[:300])
-    return {"items": results, "button_action": button, "maps_off": maps_off, "display_url_path": display_path}
+    return {"items": results, "button_action": button, "maps_off": maps_off, "display_url_path": display_path,
+            "pay_for_conversions": pay_conv}
 
 
 @app.post("/api/projects/{project_id}/fund-and-start")
@@ -1854,7 +1894,7 @@ async def preview_plan(project_id: int, _: AuthUser):
     return CampaignPlan(
         project_id=project_id,
         campaign_mode=project["campaign_mode"],
-        strategy="AVERAGE_CRR",  # bulk-create always uses this, по продуктовому решению — не настраивается
+        strategy="PAY_FOR_CONVERSION_CRR",  # bulk-create always uses this, по продуктовому решению — не настраивается
         items=items,
     )
 

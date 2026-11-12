@@ -152,3 +152,23 @@ def test_sitelink_href_inherits_launch_utm():
     assert "utm_content={banner_id}_{keyword}_sl2&" in f("https://ozon.ru/product/santa-3160445300/?utm_content=sl2", ad)
     assert f("https://other.ru/x", ad) == "https://other.ru/x"  # чужой сайт не трогаем
     assert f("https://ozon.ru/x", "https://ozon.ru/p") == "https://ozon.ru/x"  # у запуска нет параметров
+
+
+def test_to_pay_for_conversions():
+    f = main_module._to_pay_for_conversions
+    out, ch = f({"BiddingStrategyType": "AVERAGE_CRR", "PlacementTypes": {"Maps": "NO"},
+                 "AverageCrr": {"Crr": 30, "GoalId": 5, "BudgetType": "WEEKLY_BUDGET"}})
+    assert ch and out == {"BiddingStrategyType": "PAY_FOR_CONVERSION_CRR", "PayForConversionCrr": {"Crr": 30, "GoalId": 5},
+                          "PlacementTypes": {"Maps": "NO"}}
+    same = {"BiddingStrategyType": "PAY_FOR_CONVERSION_CRR", "PayForConversionCrr": {"Crr": 30, "GoalId": 5}}
+    assert f(same) == (same, False)
+    import pytest
+    with pytest.raises(main_module.ClickRUError):
+        f({"BiddingStrategyType": "WB_MAXIMUM_CLICKS"})
+
+
+def test_text_campaign_pays_for_conversions(monkeypatch):
+    calls = _capture(monkeypatch)
+    asyncio.run(ClickRUClient(token="t").create_draft_text_campaign("porg-1", "Т", "2026-11-12", target_drr=25, goal_id=7))
+    search = calls[0][2]["params"]["Campaigns"][0]["TextCampaign"]["BiddingStrategy"]["Search"]
+    assert search == {"BiddingStrategyType": "PAY_FOR_CONVERSION_CRR", "PayForConversionCrr": {"Crr": 25, "GoalId": 7}}

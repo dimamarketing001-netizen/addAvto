@@ -12,6 +12,13 @@ import httpx
 
 # Временные ошибки Direct API: сервис недоступен/перегружен — повторяем.
 TRANSIENT_DIRECT_ERRORS = {"52", "1000", "1001", "1002"}
+# Стратегия поиска: оплата за конверсии с целевой ДРР (Dima, 2026-11-12:
+# «оплату не за клики, а за конверсии»). Проверено живым update ЕПК 716086494.
+def search_crr_strategy(target_drr: float, goal_id: int) -> dict[str, Any]:
+    return {"BiddingStrategyType": "PAY_FOR_CONVERSION_CRR",
+            "PayForConversionCrr": {"Crr": round(target_drr), "GoalId": goal_id}}
+
+
 # Паузы между повторами при 429 Click.ru (секунды).
 CLICKRU_429_BACKOFF = (3.0, 8.0, 15.0)
 
@@ -326,8 +333,7 @@ class ClickRUClient:
         """
         if target_drr is not None and goal_id is not None:
             search_block: dict[str, Any] = {
-                "BiddingStrategyType": "AVERAGE_CRR",
-                "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
+                **search_crr_strategy(target_drr, goal_id),
             }
             # Seen live: AVERAGE_CRR on BOTH Search and Network is rejected
             # ("these strategies are not compatible") — same rule as
@@ -408,8 +414,7 @@ class ClickRUClient:
                         "UnifiedCampaign": {
                             "BiddingStrategy": {
                                 "Search": {
-                                    "BiddingStrategyType": "AVERAGE_CRR",
-                                    "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
+                                    **search_crr_strategy(target_drr, goal_id),
                                     # Яндекс Карты не нужны (Dima, 2026-11-12); остальные
                                     # площадки поиска — по умолчанию Директа.
                                     "PlacementTypes": {"Maps": "NO"},
