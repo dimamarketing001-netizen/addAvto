@@ -27,6 +27,7 @@ from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozo
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from .schemas import (
     BUTTON_ACTIONS,
+    check_display_url_path,
     BulkCampaignCreateRequest,
     BulkCampaignItemResult,
     BulkJobOut,
@@ -1248,6 +1249,20 @@ async def open_account_direct(project_id: int, account_id: int, _: AuthUser):
     return {**result, "org_login": org_login}
 
 
+async def _resync_sitelinks_set(client: ClickRUClient, login: str, set_id: int, ad_href: str) -> int | None:
+    """Наборы быстрых ссылок в Директе не редактируются: если адресам не
+    хватает параметров ссылки запуска — создаём новый набор, иначе None."""
+    data = await client.direct_api(login, "sitelinks", {"method": "get", "params": {
+        "SelectionCriteria": {"Ids": [set_id]}, "FieldNames": ["Id", "Sitelinks"]}})
+    sets = (data.get("result") or {}).get("SitelinksSets") or []
+    links = (sets[0].get("Sitelinks") or []) if sets else []
+    fixed = [{k: v for k, v in {**sl, "Href": _sitelink_href(sl.get("Href") or "", ad_href)}.items()
+              if v is not None and k in ("Title", "Href", "Description", "TurboPageId")} for sl in links]
+    if not links or all(f["Href"] == (sl.get("Href") or "") for f, sl in zip(fixed, links)):
+        return None
+    return await client.create_sitelinks_set(login, fixed)
+
+
 @app.post("/api/projects/{project_id}/sync-href")
 async def sync_project_href(project_id: int, _: AuthUser):
     """Проставить в уже созданных объявлениях проекта полную ссылку запуска
@@ -1266,9 +1281,29 @@ async def sync_project_href(project_id: int, _: AuthUser):
             login = await _resolve_client_login(client, int(row["account_id"]))
             ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
                 "SelectionCriteria": {"CampaignIds": [int(row["campaign_id"])]},
-                "FieldNames": ["Id"], "TextAdFieldNames": ["Href"],
+                "FieldNames": ["Id"], "TextAdFieldNames": ["Href", "ButtonExtension", "SitelinkSetId"],
             }}, **api_v)).get("result", {}).get("Ads") or []
-            todo = [{"Id": a["Id"], "TextAd": {"Href": href}} for a in ads if (a.get("TextAd") or {}).get("Href") != href]
+            new_sets: dict[int, int | None] = {}
+            todo = []
+            for a in ads:
+                ta = a.get("TextAd")
+                if ta is None:
+                    continue
+                change: dict[str, Any] = {}
+                if ta.get("Href") != href:
+                    change["Href"] = href
+                btn = ta.get("ButtonExtension") or {}
+                if btn.get("Action") and btn.get("Href") != href:
+                    change["ButtonExtension"] = {"Action": btn["Action"], "Href": href}
+                set_id = ta.get("SitelinkSetId")
+                if set_id:
+                    if set_id not in new_sets:
+                        new_sets[set_id] = await _resync_sitelinks_set(client, login, int(set_id), href)
+                    if new_sets[set_id]:
+                        change["SitelinkSetId"] = new_sets[set_id]
+                if change:
+                    todo.append({"Id": a["Id"], "TextAd": change})
+            res["sitelink_sets"] = sum(1 for v in new_sets.values() if v)
             if todo:
                 data = await client.direct_api(login, "ads", {"method": "update", "params": {"Ads": todo}}, **api_v)
                 errs = [e for r in (data.get("result") or {}).get("UpdateResults") or [] for e in r.get("Errors") or []]
@@ -1279,7 +1314,9 @@ async def sync_project_href(project_id: int, _: AuthUser):
             res["error"] = str(getattr(exc, "detail", None) or exc)[:300]
         results.append(res)
     total = sum(r["updated"] for r in results)
-    db.add_project_event(project_id, "href_sync", f"Ссылка объявлений обновлена: {total}", href[:300])
+    sl_total = sum(r.get("sitelink_sets", 0) for r in results)
+    db.add_project_event(project_id, "href_sync", f"Ссылка объявлений обновлена: {total}"
+                         + (f", новых наборов быстрых ссылок: {sl_total}" if sl_total else ""), href[:300])
     return {"href": href, "items": results, "updated": total}
 
 
@@ -1307,6 +1344,7 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
     """Применить к УЖЕ созданным кампаниям проекта:
       button_action — кнопку во всех объявлениях (пусто — не трогать);
       maps_off — выключить Яндекс Карты в площадках поиска (только ЕПК).
+      display_url_path — отображаемая ссылка во всех объявлениях (пусто — не трогать).
     Изменение объявления Директ отправит на перемодерацию."""
     project = db.get_project(project_id)
     if project is None:
@@ -1314,10 +1352,14 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
     button = payload.get("button_action") or None
     if button is not None and button not in BUTTON_ACTIONS:
         raise HTTPException(status_code=422, detail="Неизвестная кнопка — выберите из списка Директа")
+    try:
+        display_path = check_display_url_path(payload.get("display_url_path"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     is_epk = project.get("campaign_mode") == "single_epk"
     maps_off = bool(payload.get("maps_off")) and is_epk
-    if not button and not maps_off:
-        raise HTTPException(status_code=422, detail="Нечего применять: выберите кнопку и/или выключение Карт (только ЕПК)")
+    if not button and not maps_off and not display_path:
+        raise HTTPException(status_code=422, detail="Нечего применять: кнопка, отображаемая ссылка или выключение Карт (только ЕПК)")
     api_v = {"api_version": "v501"} if is_epk else {}
     href = _ad_href(project)
     results = []
@@ -1345,15 +1387,24 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
                 }]}}, **api_v)
                 _raise_update_errors(data)
                 res["maps_off"] = True
-            if button:
+            if button or display_path:
                 ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
                     "SelectionCriteria": {"CampaignIds": [cid]}, "FieldNames": ["Id"],
-                    "TextAdFieldNames": ["Href", "ButtonExtension"],
+                    "TextAdFieldNames": ["Href", "ButtonExtension", "DisplayUrlPath"],
                 }}, **api_v)).get("result", {}).get("Ads") or []
-                todo = [{"Id": a["Id"], "TextAd": {"ButtonExtension": {
-                            "Action": button, "Href": (a.get("TextAd") or {}).get("Href") or href}}}
-                        for a in ads if "TextAd" in a
-                        and ((a["TextAd"].get("ButtonExtension") or {}).get("Action") != button)]
+                todo = []
+                for a in ads:
+                    ta = a.get("TextAd")
+                    if ta is None:
+                        continue
+                    change: dict[str, Any] = {}
+                    cur_btn = ta.get("ButtonExtension") or {}
+                    if button and (cur_btn.get("Action") != button or cur_btn.get("Href") != href):
+                        change["ButtonExtension"] = {"Action": button, "Href": href}
+                    if display_path and ta.get("DisplayUrlPath") != display_path:
+                        change["DisplayUrlPath"] = display_path
+                    if change:
+                        todo.append({"Id": a["Id"], "TextAd": change})
                 if todo:
                     _raise_update_errors(await client.direct_api(
                         login, "ads", {"method": "update", "params": {"Ads": todo}}, **api_v))
@@ -1364,11 +1415,13 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
     parts = []
     if button:
         parts.append(f"кнопка «{BUTTON_ACTIONS[button]}» — объявлений {sum(r['ads_updated'] for r in results)}")
+    if display_path:
+        parts.append(f"отображаемая ссылка «{display_path}»" + ("" if button else f" — объявлений {sum(r['ads_updated'] for r in results)}"))
     if maps_off:
         parts.append(f"Карты выключены — кампаний {sum(1 for r in results if r['maps_off'])}")
     errors = "; ".join(f"{r['account_id']}: {r['error']}" for r in results if r.get("error"))
     db.add_project_event(project_id, "ad_settings", "Настройки объявлений: " + "; ".join(parts), errors[:300])
-    return {"items": results, "button_action": button, "maps_off": maps_off}
+    return {"items": results, "button_action": button, "maps_off": maps_off, "display_url_path": display_path}
 
 
 @app.post("/api/projects/{project_id}/fund-and-start")
@@ -1902,6 +1955,26 @@ async def _download_image_base64(url: str) -> str:
         return base64.b64encode(response.content).decode("ascii")
 
 
+def _sitelink_href(href: str, ad_href: str) -> str:
+    """Быстрая ссылка на тот же сайт получает параметры ссылки запуска (UTM)
+    — 2026-11-12, Dima: «в быстрых ссылках и в кнопке — та же полная ссылка
+    с utm». Путь и якорь быстрой ссылки сохраняются; свои параметры быстрой
+    ссылки перекрывают общие, а utm_content дописывается (…_sl2), чтобы
+    адреса в наборе не совпадали. Шаблоны {campaign_id} и т.п. не кодируем."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    a, h = urlsplit(ad_href or ""), urlsplit(href or "")
+    host = lambda u: (u.hostname or "").lower().removeprefix("www.")
+    if not a.query or not h.hostname or host(a) != host(h):
+        return href
+    pairs = [x.partition("=") for x in a.query.split("&") if x]
+    merged = {k: v for k, _, v in pairs}
+    for k, _, v in (x.partition("=") for x in h.query.split("&") if x):
+        merged[k] = f"{merged[k]}_{v}" if k == "utm_content" and merged.get(k) else v
+    query = "&".join(f"{k}={v}" if v != "" else k for k, v in merged.items())
+    return urlunsplit((h.scheme or a.scheme, h.netloc, h.path, query, h.fragment))
+
+
 def _ad_href(project: dict[str, Any]) -> str:
     """Ссылка объявления — РОВНО та, что вставлена при запуске (2026-11-12,
     Dima: «вставлялась с utm-метками, а в Директе без них»). У Ozon-проекта
@@ -2252,7 +2325,8 @@ async def _run_bulk_job(
                     sitelink_set_id = await client.create_sitelinks_set(
                         client_login,
                         [
-                            {"Title": sl["title"], "Href": sl["href"], **({"Description": sl["description"]} if sl.get("description") else {})}
+                            {"Title": sl["title"], "Href": _sitelink_href(sl["href"], _ad_href(project)),
+                             **({"Description": sl["description"]} if sl.get("description") else {})}
                             for sl in this_sitelinks
                         ],
                     )
@@ -2362,6 +2436,7 @@ async def _run_bulk_job(
                             note = ((note + "; ") if note else "") + "Объявление без картинки: " + img_errors[-1]
 
                     ad_kwargs = dict(
+                        display_url_path=getattr(payload, "display_url_path", None),
                         ad_image_hash=ad_image_hash, sitelink_set_id=sitelink_set_id,
                         ad_extension_ids=ad_extension_ids or None, **({"api_version": "v501"} if is_epk else {}),
                     )

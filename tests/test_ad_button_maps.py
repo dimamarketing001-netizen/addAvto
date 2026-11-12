@@ -106,11 +106,12 @@ def test_apply_ad_settings_to_existing(monkeypatch, tmp_path):
         assert client.post(f"/api/projects/{p['id']}/apply-ad-settings", auth=AUTH, json={}).status_code == 422
         r = client.post(f"/api/projects/{p['id']}/apply-ad-settings", auth=AUTH,
                         json={"button_action": "BUY", "maps_off": True}).json()
-    # проект не ЕПК → Карты не трогаем; кнопку ставим только там, где её нет
-    assert r["maps_off"] is False and r["items"][0]["ads_updated"] == 1
+    # проект не ЕПК → Карты не трогаем; кнопка — со ссылкой запуска проекта
+    href = main_module._ad_href(main_module.db.get_project(p["id"]))
+    assert r["maps_off"] is False and r["items"][0]["ads_updated"] == 2
     upd = [c for c in calls if c[1] == "update"]
     assert len(upd) == 1 and upd[0][3]["Ads"] == [
-        {"Id": 1, "TextAd": {"ButtonExtension": {"Action": "BUY", "Href": "https://a.ru/?u=1"}}}]
+        {"Id": i, "TextAd": {"ButtonExtension": {"Action": "BUY", "Href": href}}} for i in (1, 2)]
 
 
 def test_strategy_for_update_keeps_settings():
@@ -119,3 +120,35 @@ def test_strategy_for_update_keeps_settings():
                           "ExplorationBudget": {"MinimumExplorationBudget": 1}}}
     assert main_module._strategy_for_update(got) == {
         "BiddingStrategyType": "AVERAGE_CRR", "AverageCrr": {"Crr": 30, "GoalId": 5, "BudgetType": "WEEKLY_BUDGET"}}
+
+
+def test_display_url_path_rules():
+    import pytest
+    from app.schemas import check_display_url_path as chk
+    assert chk("") is None and chk(None) is None
+    assert chk("Санта-Клаус/купить") == "Санта-Клаус/купить"
+    assert chk("скидка-50%") == "скидка-50%"
+    assert chk("#" + "а" * 20 + "#") == "#" + "а" * 20 + "#"  # # шаблона не считается
+    for bad in ("а" * 21, "два слова", "a_b", "a--b", "a//b", "цена!"):
+        with pytest.raises(ValueError):
+            chk(bad)
+
+
+def test_ad_gets_display_url_path(monkeypatch):
+    calls = _capture(monkeypatch)
+    c = ClickRUClient(token="t")
+    asyncio.run(c.create_text_ad("porg-1", 1, "З", "Т", "https://x.ru/", display_url_path="santa-klaus"))
+    assert calls[0][2]["params"]["Ads"][0]["TextAd"]["DisplayUrlPath"] == "santa-klaus"
+
+
+def test_sitelink_href_inherits_launch_utm():
+    ad = "https://ozon.ru/product/santa-3160445300?hs=1&utm_campaign=v_{campaign_id}&utm_content={banner_id}_{keyword}&utm_source=yandex_direct"
+    f = main_module._sitelink_href
+    assert f("https://ozon.ru/product/santa-3160445300/reviews/", ad) == (
+        "https://ozon.ru/product/santa-3160445300/reviews/?hs=1&utm_campaign=v_{campaign_id}"
+        "&utm_content={banner_id}_{keyword}&utm_source=yandex_direct")
+    assert f("https://www.ozon.ru/product/santa-3160445300/#section-description", ad).endswith(
+        "utm_source=yandex_direct#section-description")
+    assert "utm_content={banner_id}_{keyword}_sl2&" in f("https://ozon.ru/product/santa-3160445300/?utm_content=sl2", ad)
+    assert f("https://other.ru/x", ad) == "https://other.ru/x"  # чужой сайт не трогаем
+    assert f("https://ozon.ru/x", "https://ozon.ru/p") == "https://ozon.ru/x"  # у запуска нет параметров

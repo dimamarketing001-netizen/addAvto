@@ -494,6 +494,7 @@ class ClickRUClient:
         ad_extension_ids: list[int] | None = None,
         api_version: str = "v5",
         button_action: str | None = None,
+        display_url_path: str | None = None,
     ) -> int:
         """Ads.add for a single TextAd. Title <=56 chars, Text <=81 chars,
         Title2 <=30 chars — Yandex Direct enforces this itself with a clear
@@ -511,6 +512,8 @@ class ClickRUClient:
             text_ad["AdExtensionIds"] = ad_extension_ids
         if button_action:
             text_ad["ButtonExtension"] = {"Action": button_action, "Href": href}
+        if display_url_path:
+            text_ad["DisplayUrlPath"] = display_url_path
 
         body = {
             "method": "add",

@@ -7,6 +7,29 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 CampaignMode = Literal["separate", "single_epk"]
 
+# Отображаемая ссылка (TextAd.DisplayUrlPath), документация Direct API ads.add:
+# не более 20 символов (# шаблона не считается); буквы, цифры, - № / % #;
+# запрещены пробел, _, двойные -- и //.
+DISPLAY_URL_MAX = 20
+_DISPLAY_URL_RE = re.compile(r"^[^\W_]*(?:[-№/%#][^\W_]*)*$")
+
+
+def check_display_url_path(value: str | None) -> str | None:
+    """None/"" → None; иначе проверенная строка или ValueError с причиной."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if len(value.replace("#", "")) > DISPLAY_URL_MAX:
+        raise ValueError(f"Отображаемая ссылка длиннее {DISPLAY_URL_MAX} символов")
+    if " " in value or "_" in value:
+        raise ValueError("В отображаемой ссылке нельзя пробел и _")
+    if "--" in value or "//" in value:
+        raise ValueError("В отображаемой ссылке нельзя -- и //")
+    if not _DISPLAY_URL_RE.match(value):
+        raise ValueError("Отображаемая ссылка: только буквы, цифры и - № / % #")
+    return value
+
+
 # Кнопка объявления (TextAd.ButtonExtension.Action) — только варианты,
 # которые предлагает сам Директ; свой текст (CUSTOM_TEXT) намеренно не
 # поддерживаем. Список получен из ответа Direct API v501 (2026-11-12).
@@ -287,6 +310,13 @@ class BulkCampaignCreateRequest(BaseModel):
     auto_start: bool = False
     # Кнопка во всех объявлениях запуска (ключ BUTTON_ACTIONS); None — без кнопки.
     button_action: str | None = None
+    # Отображаемая ссылка во всех объявлениях запуска; None — Директ покажет домен.
+    display_url_path: str | None = Field(default=None, max_length=60)
+
+    @field_validator("display_url_path")
+    @classmethod
+    def validate_display_url_path(cls, value: str | None) -> str | None:
+        return check_display_url_path(value)
 
     @field_validator("button_action")
     @classmethod
