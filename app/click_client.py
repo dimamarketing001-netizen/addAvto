@@ -164,6 +164,26 @@ class ClickRUClient:
         return rows
 
 
+    async def stat(
+        self, fields: list[str], date_from: date, date_to: date, account_ids: list[int], v2: bool = False,
+    ) -> list[dict[str, Any]]:
+        """GET /stat (показы/клики/расход loss) или /stat/v2 (в т.ч. conversions).
+        CSV → список dict. В v2 нельзя сочетать impressions с conversionName
+        (INVALID_FIELDS, проверено 2026-11-12), а cost там 0 — расход берём из
+        /stat (loss). accountIds — пачками до 100."""
+        rows: list[dict[str, Any]] = []
+        for i in range(0, len(account_ids), 100):
+            response = await self._request("GET", "/stat/v2" if v2 else "/stat", params={
+                "fields": ",".join(fields), "dateFrom": date_from.isoformat(), "dateTo": date_to.isoformat(),
+                "accountIds": ",".join(str(x) for x in account_ids[i:i + 100]), "includeHeaders": "true",
+            })
+            text = response.text.strip()
+            if not text:
+                continue
+            for row in csv.DictReader(io.StringIO(text)):
+                rows.append({str(k).strip(): v for k, v in row.items() if k is not None})
+        return rows
+
     async def payers(self) -> list[dict[str, Any]]:
         """GET /users/payers — legal entities (юрлица) available under this
         Click.ru master account, with their balance. Needed before any real

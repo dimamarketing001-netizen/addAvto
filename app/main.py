@@ -2635,6 +2635,242 @@ async def resume_bulk_job(
     return BulkJobStartOut(job_id=new_id, project_id=project_id, status="running")
 
 
+# ---------- Статусы аккаунтов и дашборд проектов (2026-11-12) ----------
+
+# Click.ru Accounts.Account.state (openapi): ACTIVE | PERMISSION_DENIED | ARCHIVE | BAN | NOT_ACTIVE | DEMO_EXPIRED
+_CLICK_STATE = {
+    "BAN": ("banned", "Аккаунт забанен"),
+    "PERMISSION_DENIED": ("no_access", "Нет доступа к аккаунту"),
+    "ARCHIVE": ("archived", "Аккаунт в архиве"),
+    "NOT_ACTIVE": ("stopped", "Аккаунт не активен"),
+    "DEMO_EXPIRED": ("stopped", "Демо-период истёк"),
+}
+STATUS_ORDER = ["banned", "no_access", "rejected", "partial", "review", "live", "no_money", "paused",
+                "stopped", "draft", "archived", "unknown", "error"]
+
+
+def account_status(click_account: dict[str, Any] | None, campaign: dict[str, Any] | None,
+                   ads: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Итоговый статус аккаунта проекта из Click.ru (бан/доступ) и Директа
+    (Campaign.State/Status/StatusPayment, Ad.Status/State). code — значение
+    для <nv-status> в ЛК."""
+    ads = ads or []
+    counts = {
+        "total": len(ads),
+        "accepted": sum(1 for a in ads if a.get("Status") in ("ACCEPTED", "PREACCEPTED")),
+        "moderation": sum(1 for a in ads if a.get("Status") == "MODERATION"),
+        "rejected": sum(1 for a in ads if a.get("Status") == "REJECTED"),
+        "draft": sum(1 for a in ads if a.get("Status") == "DRAFT"),
+    }
+    out: dict[str, Any] = {"ads": counts, "detail": "", "click_state": (click_account or {}).get("state"),
+                           "campaign_state": (campaign or {}).get("State"), "campaign_status": (campaign or {}).get("Status")}
+
+    def done(code: str, label: str, detail: str = "") -> dict[str, Any]:
+        out.update(code=code, label=label, detail=(detail or "").strip())
+        return out
+
+    st = (click_account or {}).get("state")
+    if st in _CLICK_STATE:
+        return done(*_CLICK_STATE[st])
+    if not campaign:
+        return done("unknown", "Кампания не найдена")
+    clar = campaign.get("StatusClarification") or ""
+    rej = next((a.get("StatusClarification") for a in ads if a.get("Status") == "REJECTED" and a.get("StatusClarification")), "")
+    cstate, cstatus = campaign.get("State"), campaign.get("Status")
+    if cstate == "ARCHIVED":
+        return done("archived", "Кампания в архиве", clar)
+    if cstate == "ENDED":
+        return done("stopped", "Кампания завершена", clar)
+    if cstatus == "REJECTED" or (counts["total"] and counts["rejected"] == counts["total"]):
+        return done("rejected", "Отклонена модерацией", rej or clar)
+    if cstatus == "DRAFT" or (counts["total"] and counts["draft"] == counts["total"]):
+        return done("draft", "Черновик — не отправлена на модерацию", clar)
+    if not counts["accepted"] and (cstatus == "MODERATION" or counts["moderation"]):
+        return done("review", "На модерации", clar)
+    if cstate == "SUSPENDED":
+        return done("paused", "Остановлена", clar)
+    if campaign.get("StatusPayment") == "DISALLOWED" and cstate != "ON":
+        return done("no_money", "Нет средств — показы не идут", clar)
+    if cstate == "ON" and counts["accepted"]:
+        if counts["rejected"] or counts["moderation"]:
+            return done("partial", f"Частично запущено: принято {counts['accepted']} из {counts['total']}",
+                        "; ".join(x for x in (rej, clar) if x))
+        return done("live", "Идут показы", clar)
+    return done("stopped", "Показы не идут", clar)
+
+
+_STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
+STATUS_CACHE_SECONDS = 120
+
+
+async def _account_status_live(row: dict[str, Any]) -> dict[str, Any]:
+    account_id = int(row["account_id"])
+    cached = _STATUS_CACHE.get(account_id)
+    if cached and _time.time() - cached[0] < STATUS_CACHE_SECONDS:
+        return cached[1]
+    client = _resolve_clickru_client(row.get("connection_id"))
+    click_acc: dict[str, Any] | None = None
+    try:
+        click_acc = await client.account(account_id)
+    except (ClickRUError, httpx.HTTPError):
+        click_acc = None
+    try:
+        if (click_acc or {}).get("state") in _CLICK_STATE:
+            res = account_status(click_acc, None, None)
+        else:
+            login = (click_acc or {}).get("serviceLogin") or await _resolve_client_login(client, account_id)
+            cid = row.get("campaign_id")
+            camps = (await client.direct_api(login, "campaigns", {"method": "get", "params": {
+                "SelectionCriteria": {"Ids": [int(cid)]},
+                "FieldNames": ["Id", "Status", "State", "StatusClarification", "StatusPayment"]}})
+            ).get("result", {}).get("Campaigns", []) if cid else []
+            ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
+                "SelectionCriteria": {"CampaignIds": [int(cid)]},
+                "FieldNames": ["Id", "Status", "State", "StatusClarification"]}})
+            ).get("result", {}).get("Ads", []) if cid else []
+            res = account_status(click_acc, camps[0] if camps else None, ads)
+    except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+        msg = str(getattr(exc, "detail", None) or exc)
+        res = {"code": "error", "label": "Не удалось проверить", "detail": msg[:200], "ads": {}}
+    res = {**res, "checked_at": datetime.now(timezone.utc).isoformat()}
+    _STATUS_CACHE[account_id] = (_time.time(), res)
+    return res
+
+
+async def _statuses_for(rows: list[dict[str, Any]], refresh: bool = False) -> dict[int, dict[str, Any]]:
+    if refresh:
+        for r in rows:
+            _STATUS_CACHE.pop(int(r["account_id"]), None)
+    sem = asyncio.Semaphore(4)
+
+    async def one(r: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        async with sem:
+            return int(r["account_id"]), await _account_status_live(r)
+
+    return dict(await asyncio.gather(*(one(r) for r in rows if r.get("account_id"))))
+
+
+@app.get("/api/projects/{project_id}/statuses")
+async def project_statuses(project_id: int, _: AuthUser, refresh: bool = Query(default=False)):
+    """Статус каждого аккаунта проекта: бан/доступ (Click.ru) и модерация/показы
+    (Директ). Кэш 2 минуты, refresh=true — заново."""
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    rows = db.list_bulk_campaigns(project_id)
+    st = await _statuses_for(rows, refresh)
+    return {"items": [{"account_id": r.get("account_id"), "campaign_id": r.get("campaign_id"),
+                       **st.get(int(r["account_id"]), {})} for r in rows if r.get("account_id")]}
+
+
+def _num(v: Any) -> float:
+    try:
+        return float(str(v).replace(",", ".").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+@app.get("/api/ads-dashboard")
+async def ads_dashboard(
+    _: AuthUser,
+    date_from: date = Query(),
+    date_to: date = Query(),
+    project_ids: str | None = Query(default=None),
+    threshold: int = Query(default=10, ge=0, le=1_000_000),
+    with_status: bool = Query(default=True),
+    refresh: bool = Query(default=False),
+):
+    """Дашборд по проектам: аккаунты кампаний выбранных проектов (по умолчанию
+    всех), их показы/клики/расход (Click.ru /stat) и лиды (/stat/v2
+    conversions — конверсии по целям стратегии, у нас это цель lead), статусы.
+    Сводка: сколько аккаунтов набрали больше threshold показов/кликов/лидов."""
+    if date_to < date_from:
+        raise HTTPException(status_code=422, detail="Дата окончания раньше даты начала")
+    if (date_to - date_from).days > 366:
+        raise HTTPException(status_code=422, detail="Максимальный диапазон — 366 дней")
+    projects = {p["id"]: p for p in db.list_projects()} if hasattr(db, "list_projects") else {}
+    wanted: set[int] | None = None
+    if project_ids and project_ids.strip():
+        try:
+            wanted = {int(x) for x in project_ids.split(",") if x.strip()}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="project_ids — числа через запятую") from exc
+    rows: list[dict[str, Any]] = []
+    for pid, proj in projects.items():
+        if wanted is not None and pid not in wanted:
+            continue
+        for r in db.list_bulk_campaigns(pid):
+            if r.get("account_id"):
+                rows.append({**r, "project_id": pid, "project_name": proj.get("name")})
+    days = [(date_from + timedelta(days=i)).isoformat() for i in range((date_to - date_from).days + 1)]
+    per: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        per[int(r["account_id"])] = {
+            "account_id": int(r["account_id"]), "campaign_id": r.get("campaign_id"), "pool_login": r.get("pool_login"),
+            "project_id": r["project_id"], "project_name": r.get("project_name"), "created_at": r.get("created_at"),
+            "impressions": 0, "clicks": 0, "spend": 0.0, "leads": 0,
+            "daily": {d: {"impressions": 0, "clicks": 0, "spend": 0.0, "leads": 0} for d in days},
+        }
+    errors: list[str] = []
+    by_conn: dict[Any, list[int]] = {}
+    for r in rows:
+        by_conn.setdefault(r.get("connection_id"), []).append(int(r["account_id"]))
+    for conn_id, ids in by_conn.items():
+        client = _resolve_clickru_client(conn_id)
+        try:
+            base = await client.stat(["accountId", "date", "impressions", "clicks", "loss"], date_from, date_to, ids)
+            conv = await client.stat(["accountId", "date", "conversions"], date_from, date_to, ids, v2=True)
+        except (ClickRUError, httpx.HTTPError) as exc:
+            errors.append(f"подключение {conn_id}: {str(exc)[:200]}")
+            continue
+        for row, kind in [(x, "base") for x in base] + [(x, "conv") for x in conv]:
+            acc = per.get(int(_num(row.get("accountId"))))
+            if acc is None:
+                continue
+            day = acc["daily"].get(str(row.get("date") or "")[:10])
+            vals = ({"impressions": int(_num(row.get("impressions"))), "clicks": int(_num(row.get("clicks"))),
+                     "spend": _num(row.get("loss"))} if kind == "base" else {"leads": int(_num(row.get("conversions")))})
+            for k, v in vals.items():
+                acc[k] += v
+                if day is not None:
+                    day[k] += v
+    statuses = await _statuses_for(rows, refresh) if with_status and rows else {}
+    items = []
+    for acc in per.values():
+        acc["spend"] = round(acc["spend"], 2)
+        acc["ctr"] = round(acc["clicks"] / acc["impressions"] * 100, 2) if acc["impressions"] else None
+        acc["cpc"] = round(acc["spend"] / acc["clicks"], 2) if acc["clicks"] else None
+        acc["cpl"] = round(acc["spend"] / acc["leads"], 2) if acc["leads"] else None
+        acc["series"] = {k: [acc["daily"][d][k] for d in days] for k in ("impressions", "clicks", "leads")}
+        acc["series"]["spend"] = [round(acc["daily"][d]["spend"], 2) for d in days]
+        del acc["daily"]
+        acc["status"] = statuses.get(acc["account_id"])
+        items.append(acc)
+    items.sort(key=lambda a: (-a["spend"], -a["clicks"], -a["impressions"]))
+    tot = {k: sum(a[k] for a in items) for k in ("impressions", "clicks", "leads")}
+    tot["spend"] = round(sum(a["spend"] for a in items), 2)
+    tot["ctr"] = round(tot["clicks"] / tot["impressions"] * 100, 2) if tot["impressions"] else None
+    tot["cpc"] = round(tot["spend"] / tot["clicks"], 2) if tot["clicks"] else None
+    tot["cpl"] = round(tot["spend"] / tot["leads"], 2) if tot["leads"] else None
+    by_status: dict[str, int] = {}
+    for a in items:
+        code = (a.get("status") or {}).get("code")
+        if code:
+            by_status[code] = by_status.get(code, 0) + 1
+    summary = {
+        "accounts": len(items), "threshold": threshold,
+        "with_impressions": sum(1 for a in items if a["impressions"] > threshold),
+        "with_clicks": sum(1 for a in items if a["clicks"] > threshold),
+        "with_leads": sum(1 for a in items if a["leads"] > threshold),
+        "with_any_impressions": sum(1 for a in items if a["impressions"] > 0),
+        "by_status": dict(sorted(by_status.items(), key=lambda kv: STATUS_ORDER.index(kv[0]) if kv[0] in STATUS_ORDER else 99)),
+    }
+    daily = {"labels": days, **{k: [sum(a["series"][k][i] for a in items) for i in range(len(days))]
+                                for k in ("impressions", "clicks", "leads", "spend")}}
+    daily["spend"] = [round(v, 2) for v in daily["spend"]]
+    return {"summary": summary, "totals": tot, "daily": daily, "items": items, "errors": errors,
+            "projects": [{"id": pid, "name": p.get("name")} for pid, p in projects.items()]}
+
+
 @app.get("/api/report")
 async def get_report(
     _: AuthUser,
