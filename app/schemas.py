@@ -37,7 +37,7 @@ BUTTON_ACTIONS: dict[str, str] = {
     "MORE": "Подробнее", "GO_TO_WEBSITE": "Перейти на сайт", "BUY": "Купить", "ORDER": "Заказать",
     "VIEW_PRODUCT": "Посмотреть товар", "VIEW_CATALOG": "Смотреть каталог", "CHOOSE": "Выбрать",
     "GET_PRICE": "Узнать цену", "GET_DISCOUNT": "Получить скидку", "GET_OFFER": "Получить предложение",
-    "GET_CONSULTATION": "Получить консультацию", "APPLY": "Оставить заявку", "REQUEST_CALLBACK": "Заказать звонок",
+    "GET_CONSULTATION": "Получить консультацию", "APPLY": "Подать заявку", "REQUEST_CALLBACK": "Заказать звонок",
     "CALL_SPECIALIST": "Вызвать специалиста", "SIGN_UP": "Записаться", "SIGN_UP_ONLINE": "Записаться онлайн",
     "BOOK": "Забронировать", "REGISTER": "Зарегистрироваться", "SUBSCRIBE": "Подписаться", "TRY": "Попробовать",
     "START": "Начать", "WATCH": "Смотреть", "LISTEN": "Слушать", "PLAY": "Играть", "TURN_ON": "Включить",
