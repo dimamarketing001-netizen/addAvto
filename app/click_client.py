@@ -390,6 +390,9 @@ class ClickRUClient:
                                 "Search": {
                                     "BiddingStrategyType": "AVERAGE_CRR",
                                     "AverageCrr": {"Crr": round(target_drr), "GoalId": goal_id},
+                                    # Яндекс Карты не нужны (Dima, 2026-11-12); остальные
+                                    # площадки поиска — по умолчанию Директа.
+                                    "PlacementTypes": {"Maps": "NO"},
                                 },
                                 # В ЕПК у NETWORK_DEFAULT нет объекта NetworkDefault
                                 # (v501: «unknown parameter …Network.NetworkDefault», 2026-11-11).
@@ -490,6 +493,7 @@ class ClickRUClient:
         sitelink_set_id: int | None = None,
         ad_extension_ids: list[int] | None = None,
         api_version: str = "v5",
+        button_action: str | None = None,
     ) -> int:
         """Ads.add for a single TextAd. Title <=56 chars, Text <=81 chars,
         Title2 <=30 chars — Yandex Direct enforces this itself with a clear
@@ -505,6 +509,8 @@ class ClickRUClient:
             text_ad["SitelinkSetId"] = sitelink_set_id
         if ad_extension_ids:
             text_ad["AdExtensionIds"] = ad_extension_ids
+        if button_action:
+            text_ad["ButtonExtension"] = {"Action": button_action, "Href": href}
 
         body = {
             "method": "add",

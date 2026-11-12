@@ -6,6 +6,22 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 CampaignMode = Literal["separate", "single_epk"]
+
+# Кнопка объявления (TextAd.ButtonExtension.Action) — только варианты,
+# которые предлагает сам Директ; свой текст (CUSTOM_TEXT) намеренно не
+# поддерживаем. Список получен из ответа Direct API v501 (2026-11-12).
+BUTTON_ACTIONS: dict[str, str] = {
+    "MORE": "Подробнее", "GO_TO_WEBSITE": "Перейти на сайт", "BUY": "Купить", "ORDER": "Заказать",
+    "VIEW_PRODUCT": "Посмотреть товар", "VIEW_CATALOG": "Смотреть каталог", "CHOOSE": "Выбрать",
+    "GET_PRICE": "Узнать цену", "GET_DISCOUNT": "Получить скидку", "GET_OFFER": "Получить предложение",
+    "GET_CONSULTATION": "Получить консультацию", "APPLY": "Оставить заявку", "REQUEST_CALLBACK": "Заказать звонок",
+    "CALL_SPECIALIST": "Вызвать специалиста", "SIGN_UP": "Записаться", "SIGN_UP_ONLINE": "Записаться онлайн",
+    "BOOK": "Забронировать", "REGISTER": "Зарегистрироваться", "SUBSCRIBE": "Подписаться", "TRY": "Попробовать",
+    "START": "Начать", "WATCH": "Смотреть", "LISTEN": "Слушать", "PLAY": "Играть", "TURN_ON": "Включить",
+    "READ_POST": "Читать пост", "WRITE_WHATSAPP": "Написать в WhatsApp", "WRITE_TELEGRAM": "Написать в Telegram",
+    "GO_TO_CHANNEL": "Перейти в канал", "GO_TO_BOT": "Перейти в бот", "INSTALL": "Установить",
+    "DOWNLOAD": "Скачать", "OPEN_APP": "Открыть приложение", "ARROW": "Стрелка →",
+}
 StrategyType = Literal["AVERAGE_CRR", "PAY_FOR_CONVERSION_CRR"]
 LaunchMode = Literal["direct", "ozon"]
 
@@ -269,6 +285,17 @@ class BulkCampaignCreateRequest(BaseModel):
     # запустить: модерация объявлений + включение. Это РЕАЛЬНЫЕ деньги.
     topup_amount_rub: float | None = Field(default=None, ge=0, le=100000)
     auto_start: bool = False
+    # Кнопка во всех объявлениях запуска (ключ BUTTON_ACTIONS); None — без кнопки.
+    button_action: str | None = None
+
+    @field_validator("button_action")
+    @classmethod
+    def validate_button_action(cls, value: str | None) -> str | None:
+        if value in (None, ""):
+            return None
+        if value not in BUTTON_ACTIONS:
+            raise ValueError("Неизвестная кнопка — выберите из списка Директа")
+        return value
 
     @field_validator("creative_sets")
     @classmethod

@@ -26,6 +26,7 @@ from .metrika_client import MetrikaAPIError, YandexMetrikaClient
 from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozon_sitelinks, process_ozon_url
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from .schemas import (
+    BUTTON_ACTIONS,
     BulkCampaignCreateRequest,
     BulkCampaignItemResult,
     BulkJobOut,
@@ -1282,6 +1283,76 @@ async def sync_project_href(project_id: int, _: AuthUser):
     return {"href": href, "items": results, "updated": total}
 
 
+@app.get("/api/direct/button-actions")
+async def direct_button_actions(_: AuthUser):
+    """Кнопки объявлений, которые предлагает Директ (без своего текста)."""
+    return {"items": [{"value": k, "label": v} for k, v in BUTTON_ACTIONS.items()]}
+
+
+def _raise_update_errors(data: dict[str, Any]) -> None:
+    errs = [e for r in (data.get("result") or {}).get("UpdateResults") or [] for e in r.get("Errors") or []]
+    if errs:
+        raise ClickRUError("; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in errs[:3]))
+
+
+@app.post("/api/projects/{project_id}/apply-ad-settings")
+async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUser):
+    """Применить к УЖЕ созданным кампаниям проекта:
+      button_action — кнопку во всех объявлениях (пусто — не трогать);
+      maps_off — выключить Яндекс Карты в площадках поиска (только ЕПК).
+    Изменение объявления Директ отправит на перемодерацию."""
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    button = payload.get("button_action") or None
+    if button is not None and button not in BUTTON_ACTIONS:
+        raise HTTPException(status_code=422, detail="Неизвестная кнопка — выберите из списка Директа")
+    is_epk = project.get("campaign_mode") == "single_epk"
+    maps_off = bool(payload.get("maps_off")) and is_epk
+    if not button and not maps_off:
+        raise HTTPException(status_code=422, detail="Нечего применять: выберите кнопку и/или выключение Карт (только ЕПК)")
+    api_v = {"api_version": "v501"} if is_epk else {}
+    href = _ad_href(project)
+    results = []
+    for row in db.list_bulk_campaigns(project_id):
+        res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id"),
+                               "ads_updated": 0, "maps_off": False}
+        try:
+            client = _resolve_clickru_client(row.get("connection_id"))
+            login = await _resolve_client_login(client, int(row["account_id"]))
+            cid = int(row["campaign_id"])
+            if maps_off:
+                data = await client.direct_api(login, "campaigns", {"method": "update", "params": {"Campaigns": [{
+                    "Id": cid, "UnifiedCampaign": {"BiddingStrategy": {"Search": {"PlacementTypes": {"Maps": "NO"}}}},
+                }]}}, **api_v)
+                _raise_update_errors(data)
+                res["maps_off"] = True
+            if button:
+                ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
+                    "SelectionCriteria": {"CampaignIds": [cid]}, "FieldNames": ["Id"],
+                    "TextAdFieldNames": ["Href", "ButtonExtension"],
+                }}, **api_v)).get("result", {}).get("Ads") or []
+                todo = [{"Id": a["Id"], "TextAd": {"ButtonExtension": {
+                            "Action": button, "Href": (a.get("TextAd") or {}).get("Href") or href}}}
+                        for a in ads if "TextAd" in a
+                        and ((a["TextAd"].get("ButtonExtension") or {}).get("Action") != button)]
+                if todo:
+                    _raise_update_errors(await client.direct_api(
+                        login, "ads", {"method": "update", "params": {"Ads": todo}}, **api_v))
+                res["ads_updated"] = len(todo)
+        except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+            res["error"] = str(getattr(exc, "detail", None) or exc)[:300]
+        results.append(res)
+    parts = []
+    if button:
+        parts.append(f"кнопка «{BUTTON_ACTIONS[button]}» — объявлений {sum(r['ads_updated'] for r in results)}")
+    if maps_off:
+        parts.append(f"Карты выключены — кампаний {sum(1 for r in results if r['maps_off'])}")
+    errors = "; ".join(f"{r['account_id']}: {r['error']}" for r in results if r.get("error"))
+    db.add_project_event(project_id, "ad_settings", "Настройки объявлений: " + "; ".join(parts), errors[:300])
+    return {"items": results, "button_action": button, "maps_off": maps_off}
+
+
 @app.post("/api/projects/{project_id}/fund-and-start")
 async def fund_and_start_project(project_id: int, payload: dict[str, Any], _: AuthUser):
     """Пополнить и/или запустить уже созданные кампании проекта.
@@ -2272,17 +2343,20 @@ async def _run_bulk_job(
                         if ad_image_hash is None and img_errors:
                             note = ((note + "; ") if note else "") + "Объявление без картинки: " + img_errors[-1]
 
-                    await client.create_text_ad(
-                        client_login,
-                        ad_group_id,
-                        headline,
-                        ad_text,
-                        _ad_href(project),
-                        ad_image_hash=ad_image_hash,
-                        sitelink_set_id=sitelink_set_id,
-                        ad_extension_ids=ad_extension_ids or None,
-                        **({"api_version": "v501"} if is_epk else {}),
+                    ad_kwargs = dict(
+                        ad_image_hash=ad_image_hash, sitelink_set_id=sitelink_set_id,
+                        ad_extension_ids=ad_extension_ids or None, **({"api_version": "v501"} if is_epk else {}),
                     )
+                    button = getattr(payload, "button_action", None)
+                    try:
+                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, _ad_href(project),
+                                                    button_action=button, **ad_kwargs)
+                    except ClickRUError as btn_exc:
+                        if not button:
+                            raise
+                        # кнопку Директ может не принять — объявление важнее
+                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, _ad_href(project), **ad_kwargs)
+                        note = ((note + "; ") if note else "") + f"Объявление без кнопки: {str(btn_exc)[:150]}"
                     ads_created += 1
                     if ad_index == 0:
                         first_headline, first_ad_text, first_image_used = headline, ad_text, ad_image_hash is not None
