@@ -1077,6 +1077,85 @@ async def list_parsya_pool_accounts(_: AuthUser):
     return {"configured": True, "items": items}
 
 
+def _pool_usage() -> dict[str, list[dict[str, Any]]]:
+    """Где пуловый логин реально используется в рекламе — по кампаниям addAvto
+    (флаг is_free в пуле ParsYa не ведётся: у всех 1, проверено 2026-11-12)."""
+    usage: dict[str, list[dict[str, Any]]] = {}
+    for proj in db.list_projects():
+        for r in db.list_bulk_campaigns(proj["id"]):
+            if r.get("pool_login"):
+                usage.setdefault(r["pool_login"], []).append({
+                    "project_id": proj["id"], "project_name": proj.get("name"), "account_id": r.get("account_id"),
+                    "campaign_id": r.get("campaign_id"), "created_at": r.get("created_at")})
+    return usage
+
+
+@app.get("/api/parsya-pool/dashboard")
+async def parsya_pool_dashboard(_: AuthUser, days: int = Query(default=30, ge=7, le=365)):
+    """Дашборд пула ParsYa (2026-11-12): всего/занято/свободно/проблемные,
+    токены Метрики, добавлено и задействовано по дням, детализация по
+    каждому аккаунту — где он используется в рекламе."""
+    pool = ParsYaPoolClient()
+    if not pool.configured:
+        return {"configured": False, "items": [], "summary": {}, "daily": {"labels": []}}
+    try:
+        items = await pool.list_accounts()
+    except ParsYaPoolError as exc:
+        status_code = exc.status_code if exc.status_code and exc.status_code < 500 else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    usage = _pool_usage()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    today = now.date()
+    labels = [(today - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
+    added = dict.fromkeys(labels, 0)
+    used_daily = dict.fromkeys(labels, 0)
+
+    def _dt(v: Any) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(tzinfo=None) if v else None
+        except ValueError:
+            return None
+
+    out = []
+    for a in items:
+        login = a.get("login")
+        uses = usage.get(login, [])
+        exp = _dt(a.get("metrika_token_expires_at"))
+        state = ("problem" if a.get("status") != "active" else "used" if uses else "free")
+        row = {**a, "uses": uses, "used": bool(uses), "state": state,
+               "token_days_left": (exp - now).days if exp else None,
+               "first_used_at": min((u.get("created_at") or "" for u in uses), default=None) or None}
+        out.append(row)
+        c = _dt(a.get("created_at"))
+        if c and c.date().isoformat() in added:
+            added[c.date().isoformat()] += 1
+        f = _dt(row["first_used_at"])
+        if f and f.date().isoformat() in used_daily:
+            used_daily[f.date().isoformat()] += 1
+    total = len(out)
+    by_status: dict[str, int] = {}
+    for a in out:
+        by_status[a.get("status") or "unknown"] = by_status.get(a.get("status") or "unknown", 0) + 1
+    week_ago, day_ago = now - timedelta(days=7), now - timedelta(days=1)
+    summary = {
+        "total": total,
+        "active": sum(1 for a in out if a.get("status") == "active"),
+        "used": sum(1 for a in out if a["used"]),
+        "free": sum(1 for a in out if a["state"] == "free"),
+        "problem": sum(1 for a in out if a["state"] == "problem"),
+        "with_metrika": sum(1 for a in out if a.get("has_metrika_token")),
+        "token_expiring_30d": sum(1 for a in out if a["token_days_left"] is not None and a["token_days_left"] < 30),
+        "added_today": sum(1 for a in out if (_dt(a.get("created_at")) or datetime.min) >= day_ago),
+        "added_7d": sum(1 for a in out if (_dt(a.get("created_at")) or datetime.min) >= week_ago),
+        "campaigns": sum(len(a["uses"]) for a in out),
+        "by_status": by_status,
+        "avg_added_per_day": round(sum(added.values()) / days, 1),
+    }
+    out.sort(key=lambda a: a.get("created_at") or "", reverse=True)
+    return {"configured": True, "summary": summary, "items": out,
+            "daily": {"labels": labels, "added": [added[d] for d in labels], "used": [used_daily[d] for d in labels]}}
+
+
 @app.get("/api/projects")
 async def get_projects(_: AuthUser):
     items = db.list_projects()
