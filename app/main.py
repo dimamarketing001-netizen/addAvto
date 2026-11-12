@@ -1289,6 +1289,13 @@ async def direct_button_actions(_: AuthUser):
     return {"items": [{"value": k, "label": v} for k, v in BUTTON_ACTIONS.items()]}
 
 
+def _strategy_for_update(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _strategy_for_update(v) for k, v in obj.items()
+                if v is not None and k not in ("ExplorationBudget", "PlacementTypes")}
+    return obj
+
+
 def _raise_update_errors(data: dict[str, Any]) -> None:
     errs = [e for r in (data.get("result") or {}).get("UpdateResults") or [] for e in r.get("Errors") or []]
     if errs:
@@ -1322,8 +1329,19 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
             login = await _resolve_client_login(client, int(row["account_id"]))
             cid = int(row["campaign_id"])
             if maps_off:
+                # Директ требует в update всю стратегию поиска (тип + настройки):
+                # берём текущую, убираем null и read-only ExplorationBudget.
+                got = await client.direct_api(login, "campaigns", {"method": "get", "params": {
+                    "SelectionCriteria": {"Ids": [cid]}, "FieldNames": ["Id"],
+                    "UnifiedCampaignFieldNames": ["BiddingStrategy"]}}, **api_v)
+                camps = (got.get("result") or {}).get("Campaigns") or []
+                search = _strategy_for_update(
+                    ((camps[0].get("UnifiedCampaign") or {}).get("BiddingStrategy") or {}).get("Search") if camps else None)
+                if not search:
+                    raise ClickRUError("не удалось прочитать стратегию поиска кампании")
+                search["PlacementTypes"] = {"Maps": "NO"}
                 data = await client.direct_api(login, "campaigns", {"method": "update", "params": {"Campaigns": [{
-                    "Id": cid, "UnifiedCampaign": {"BiddingStrategy": {"Search": {"PlacementTypes": {"Maps": "NO"}}}},
+                    "Id": cid, "UnifiedCampaign": {"BiddingStrategy": {"Search": search}},
                 }]}}, **api_v)
                 _raise_update_errors(data)
                 res["maps_off"] = True

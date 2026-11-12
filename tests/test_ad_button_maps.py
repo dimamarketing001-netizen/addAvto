@@ -111,3 +111,11 @@ def test_apply_ad_settings_to_existing(monkeypatch, tmp_path):
     upd = [c for c in calls if c[1] == "update"]
     assert len(upd) == 1 and upd[0][3]["Ads"] == [
         {"Id": 1, "TextAd": {"ButtonExtension": {"Action": "BUY", "Href": "https://a.ru/?u=1"}}}]
+
+
+def test_strategy_for_update_keeps_settings():
+    got = {"BiddingStrategyType": "AVERAGE_CRR", "PlacementTypes": {"Maps": "YES"},
+           "AverageCrr": {"Crr": 30, "GoalId": 5, "WeeklySpendLimit": None, "BudgetType": "WEEKLY_BUDGET",
+                          "ExplorationBudget": {"MinimumExplorationBudget": 1}}}
+    assert main_module._strategy_for_update(got) == {
+        "BiddingStrategyType": "AVERAGE_CRR", "AverageCrr": {"Crr": 30, "GoalId": 5, "BudgetType": "WEEKLY_BUDGET"}}
