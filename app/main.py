@@ -1247,6 +1247,41 @@ async def open_account_direct(project_id: int, account_id: int, _: AuthUser):
     return {**result, "org_login": org_login}
 
 
+@app.post("/api/projects/{project_id}/sync-href")
+async def sync_project_href(project_id: int, _: AuthUser):
+    """Проставить в уже созданных объявлениях проекта полную ссылку запуска
+    (с UTM). Объявления, где ссылка уже такая, не трогает. Изменение ссылки
+    у промодерированного объявления Директ отправит на перемодерацию."""
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    href = _ad_href(project)
+    api_v = {"api_version": "v501"} if project.get("campaign_mode") == "single_epk" else {}
+    results = []
+    for row in db.list_bulk_campaigns(project_id):
+        res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id"), "updated": 0}
+        try:
+            client = _resolve_clickru_client(row.get("connection_id"))
+            login = await _resolve_client_login(client, int(row["account_id"]))
+            ads = (await client.direct_api(login, "ads", {"method": "get", "params": {
+                "SelectionCriteria": {"CampaignIds": [int(row["campaign_id"])]},
+                "FieldNames": ["Id"], "TextAdFieldNames": ["Href"],
+            }}, **api_v)).get("result", {}).get("Ads") or []
+            todo = [{"Id": a["Id"], "TextAd": {"Href": href}} for a in ads if (a.get("TextAd") or {}).get("Href") != href]
+            if todo:
+                data = await client.direct_api(login, "ads", {"method": "update", "params": {"Ads": todo}}, **api_v)
+                errs = [e for r in (data.get("result") or {}).get("UpdateResults") or [] for e in r.get("Errors") or []]
+                if errs:
+                    raise ClickRUError("; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in errs[:3]))
+            res["updated"] = len(todo)
+        except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+            res["error"] = str(getattr(exc, "detail", None) or exc)[:300]
+        results.append(res)
+    total = sum(r["updated"] for r in results)
+    db.add_project_event(project_id, "href_sync", f"Ссылка объявлений обновлена: {total}", href[:300])
+    return {"href": href, "items": results, "updated": total}
+
+
 @app.post("/api/projects/{project_id}/fund-and-start")
 async def fund_and_start_project(project_id: int, payload: dict[str, Any], _: AuthUser):
     """Пополнить и/или запустить уже созданные кампании проекта.
@@ -1778,6 +1813,17 @@ async def _download_image_base64(url: str) -> str:
         return base64.b64encode(response.content).decode("ascii")
 
 
+def _ad_href(project: dict[str, Any]) -> str:
+    """Ссылка объявления — РОВНО та, что вставлена при запуске (2026-11-12,
+    Dima: «вставлялась с utm-метками, а в Директе без них»). У Ozon-проекта
+    domain — очищенный адрес товара (для счётчика Метрики), а полная ссылка с
+    UTM и макросами Директа ({campaign_id}, {banner_id}…) — в ozon_url."""
+    if project.get("launch_mode") == "ozon" and (project.get("ozon_url") or "").strip():
+        url = project["ozon_url"].strip()
+        return url if url.startswith(("http://", "https://")) else "https://" + url
+    return project["domain"]
+
+
 TOPUP_STATUS_WAIT_SECONDS = 60
 
 
@@ -2198,7 +2244,7 @@ async def _run_bulk_job(
                         ad_group_id,
                         headline,
                         ad_text,
-                        project["domain"],
+                        _ad_href(project),
                         ad_image_hash=ad_image_hash,
                         sitelink_set_id=sitelink_set_id,
                         ad_extension_ids=ad_extension_ids or None,
