@@ -2887,10 +2887,10 @@ _STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
 STATUS_CACHE_SECONDS = 120
 
 
-async def _account_status_live(row: dict[str, Any]) -> dict[str, Any]:
+async def _account_status_live(row: dict[str, Any], force: bool = False) -> dict[str, Any]:
     account_id = int(row["account_id"])
     cached = _STATUS_CACHE.get(account_id)
-    if cached and _time.time() - cached[0] < STATUS_CACHE_SECONDS:
+    if not force and cached and _time.time() - cached[0] < STATUS_CACHE_SECONDS:
         return cached[1]
     client = _resolve_clickru_client(row.get("connection_id"))
     click_acc: dict[str, Any] | None = None
@@ -2921,17 +2921,41 @@ async def _account_status_live(row: dict[str, Any]) -> dict[str, Any]:
     return res
 
 
-async def _statuses_for(rows: list[dict[str, Any]], refresh: bool = False) -> dict[int, dict[str, Any]]:
-    if refresh:
-        for r in rows:
-            _STATUS_CACHE.pop(int(r["account_id"]), None)
+# Бюджет времени на статусы в одном ответе (2026-11-13: при 429 Click.ru
+# повторы растягивали отчёт до 104 с — ЛК висел на «Обновляю…», прокси и
+# nginx рвут на 115/120 с). Не успевшие аккаунты отдаём из старого кэша или
+# «статус обновляется»; их запросы доезжают в фоне и заполняют кэш.
+STATUS_BUDGET_SECONDS = float(os.getenv("STATUS_BUDGET_SECONDS", "20"))
+_STATUS_BG: set[asyncio.Task] = set()
+
+
+async def _statuses_for(rows: list[dict[str, Any]], refresh: bool = False,
+                        budget: float | None = None) -> dict[int, dict[str, Any]]:
     sem = asyncio.Semaphore(4)
 
     async def one(r: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         async with sem:
-            return int(r["account_id"]), await _account_status_live(r)
+            return int(r["account_id"]), await _account_status_live(r, force=refresh)
 
-    return dict(await asyncio.gather(*(one(r) for r in rows if r.get("account_id"))))
+    tasks = {int(r["account_id"]): asyncio.ensure_future(one(r)) for r in rows if r.get("account_id")}
+    if not tasks:
+        return {}
+    done, pending = await asyncio.wait(tasks.values(), timeout=budget if budget is not None else STATUS_BUDGET_SECONDS)
+    out: dict[int, dict[str, Any]] = {}
+    for acc_id, task in tasks.items():
+        if task in done and not task.cancelled() and task.exception() is None:
+            out[acc_id] = task.result()[1]
+            continue
+        if task in pending:
+            _STATUS_BG.add(task)
+            task.add_done_callback(_STATUS_BG.discard)
+        cached = _STATUS_CACHE.get(acc_id)
+        if cached:
+            out[acc_id] = {**cached[1], "stale": True}
+        else:
+            out[acc_id] = {"code": "unknown", "label": "Статус обновляется",
+                           "detail": "Click.ru/Директ не ответили вовремя — нажмите «Обновить» через минуту", "ads": {}}
+    return out
 
 
 @app.get("/api/projects/{project_id}/statuses")
@@ -3007,8 +3031,13 @@ async def ads_dashboard(
     for conn_id, ids in by_conn.items():
         client = _resolve_clickru_client(conn_id)
         try:
-            base = await client.stat(["accountId", "date", "impressions", "clicks", "loss"], date_from, date_to, ids)
-            conv = await client.stat(["accountId", "date", "conversions"], date_from, date_to, ids, v2=True)
+            base = await asyncio.wait_for(
+                client.stat(["accountId", "date", "impressions", "clicks", "loss"], date_from, date_to, ids), 40)
+            conv = await asyncio.wait_for(
+                client.stat(["accountId", "date", "conversions"], date_from, date_to, ids, v2=True), 30)
+        except asyncio.TimeoutError:
+            errors.append(f"подключение {conn_id}: Click.ru не ответил вовремя (лимит запросов?) — обновите позже")
+            continue
         except (ClickRUError, httpx.HTTPError) as exc:
             errors.append(f"подключение {conn_id}: {str(exc)[:200]}")
             continue
