@@ -2902,8 +2902,9 @@ def _num(v: Any) -> float:
 @app.get("/api/ads-dashboard")
 async def ads_dashboard(
     _: AuthUser,
-    date_from: date = Query(),
-    date_to: date = Query(),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    days: int | None = Query(default=None, ge=1, le=366),
     project_ids: str | None = Query(default=None),
     threshold: int = Query(default=10, ge=0, le=1_000_000),
     with_status: bool = Query(default=True),
@@ -2913,6 +2914,11 @@ async def ads_dashboard(
     всех), их показы/клики/расход (Click.ru /stat) и лиды (/stat/v2
     conversions — конверсии по целям стратегии, у нас это цель lead), статусы.
     Сводка: сколько аккаунтов набрали больше threshold показов/кликов/лидов."""
+    # days: last N days by SERVER clock (MSK); browser clocks may be wrong
+    # (2026-11-13: LK sent 06.10-05.11 and the report was empty).
+    if days is not None or date_from is None or date_to is None:
+        date_to = datetime.now(timezone(timedelta(hours=3))).date()
+        date_from = date_to - timedelta(days=(days or 30) - 1)
     if date_to < date_from:
         raise HTTPException(status_code=422, detail="Дата окончания раньше даты начала")
     if (date_to - date_from).days > 366:
@@ -2998,6 +3004,7 @@ async def ads_dashboard(
                                 for k in ("impressions", "clicks", "leads", "spend")}}
     daily["spend"] = [round(v, 2) for v in daily["spend"]]
     return {"summary": summary, "totals": tot, "daily": daily, "items": items, "errors": errors,
+            "date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
             "projects": [{"id": pid, "name": p.get("name")} for pid, p in projects.items()]}
 
 

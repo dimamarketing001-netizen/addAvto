@@ -73,6 +73,8 @@ def test_dashboard_aggregates(monkeypatch, tmp_path):
         st = client.get(f"/api/projects/{p['id']}/statuses", auth=AUTH).json()
         other = client.get("/api/ads-dashboard", auth=AUTH, params={
             "date_from": "2026-11-01", "date_to": "2026-11-03", "project_ids": "9999"}).json()
+        # days: range by server clock, ignoring stale browser dates
+        bydays = client.get("/api/ads-dashboard", auth=AUTH, params={"days": 7, "project_ids": "9999"}).json()
     s = r["summary"]
     assert s["accounts"] == 2 and s["with_impressions"] == 1 and s["with_clicks"] == 1 and s["with_leads"] == 1
     assert s["by_status"] == {"banned": 1, "live": 1}
@@ -83,3 +85,6 @@ def test_dashboard_aggregates(monkeypatch, tmp_path):
     assert r["daily"]["labels"] == ["2026-11-01", "2026-11-02", "2026-11-03"] and r["daily"]["impressions"] == [500, 108, 0]
     assert {x["account_id"]: x["code"] for x in st["items"]} == {101: "live", 102: "banned"}
     assert other["summary"]["accounts"] == 0
+    assert len(bydays["daily"]["labels"]) == 7 and bydays["date_to"] == bydays["daily"]["labels"][-1]
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    assert bydays["date_to"] == _dt.now(_tz(_td(hours=3))).date().isoformat()
