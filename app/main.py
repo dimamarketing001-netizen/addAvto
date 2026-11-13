@@ -1121,7 +1121,8 @@ async def parsya_pool_dashboard(_: AuthUser, days: int = Query(default=30, ge=7,
         login = a.get("login")
         uses = usage.get(login, [])
         exp = _dt(a.get("metrika_token_expires_at"))
-        state = ("problem" if a.get("status") != "active" else "used" if uses else "free")
+        state = ("problem" if a.get("status") != "active" else "used" if uses
+                 else "free" if a.get("has_metrika_token") else "no_token")
         row = {**a, "uses": uses, "used": bool(uses), "state": state,
                "token_days_left": (exp - now).days if exp else None,
                "first_used_at": min((u.get("created_at") or "" for u in uses), default=None) or None}
@@ -1142,6 +1143,8 @@ async def parsya_pool_dashboard(_: AuthUser, days: int = Query(default=30, ge=7,
         "active": sum(1 for a in out if a.get("status") == "active"),
         "used": sum(1 for a in out if a["used"]),
         "free": sum(1 for a in out if a["state"] == "free"),
+        # активные, не в рекламе, но без токена Метрики — провижининг их не берёт
+        "no_token": sum(1 for a in out if a["state"] == "no_token"),
         "problem": sum(1 for a in out if a["state"] == "problem"),
         "with_metrika": sum(1 for a in out if a.get("has_metrika_token")),
         "token_expiring_30d": sum(1 for a in out if a["token_days_left"] is not None and a["token_days_left"] < 30),
@@ -2601,7 +2604,15 @@ async def _run_bulk_job(
                     index=orig_index,
                 ).model_dump())
                 db.set_bulk_job_pending(job_id, None)
-            except (ParsYaPoolError, ClickRUError, MetrikaAPIError, httpx.HTTPError) as exc:
+            except (ParsYaPoolError, ClickRUError, MetrikaAPIError, httpx.HTTPError, HTTPException) as exc:
+                # HTTPException — из _metrika_context (напр. 409 «нет Metrika
+                # OAuth-токена»): раньше обрывал весь запуск (2026-11-13).
+                if isinstance(exc, HTTPException):
+                    detail = str(exc.detail)
+                    if "Metrika OAuth" in detail:
+                        detail = (f"У логина {pool_login} в пуле нет токена Метрики — счётчик и цель lead "
+                                  "не созданы. Подключите Метрику этому логину в ParsYa и нажмите «Продолжить».")
+                    exc = ParsYaPoolError(detail)
                 db.append_bulk_job_item(job_id, BulkCampaignItemResult(
                     pool_login=pool_login,
                     account_id=account_id,
