@@ -2917,6 +2917,10 @@ async def _account_status_live(row: dict[str, Any], force: bool = False) -> dict
         msg = str(getattr(exc, "detail", None) or exc)
         res = {"code": "error", "label": "Не удалось проверить", "detail": msg[:200], "ads": {}}
     res = {**res, "checked_at": datetime.now(timezone.utc).isoformat()}
+    # Ошибка проверки (чаще 429 Click.ru) не затирает последний известный
+    # статус: показываем его с пометкой stale (2026-11-13).
+    if res.get("code") == "error" and cached and cached[1].get("code") != "error":
+        return {**cached[1], "stale": True, "detail": (cached[1].get("detail") or "") + " · не обновлено: " + str(res.get("detail") or "")[:120]}
     _STATUS_CACHE[account_id] = (_time.time(), res)
     return res
 
