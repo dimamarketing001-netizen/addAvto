@@ -388,6 +388,27 @@ def set_clickru_web_session(
             )
 
 
+def clickru_connection_usage(connection_id: int) -> dict[str, Any]:
+    """Что привязано к подключению Click.ru: аккаунты кампаний addAvto
+    (bulk_campaigns) и записи campaign_map, если такая таблица есть.
+    Нужно для запрета удаления (2026-11-13: случайно удалили «Рома» с 10
+    аккаунтами — запись восстановить было нельзя)."""
+    with connect() as db:
+        rows = db.execute(
+            "SELECT b.project_id, COALESCE(p.name, '') AS name, COUNT(*) AS n FROM bulk_campaigns b "
+            "LEFT JOIN projects p ON p.id = b.project_id WHERE b.connection_id = ? GROUP BY b.project_id",
+            (connection_id,),
+        ).fetchall()
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        mapped = 0
+        if "campaign_map" in tables:
+            cols = {r[1] for r in db.execute("PRAGMA table_info(campaign_map)")}
+            if "connection_id" in cols:
+                mapped = db.execute("SELECT COUNT(*) FROM campaign_map WHERE connection_id = ?", (connection_id,)).fetchone()[0]
+    projects = [{"project_id": r["project_id"], "name": r["name"], "accounts": r["n"]} for r in rows]
+    return {"accounts": sum(x["accounts"] for x in projects), "projects": projects, "campaign_map": mapped}
+
+
 def delete_clickru_connection(connection_id: int) -> bool:
     with connect() as db:
         cursor = db.execute("DELETE FROM clickru_connections WHERE id = ?", (connection_id,))

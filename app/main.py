@@ -354,6 +354,17 @@ async def check_clickru_web_session(connection_id: int, _: AuthUser):
 
 @app.delete("/api/clickru-connections/{connection_id}")
 async def remove_clickru_connection(connection_id: int, _: AuthUser):
+    # Запрет удаления, пока к подключению привязаны аккаунты (2026-11-13):
+    # без него статусы, отчёт, пополнение и правки кампаний этих аккаунтов
+    # перестают работать, а удаление необратимо.
+    usage = db.clickru_connection_usage(connection_id)
+    if usage["accounts"] or usage["campaign_map"]:
+        where = ", ".join(f"«{p['name'] or 'Проект ' + str(p['project_id'])}» — {p['accounts']}" for p in usage["projects"])
+        parts = [f"аккаунтов кампаний: {usage['accounts']}" + (f" ({where})" if where else "")] if usage["accounts"] else []
+        if usage["campaign_map"]:
+            parts.append(f"кампаний в связках: {usage['campaign_map']}")
+        raise HTTPException(status_code=409, detail="Нельзя удалить подключение: к нему привязаны " + "; ".join(parts)
+                            + ". Без него перестанут работать статусы, отчёты, пополнение и правки этих кампаний.")
     if not db.delete_clickru_connection(connection_id):
         raise HTTPException(status_code=404, detail="Подключение Click.ru не найдено")
     return {"deleted": True, "connection_id": connection_id}
