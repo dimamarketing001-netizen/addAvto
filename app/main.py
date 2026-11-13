@@ -25,6 +25,7 @@ from .click_client import ClickRUClient, ClickRUError
 from .metrika_client import MetrikaAPIError, YandexMetrikaClient
 from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozon_sitelinks, process_ozon_url
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
+from pydantic import BaseModel, Field
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -734,6 +735,48 @@ async def upload_creative_image(request: Request, _: AuthUser):
     except creative_images.CreativeImageError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ref": ref}
+
+
+class CreativeImageImportIn(BaseModel):
+    urls: list[str] = Field(min_length=1, max_length=40)
+
+
+@app.post("/api/creative-images/import-urls")
+async def import_creative_images(payload: CreativeImageImportIn, _: AuthUser):
+    """Картинки креативов по ссылкам (визард → «Из подборки», 2026-11-13):
+    скачиваем оригинал (для аватарницы Яндекса — /orig), обрезаем под
+    требования Директа и сохраняем у себя → {"ref": "local:…"}. Ошибка
+    одной картинки не валит остальные."""
+    out: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http_client:
+        for url in payload.urls:
+            url = (url or "").strip()
+            row: dict[str, Any] = {"url": url}
+            if not url.startswith(("http://", "https://")):
+                row["error"] = "Не ссылка http(s)"
+                out.append(row)
+                continue
+            data = None
+            for candidate in [c for c in (creative_images.avatars_original(url), url) if c]:
+                try:
+                    resp = await http_client.get(candidate)
+                    if resp.status_code == 200 and resp.content:
+                        data = resp.content
+                        break
+                except httpx.HTTPError:
+                    continue
+            if data is None:
+                row["error"] = "Не удалось скачать картинку"
+                out.append(row)
+                continue
+            try:
+                fitted = creative_images.fit_for_direct(data)
+                row["ref"] = creative_images.save_image(fitted)
+                row["size"] = creative_images.image_size(fitted)
+            except creative_images.CreativeImageError as exc:
+                row["error"] = str(exc)
+            out.append(row)
+    return {"items": out, "ok": sum(1 for r in out if r.get("ref")), "failed": sum(1 for r in out if r.get("error"))}
 
 
 @app.get("/api/creative-images/{name}")
