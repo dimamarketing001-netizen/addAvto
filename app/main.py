@@ -1600,6 +1600,77 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
             "pay_for_conversions": pay_conv}
 
 
+KICK_PAUSE_SECONDS = float(os.getenv("KICK_PAUSE_SECONDS", "2"))
+
+
+@app.post("/api/projects/{project_id}/kick")
+async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthUser):
+    """«Пнуть» аккаунты, где показы фактически не идут (2026-11-16, Dima).
+    dry_run=true (по умолчанию) — только план: свежие статусы, кому
+    пополнить и запустить, кому только запустить, итоговая сумма. dry_run=false
+    + amount_rub — выполнить: пополнение ТОЛЬКО там, где баланс 0, затем
+    модерация + включение. По одному аккаунту с паузой — лимиты Click.ru."""
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    dry = payload.get("dry_run", True) is not False
+    try:
+        amount = float(payload.get("amount_rub") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="amount_rub — число")
+    if amount < 0 or amount > 100000:
+        raise HTTPException(status_code=422, detail="Сумма пополнения — от 0 до 100 000 ₽")
+    wanted = {int(x) for x in payload.get("account_ids") or []}
+    rows = [r for r in db.list_bulk_campaigns(project_id)
+            if r.get("account_id") and r.get("campaign_id") and (not wanted or int(r["account_id"]) in wanted)]
+    plan = []
+    for r in rows:
+        st = await _account_status_live(r, force=True)
+        if st.get("kick"):
+            plan.append({"account_id": int(r["account_id"]), "campaign_id": r.get("campaign_id"),
+                         "pool_login": r.get("pool_login"), "status": st, **st["kick"]})
+    need_topup = sum(1 for x in plan if x["topup"])
+    if dry:
+        last_req: dict[str, Any] = {}
+        for job in db.list_bulk_jobs(project_id):
+            try:
+                last_req = json.loads(job.get("request_json") or "{}")
+            except ValueError:
+                last_req = {}
+            if last_req:
+                break
+        return {"dry_run": True, "items": plan, "need_topup": need_topup, "need_start": len(plan),
+                "suggested_amount_rub": last_req.get("topup_amount_rub") or 0, "checked": len(rows)}
+    if need_topup and not amount:
+        raise HTTPException(status_code=422, detail=f"Аккаунтов без денег: {need_topup} — укажите сумму пополнения")
+    is_epk = project.get("campaign_mode") == "single_epk"
+    by_id = {int(r["account_id"]): r for r in rows}
+    results = []
+    for i, item in enumerate(plan):
+        if i:
+            await asyncio.sleep(KICK_PAUSE_SECONDS)
+        row = by_id[item["account_id"]]
+        res: dict[str, Any] = {"account_id": item["account_id"], "campaign_id": item["campaign_id"]}
+        try:
+            client = _resolve_clickru_client(row.get("connection_id"))
+            login = await _resolve_client_login(client, item["account_id"])
+            post = await _fund_and_start(client, item["account_id"], login, int(row["campaign_id"]), row.get("payer_id"),
+                                         amount if item["topup"] else 0, True, is_epk)
+            res.update(post)
+        except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+            res.update(notes=[str(getattr(exc, "detail", None) or exc)[:300]], started=False)
+        _STATUS_CACHE.pop(item["account_id"], None)
+        results.append(res)
+    funded = sum(1 for r in results if r.get("topup_status") == "SUCCESS")
+    started = sum(1 for r in results if r.get("started"))
+    db.add_project_event(
+        project_id, "kick",
+        f"«Пнуть»: запущено {started} из {len(results)}" + (f", пополнено {funded} по {amount:g} ₽" if need_topup else ""),
+        "; ".join(f"{r['account_id']}: " + ", ".join(r.get("notes") or []) for r in results)[:1500],
+    )
+    return {"dry_run": False, "items": results, "funded": funded, "started": started, "total": len(results)}
+
+
 @app.post("/api/projects/{project_id}/fund-and-start")
 async def fund_and_start_project(project_id: int, payload: dict[str, Any], _: AuthUser):
     """Пополнить и/или запустить уже созданные кампании проекта.
@@ -2880,7 +2951,59 @@ def account_status(click_account: dict[str, Any] | None, campaign: dict[str, Any
             return done("partial", f"Частично запущено: принято {counts['accepted']} из {counts['total']}",
                         "; ".join(x for x in (rej, clar) if x))
         return done("live", "Идут показы", clar)
+    if counts["accepted"] and cstate == "OFF":
+        return done("stopped", "Одобрено, но кампания выключена", clar)
     return done("stopped", "Показы не идут", clar)
+
+
+def _launch_note_reason(note: str, kind: str) -> str:
+    """Из заметки запуска: причина несработавшего пополнения/старта."""
+    import re as _re
+    for part in (note or "").split("; "):
+        if kind == "topup" and part.startswith(("Пополнение не выполнено", "Пополнение на", "Не пополнено")):
+            m = _re.search(r"'message': '([^']+)'\}\]", part) or _re.search(r"'message': '([^']+)'", part[30:])
+            return (m.group(1) if m else part)[:200]
+        if kind == "start" and part.startswith(("Не запущено", "Не пополнено и не запущено")):
+            return part[:200]
+    return ""
+
+
+def explain_status(st: dict[str, Any], balance: Any, launch: dict[str, Any] | None) -> dict[str, Any]:
+    """Понятный статус для «не идут» (2026-11-16, Dima): учитываем баланс
+    Click.ru и заметку запуска. kick — что сделает «Пнуть»: topup и/или start."""
+    code = st.get("code")
+    if code not in ("stopped", "draft", "paused", "no_money"):
+        return {**st, "kick": None}
+    launch = launch or {}
+    note = launch.get("note") or ""
+    try:
+        bal = float(balance) if balance is not None else None
+    except (TypeError, ValueError):
+        bal = None
+    topup_why = _launch_note_reason(note, "topup") if launch.get("topup_status") not in (None, "SUCCESS") else ""
+    start_why = _launch_note_reason(note, "start") if not launch.get("started") else ""
+    detail = st.get("detail") or ""
+    if bal is not None and bal <= 0:
+        why = f"при запуске: {topup_why}" if topup_why else "аккаунт не пополнялся"
+        return {**st, "code": "no_money", "label": "Нет денег на аккаунте — показы не идут",
+                "detail": f"Баланс 0 ₽, {why}", "kick": {"topup": True, "start": True}}
+    if code == "draft":
+        why = f"запуск сорвался: {start_why}" if start_why else "объявления не отправлены на модерацию"
+        return {**st, "label": "Черновик — объявления не на модерации", "detail": why + (f" (баланс {bal:g} ₽)" if bal else ""),
+                "kick": {"topup": False, "start": True}}
+    if code in ("stopped", "paused"):
+        return {**st, "detail": "; ".join(x for x in (detail, f"баланс {bal:g} ₽" if bal is not None else "",
+                                                     f"запуск: {start_why}" if start_why else "") if x),
+                "kick": {"topup": False, "start": True}}
+    return {**st, "kick": {"topup": True, "start": True}}
+
+
+def _last_launch_item(project_id: int, account_id: int) -> dict[str, Any] | None:
+    for job in db.list_bulk_jobs(project_id):  # новые первыми
+        for it in reversed(job.get("items") or []):
+            if it.get("account_id") == account_id:
+                return it
+    return None
 
 
 _STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
@@ -2913,6 +3036,9 @@ async def _account_status_live(row: dict[str, Any], force: bool = False) -> dict
                 "FieldNames": ["Id", "Status", "State", "StatusClarification"]}})
             ).get("result", {}).get("Ads", []) if cid else []
             res = account_status(click_acc, camps[0] if camps else None, ads)
+        if res.get("code") not in ("live", "partial", "review"):
+            res = explain_status(res, (click_acc or {}).get("balance"),
+                                 _last_launch_item(int(row["project_id"]), account_id) if row.get("project_id") else None)
     except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
         msg = str(getattr(exc, "detail", None) or exc)
         res = {"code": "error", "label": "Не удалось проверить", "detail": msg[:200], "ads": {}}
