@@ -1623,12 +1623,20 @@ async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthU
     wanted = {int(x) for x in payload.get("account_ids") or []}
     rows = [r for r in db.list_bulk_campaigns(project_id)
             if r.get("account_id") and r.get("campaign_id") and (not wanted or int(r["account_id"]) in wanted)]
+    # Быстро (nginx перед addAvto ждёт 60 с): статусы из кэша параллельно,
+    # затем свежая проверка только «подозрительных» (не идут/неизвестно).
+    sts = await _statuses_for(rows, refresh=False, budget=20)
+    suspect = [r for r in rows if (sts.get(int(r["account_id"])) or {}).get("code") not in ("live", "partial", "review",
+                                                                                          "banned", "no_access", "archived")]
+    if suspect:
+        sts.update(await _statuses_for(suspect, refresh=True, budget=25))
     plan = []
     for r in rows:
-        st = await _account_status_live(r, force=True)
-        if st.get("kick"):
+        st = sts.get(int(r["account_id"])) or {}
+        if st.get("kick") and not st.get("stale"):
             plan.append({"account_id": int(r["account_id"]), "campaign_id": r.get("campaign_id"),
                          "pool_login": r.get("pool_login"), "status": st, **st["kick"]})
+    unchecked = sum(1 for r in suspect if (sts.get(int(r["account_id"])) or {}).get("code") in ("unknown", "error"))
     need_topup = sum(1 for x in plan if x["topup"])
     if dry:
         last_req: dict[str, Any] = {}
@@ -1639,7 +1647,7 @@ async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthU
                 last_req = {}
             if last_req:
                 break
-        return {"dry_run": True, "items": plan, "need_topup": need_topup, "need_start": len(plan),
+        return {"dry_run": True, "items": plan, "need_topup": need_topup, "need_start": len(plan), "unchecked": unchecked,
                 "suggested_amount_rub": last_req.get("topup_amount_rub") or 0, "checked": len(rows)}
     if need_topup and not amount:
         raise HTTPException(status_code=422, detail=f"Аккаунтов без денег: {need_topup} — укажите сумму пополнения")
