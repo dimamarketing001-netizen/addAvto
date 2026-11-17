@@ -1095,7 +1095,15 @@ def _normalize_site(value: str | None) -> str:
     raw = value.strip()
     parsed = urlsplit(raw if "://" in raw else "//" + raw)
     host = (parsed.hostname or "").lower().rstrip(".")
-    return host[4:] if host.startswith("www.") else host
+    host = host[4:] if host.startswith("www.") else host
+    # Кириллица и punycode — один сайт (2026-11-17: счётчик «мойюрист24.рф» не
+    # узнавался для домена xn--24-vlcdompjj0j.xn--p1ai → «A tag with this name
+    # and domain already exists» на каждом перезапуске). Сравниваем в punycode.
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    return host
 
 
 def _counter_site(counter: dict[str, Any]) -> str:
@@ -1631,13 +1639,43 @@ async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthU
                                                                                           "banned", "no_access", "archived")]
     if suspect:
         sts.update(await _statuses_for(suspect, refresh=True, budget=25))
+    # Деньги решаются по балансу из ОДНОГО GET /accounts на подключение — без
+    # Директа (2026-11-17: при лимите Click.ru статусы не проверялись, план был
+    # пустой и «Пнуть» ничего не делал). Баланс 0 + аккаунт ACTIVE → пополнить
+    # и запустить, даже если статус Директа сейчас неизвестен.
+    balances: dict[int, dict[str, Any]] = {}
+    for conn_id in {r.get("connection_id") for r in rows}:
+        try:
+            for a in await _resolve_clickru_client(conn_id).accounts():
+                if a.get("id") is not None:
+                    balances[int(a["id"])] = {"state": a.get("state"), "balance": a.get("balance")}
+        except Exception:  # без списка — по статусам, как раньше
+            pass
     plan = []
     for r in rows:
-        st = sts.get(int(r["account_id"])) or {}
-        if st.get("kick") and not st.get("stale"):
-            plan.append({"account_id": int(r["account_id"]), "campaign_id": r.get("campaign_id"),
-                         "pool_login": r.get("pool_login"), "status": st, **st["kick"]})
-    unchecked = sum(1 for r in suspect if (sts.get(int(r["account_id"])) or {}).get("code") in ("unknown", "error"))
+        aid = int(r["account_id"])
+        st = sts.get(aid) or {}
+        bal = balances.get(aid) or {}
+        try:
+            zero = bal.get("state") == "ACTIVE" and bal.get("balance") is not None and float(bal["balance"]) <= 0
+        except (TypeError, ValueError):
+            zero = False
+        if zero and st.get("code") not in ("live", "partial"):
+            if (st.get("kick") or {}).get("topup"):
+                status = st
+            else:
+                status = explain_status({**st, "code": "no_money" if st.get("code") in (None, "unknown", "error") else st.get("code")},
+                                        0, _last_launch_item(project_id, aid))
+                if st.get("code") in (None, "unknown", "error"):
+                    status = {**status, "detail": (status.get("detail") or "") + " · статус Директа сейчас не проверен (лимит Click.ru)"}
+            plan.append({"account_id": aid, "campaign_id": r.get("campaign_id"), "pool_login": r.get("pool_login"),
+                         "status": status, "topup": True, "start": True})
+        elif st.get("kick") and not st.get("stale"):
+            plan.append({"account_id": aid, "campaign_id": r.get("campaign_id"),
+                         "pool_login": r.get("pool_login"), "status": st, **st["kick"], "topup": False})
+    planned = {x["account_id"] for x in plan}
+    unchecked = sum(1 for r in suspect if int(r["account_id"]) not in planned
+                    and (sts.get(int(r["account_id"])) or {}).get("code") in ("unknown", "error"))
     need_topup = sum(1 for x in plan if x["topup"])
     if dry:
         last_req: dict[str, Any] = {}

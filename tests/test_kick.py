@@ -27,3 +27,34 @@ def test_accepted_off_label():
     camp = {"State": "OFF", "Status": "ACCEPTED", "StatusPayment": "ALLOWED", "StatusClarification": ""}
     r = m.account_status({"state": "ACTIVE"}, camp, [{"Status": "ACCEPTED"}])
     assert r["code"] == "stopped" and r["label"] == "Одобрено, но кампания выключена"
+
+
+def test_normalize_site_idn():
+    assert m._normalize_site("мойюрист24.рф") == m._normalize_site("https://xn--24-vlcdompjj0j.xn--p1ai/path?x=1")
+    assert m._normalize_site("www.Example.com") == "example.com"
+
+
+def test_kick_plan_uses_zero_balance_without_direct(monkeypatch, tmp_path):
+    import asyncio
+    from fastapi.testclient import TestClient
+    from app import db
+    from test_bulk_campaign_create import _configure_test_env, _make_project
+    _configure_test_env(monkeypatch, tmp_path / "kick.db")
+
+    class C:
+        async def accounts(self):
+            return [{"id": 101, "state": "ACTIVE", "balance": 0}, {"id": 102, "state": "ACTIVE", "balance": 900},
+                    {"id": 103, "state": "BAN", "balance": 0}]
+
+    async def unknown(rows, refresh=False, budget=None):
+        return {int(r["account_id"]): {"code": "unknown", "label": "Статус обновляется", "detail": "", "ads": {}} for r in rows}
+
+    monkeypatch.setattr(m, "_resolve_clickru_client", lambda _c: C())
+    monkeypatch.setattr(m, "_statuses_for", unknown)
+    with TestClient(m.app) as client:
+        p = _make_project(client, ("test-admin", "test-password-long-enough"))
+        for aid in (101, 102, 103):
+            db.record_bulk_campaign(p["id"], f"pool-{aid}", aid, 7000 + aid, connection_id=None, payer_id=1)
+        r = client.post(f"/api/projects/{p['id']}/kick", auth=("test-admin", "test-password-long-enough"), json={"dry_run": True}).json()
+    assert [x["account_id"] for x in r["items"]] == [101] and r["items"][0]["topup"] is True
+    assert r["need_topup"] == 1 and r["items"][0]["status"]["code"] == "no_money"
