@@ -3018,17 +3018,33 @@ _STATUS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
 STATUS_CACHE_SECONDS = 120
 
 
-async def _account_status_live(row: dict[str, Any], force: bool = False) -> dict[str, Any]:
+# После 429 статусы ~90 с не дёргают Click.ru (2026-11-16: проверки статусов
+# сами держали проект в лимите). Пополнение/запуск этот стоп не трогает.
+STATUS_COOLDOWN_SECONDS = 90
+_STATUS_COOLDOWN = {"until": 0.0}
+
+
+def _status_cooldown_left() -> float:
+    return max(0.0, _STATUS_COOLDOWN["until"] - _time.time())
+
+
+async def _account_status_live(row: dict[str, Any], force: bool = False,
+                               click_acc: dict[str, Any] | None = None) -> dict[str, Any]:
     account_id = int(row["account_id"])
     cached = _STATUS_CACHE.get(account_id)
     if not force and cached and _time.time() - cached[0] < STATUS_CACHE_SECONDS:
         return cached[1]
+    if _status_cooldown_left():
+        if cached:
+            return {**cached[1], "stale": True}
+        return {"code": "unknown", "label": "Статус обновляется",
+                "detail": f"Лимит API Click.ru — повтор через {int(_status_cooldown_left())} с", "ads": {}}
     client = _resolve_clickru_client(row.get("connection_id"))
-    click_acc: dict[str, Any] | None = None
-    try:
-        click_acc = await client.account(account_id)
-    except (ClickRUError, httpx.HTTPError):
-        click_acc = None
+    if click_acc is None:
+        try:
+            click_acc = await client.account(account_id)
+        except (ClickRUError, httpx.HTTPError):
+            click_acc = None
     try:
         if (click_acc or {}).get("state") in _CLICK_STATE:
             res = account_status(click_acc, None, None)
@@ -3049,6 +3065,8 @@ async def _account_status_live(row: dict[str, Any], force: bool = False) -> dict
                                  _last_launch_item(int(row["project_id"]), account_id) if row.get("project_id") else None)
     except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
         msg = str(getattr(exc, "detail", None) or exc)
+        if "429" in msg:
+            _STATUS_COOLDOWN["until"] = _time.time() + STATUS_COOLDOWN_SECONDS
         res = {"code": "error", "label": "Не удалось проверить", "detail": msg[:200], "ads": {}}
     res = {**res, "checked_at": datetime.now(timezone.utc).isoformat()}
     # Ошибка проверки (чаще 429 Click.ru) не затирает последний известный
@@ -3069,11 +3087,26 @@ _STATUS_BG: set[asyncio.Task] = set()
 
 async def _statuses_for(rows: list[dict[str, Any]], refresh: bool = False,
                         budget: float | None = None) -> dict[int, dict[str, Any]]:
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(2)
+    # Состояние/баланс/serviceLogin всех аккаунтов — одним GET /accounts на
+    # подключение вместо GET /accounts/{id} на каждый (2026-11-16, лимиты).
+    prefetched: dict[int, dict[str, Any]] = {}
+    need = [r for r in rows if r.get("account_id") and (refresh or not (
+        _STATUS_CACHE.get(int(r["account_id"])) and _time.time() - _STATUS_CACHE[int(r["account_id"])][0] < STATUS_CACHE_SECONDS))]
+    if need and not _status_cooldown_left():
+        for conn_id in {r.get("connection_id") for r in need}:
+            try:
+                for a in await _resolve_clickru_client(conn_id).accounts():
+                    if a.get("id") is not None:
+                        prefetched[int(a["id"])] = {k: v for k, v in a.items() if k != "servicePassword"}
+            except Exception as exc:  # нет списка — проверим по одному, как раньше
+                if "429" in str(exc):
+                    _STATUS_COOLDOWN["until"] = _time.time() + STATUS_COOLDOWN_SECONDS
 
     async def one(r: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         async with sem:
-            return int(r["account_id"]), await _account_status_live(r, force=refresh)
+            return int(r["account_id"]), await _account_status_live(
+                r, force=refresh, click_acc=prefetched.get(int(r["account_id"])))
 
     tasks = {int(r["account_id"]): asyncio.ensure_future(one(r)) for r in rows if r.get("account_id")}
     if not tasks:
