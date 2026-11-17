@@ -28,6 +28,7 @@ from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from pydantic import BaseModel, Field
 from . import crm_stats
 from . import topup_retry
+from . import lifecycle
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -80,7 +81,12 @@ async def lifespan(_: FastAPI):
     retry_worker = None
     if os.getenv("TOPUP_RETRY", "1") != "0":
         retry_worker = asyncio.create_task(_topup_retry_loop())
+    life_worker = None
+    if os.getenv("LIFECYCLE", "1") != "0":
+        life_worker = asyncio.create_task(_lifecycle_loop())
     yield
+    if life_worker:
+        life_worker.cancel()
     if worker:
         worker.cancel()
     if retry_worker:
@@ -2401,6 +2407,325 @@ async def _topup_retry_loop() -> None:
         except Exception as exc:  # pragma: no cover - обработчик не должен умирать
             print(f"[topup-retry] {type(exc).__name__}: {exc}", flush=True)
         await asyncio.sleep(TOPUP_RETRY_POLL_SECONDS)
+
+
+# ───────────── Жизнь аккаунтов и автозамена (2026-11-17) ─────────────
+
+LIFECYCLE_HOUR_MSK = int(os.getenv("LIFECYCLE_HOUR_MSK", "9"))
+_LIFECYCLE_LOCK = asyncio.Lock()
+
+
+def _replacement_payload(project_id: int, dead_rows: list[dict[str, Any]]) -> BulkCampaignCreateRequest | None:
+    """Параметры последнего запуска проекта (те же подключение, плательщик,
+    креативы, кнопка, пополнение, автозапуск), count = число замен. Для режима
+    «свой набор на аккаунт» — наборы ровно тех аккаунтов, что заменяем."""
+    for job in db.list_bulk_jobs(project_id):
+        req = job.get("request")
+        if not req:
+            continue
+        req = {**req, "count": len(dead_rows)}
+        if req.get("creative_mode") == "manual_per_account":
+            sets = req.get("creative_sets") or []
+            idx = {}
+            for j in db.list_bulk_jobs(project_id):
+                for it in j.get("items") or []:
+                    if it.get("account_id") and it.get("index") is not None:
+                        idx.setdefault(int(it["account_id"]), int(it["index"]))
+            req["creative_sets"] = [sets[idx.get(int(r["account_id"]), 0) % len(sets)] for r in dead_rows] if sets else []
+        try:
+            return BulkCampaignCreateRequest(**req)
+        except Exception:
+            return None
+    return None
+
+
+async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
+                         project_ids: set[int] | None = None) -> dict[str, Any]:
+    """Один ежедневный проход (см. app/lifecycle.py). dry_run — только план и
+    сбор статистики, без остановок, замен и возвратов."""
+    async with _LIFECYCLE_LOCK:
+        started = lifecycle.now_utc()
+        yday = lifecycle.today_msk() - timedelta(days=1)
+        projects = {p["id"]: p for p in db.list_projects() if project_ids is None or p["id"] in project_ids}
+        rows = [r for pid in projects for r in db.list_bulk_campaigns(pid) if r.get("account_id") and r.get("campaign_id")]
+        by_conn: dict[Any, list[int]] = {}
+        for r in rows:
+            by_conn.setdefault(r.get("connection_id"), []).append(int(r["account_id"]))
+        errors: list[str] = []
+        balances: dict[int, dict[str, Any]] = {}
+        # 1) статистика за 3 дня + балансы (1+1 запрос на подключение)
+        for conn_id, ids in by_conn.items():
+            client = _resolve_clickru_client(conn_id)
+            try:
+                st = await asyncio.wait_for(client.stat(["accountId", "date", "impressions", "clicks", "loss"],
+                                                        yday - timedelta(days=2), yday, ids), 60)
+                lifecycle.upsert_daily([(int(_num(x.get("accountId"))), str(x.get("date") or "")[:10],
+                                         int(_num(x.get("impressions"))), int(_num(x.get("clicks"))), _num(x.get("loss")))
+                                        for x in st if x.get("accountId") and x.get("date")])
+                # Click.ru не отдаёт строк за дни без показов — дописываем нули за вчера
+                have = {int(_num(x.get("accountId"))) for x in st if str(x.get("date") or "")[:10] == yday.isoformat()}
+                lifecycle.upsert_daily([(a, yday.isoformat(), 0, 0, 0.0) for a in ids if a not in have])
+            except (ClickRUError, httpx.HTTPError, asyncio.TimeoutError) as exc:
+                errors.append(f"статистика подключения {conn_id}: {str(exc)[:150] or 'нет ответа'}")
+                continue
+            try:
+                for a in await client.accounts():
+                    if a.get("id") is not None:
+                        balances[int(a["id"])] = {"state": a.get("state"), "balance": a.get("balance")}
+            except Exception as exc:
+                errors.append(f"балансы подключения {conn_id}: {str(exc)[:150]}")
+        ids_all = [int(r["account_id"]) for r in rows]
+        daily = lifecycle.daily_for(ids_all, yday - timedelta(days=30))
+        lives = lifecycle.lives_for(ids_all)
+        plan: list[dict[str, Any]] = []
+        # 2) «умершие» → остановка + замена
+        for pid, proj in projects.items():
+            settings = lifecycle.get_settings(pid)
+            prow = [r for r in rows if r["project_id"] == pid]
+            dead: list[tuple[dict[str, Any], str]] = []
+            for r in prow:
+                aid = int(r["account_id"])
+                life = lives.get(aid)
+                if life and life["state"] not in ("active", "dead"):
+                    continue
+                if topup_retry.pending_for_account(aid):
+                    continue
+                if (balances.get(aid) or {}).get("state") not in (None, "ACTIVE"):
+                    reason = f"аккаунт Click.ru: {balances[aid]['state']}"
+                    ok = True
+                elif life and life["state"] == "dead":
+                    ok, reason = True, life.get("death_reason") or "0 показов"
+                else:
+                    ok, reason = lifecycle.is_dead(daily.get(aid, {}), r.get("created_at"), yday)
+                if ok:
+                    dead.append((r, reason))
+            if not dead:
+                continue
+            limit = max(0, settings["max_per_day"] - lifecycle.replacements_today(pid)) if settings["enabled"] else 0
+            to_replace = dead[:limit]
+            running = any(j["status"] == "running" for j in db.list_bulk_jobs(pid))
+            for r, reason in dead:
+                act = ("остановить и заменить" if (r, reason) in to_replace and not running
+                       else "ждёт: идёт запуск" if (r, reason) in to_replace else
+                       "автозамена выключена" if not settings["enabled"] else "лимит замен на сегодня")
+                plan.append({"project_id": pid, "project_name": proj.get("name"), "account_id": int(r["account_id"]),
+                             "campaign_id": r.get("campaign_id"), "pool_login": r.get("pool_login"), "reason": reason,
+                             "action": act, "balance": (balances.get(int(r["account_id"])) or {}).get("balance")})
+            if dry_run:
+                continue
+            for r, reason in dead:
+                aid = int(r["account_id"])
+                if not (lives.get(aid) or {}).get("died_at"):
+                    lifecycle.set_life(aid, pid, state="dead", died_at=lifecycle.now_utc().isoformat(), death_reason=reason)
+            if not to_replace or running:
+                continue
+            stopped: list[dict[str, Any]] = []
+            for r, reason in to_replace:
+                aid = int(r["account_id"])
+                client = _resolve_clickru_client(r.get("connection_id"))
+                try:
+                    login = await _resolve_client_login(client, aid)
+                    try:
+                        await client.suspend_campaign(login, int(r["campaign_id"]))
+                    except ClickRUError as exc:
+                        if "already" not in str(exc).lower() and "уже" not in str(exc).lower():
+                            raise
+                    lifecycle.set_life(aid, pid, state="stopped", stopped_at=lifecycle.now_utc().isoformat(),
+                                       balance_at_stop=_num((balances.get(aid) or {}).get("balance")))
+                    stopped.append(r)
+                except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+                    errors.append(f"{aid}: не остановлен — {str(getattr(exc, 'detail', None) or exc)[:150]}")
+                await asyncio.sleep(1)
+            if not stopped:
+                continue
+            payload = _replacement_payload(pid, stopped)
+            note = ""
+            if payload is None:
+                note = "нет параметров прошлого запуска — замену не завёл"
+            else:
+                try:
+                    job_id = _start_bulk_job(pid, payload)
+                    note = f"запуск #{job_id}"
+                    for r in stopped:
+                        lifecycle.set_life(int(r["account_id"]), pid, replacement_job_id=job_id, replacement_note=note)
+                except HTTPException as exc:
+                    note = f"замена не запущена: {exc.detail}"
+            for r in stopped:
+                if not note.startswith("запуск"):
+                    lifecycle.set_life(int(r["account_id"]), pid, replacement_note=note)
+            db.add_project_event(pid, "autoreplace",
+                                 f"Автозамена: остановлено {len(stopped)}, {note}",
+                                 "; ".join(f"{r['account_id']}: " + next(x for y, x in to_replace if y is r) for r in stopped)[:1500])
+        # 3) возврат денег с остановленных
+        refunds: list[dict[str, Any]] = []
+        for aid, life in lives.items():
+            if life["project_id"] not in projects or life["state"] not in ("stopped", "refund_requested"):
+                continue
+            row = next((r for r in rows if int(r["account_id"]) == aid), None)
+            if row is None:
+                continue
+            bal = _num((balances.get(aid) or {}).get("balance")) if aid in balances else None
+            if life["state"] == "refund_requested":
+                if bal is not None and bal <= 0 and not dry_run:
+                    lifecycle.set_life(aid, life["project_id"], state="refunded", refunded_at=lifecycle.now_utc().isoformat())
+                    refunds.append({"account_id": aid, "action": "деньги вернулись"})
+                continue
+            try:
+                stopped_at = datetime.fromisoformat(life["stopped_at"]) if life.get("stopped_at") else None
+            except ValueError:
+                stopped_at = None
+            if stopped_at is None or lifecycle.now_utc() - stopped_at < timedelta(days=lifecycle.REFUND_WAIT_DAYS):
+                refunds.append({"account_id": aid, "action": "ждёт 2 суток после остановки"})
+                continue
+            if bal is not None and bal <= 0:
+                if not dry_run:
+                    lifecycle.set_life(aid, life["project_id"], state="closed", refund_note="баланс 0 — возвращать нечего")
+                refunds.append({"account_id": aid, "action": "баланс 0 — закрыт"})
+                continue
+            client = _resolve_clickru_client(row.get("connection_id"))
+            try:
+                status, msg = await client.refund_available(aid)
+                if status != "AVAILABLE":
+                    if not dry_run:
+                        lifecycle.set_life(aid, life["project_id"], refund_note=msg[:300])
+                    refunds.append({"account_id": aid, "action": "Click.ru пока не даёт: " + msg[:120]})
+                    continue
+                if dry_run:
+                    refunds.append({"account_id": aid, "action": f"подать заявку на возврат ({bal} ₽)"})
+                    continue
+                await client.refund(aid)
+                lifecycle.set_life(aid, life["project_id"], state="refund_requested",
+                                   refund_requested_at=lifecycle.now_utc().isoformat(), refund_note=f"заявка на {bal} ₽")
+                db.add_project_event(life["project_id"], "refund", f"Заявка на возврат денег с аккаунта {aid}: {bal} ₽",
+                                     "Click.ru обрабатывает до 7 рабочих дней")
+                refunds.append({"account_id": aid, "action": f"заявка на возврат подана ({bal} ₽)"})
+            except (ClickRUError, httpx.HTTPError) as exc:
+                errors.append(f"{aid}: возврат — {str(exc)[:150]}")
+            await asyncio.sleep(1)
+        summary = (f"проверено {len(rows)}, умерших {len(plan)}, "
+                   f"заменяется {sum(1 for x in plan if x['action'] == 'остановить и заменить')}, "
+                   f"возвраты: {len([x for x in refunds if 'заявка' in x['action']])}")
+        if not dry_run:
+            lifecycle.log_run(trigger, summary + ("; ошибки: " + "; ".join(errors) if errors else ""), started)
+        return {"dry_run": dry_run, "yesterday": yday.isoformat(), "checked": len(rows), "dead": plan,
+                "refunds": refunds, "errors": errors, "summary": summary}
+
+
+async def _lifecycle_loop() -> None:
+    """Раз в день в LIFECYCLE_HOUR_MSK:00 по Москве (повторно после рестарта не запускается)."""
+    await asyncio.sleep(60)
+    while True:
+        now = datetime.now(lifecycle.MSK)
+        target = now.replace(hour=LIFECYCLE_HOUR_MSK, minute=0, second=0, microsecond=0)
+        ran_today = any(r["trigger"] == "schedule" and r["started_at"][:10] == datetime.now(timezone.utc).date().isoformat()
+                        for r in lifecycle.last_runs(5))
+        if now >= target and not ran_today:
+            try:
+                await _lifecycle_run("schedule")
+            except Exception as exc:  # pragma: no cover
+                print(f"[lifecycle] {type(exc).__name__}: {exc}", flush=True)
+            continue
+        nxt = target if now < target else target + timedelta(days=1)
+        await asyncio.sleep(min(3600, max(30, (nxt - now).total_seconds())))
+
+
+@app.post("/api/lifecycle/run")
+async def lifecycle_run(payload: dict[str, Any], _: AuthUser):
+    """Ручной запуск ежедневной проверки. dry_run (по умолчанию true) —
+    только план; false — остановка, замены и возвраты как по расписанию."""
+    ids = {int(x) for x in payload.get("project_ids") or []} or None
+    try:
+        return await asyncio.wait_for(_lifecycle_run("manual", payload.get("dry_run", True) is not False, ids), 110)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Проверка идёт дольше 110 с — результат появится в журнале проекта")
+
+
+@app.get("/api/projects/{project_id}/autoreplace")
+async def get_autoreplace(project_id: int, _: AuthUser):
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    return lifecycle.get_settings(project_id)
+
+
+@app.put("/api/projects/{project_id}/autoreplace")
+async def put_autoreplace(project_id: int, payload: dict[str, Any], _: AuthUser):
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    try:
+        mx = int(payload.get("max_per_day") or lifecycle.DEFAULT_MAX_PER_DAY)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="max_per_day — число")
+    if not 1 <= mx <= 50:
+        raise HTTPException(status_code=422, detail="Замен в день — от 1 до 50")
+    out = lifecycle.set_settings(project_id, bool(payload.get("enabled")), mx)
+    db.add_project_event(project_id, "autoreplace",
+                         f"Автозамена {'включена' if out['enabled'] else 'выключена'} (до {out['max_per_day']} в день)", "")
+    return out
+
+
+@app.get("/api/lifecycle/dashboard")
+async def lifecycle_dashboard(_: AuthUser, project_ids: str | None = Query(default=None),
+                              days: int = Query(default=30, ge=7, le=180)):
+    """Жизнь аккаунтов: живые/умершие/возвраты, срок жизни, история по дням."""
+    wanted = {int(x) for x in project_ids.split(",") if x.strip()} if project_ids and project_ids.strip() else None
+    projects = {p["id"]: p for p in db.list_projects() if wanted is None or p["id"] in wanted}
+    rows = [r for pid in projects for r in db.list_bulk_campaigns(pid) if r.get("account_id")]
+    ids = [int(r["account_id"]) for r in rows]
+    lives, totals = lifecycle.lives_for(ids), lifecycle.totals_for(ids)
+    today = lifecycle.today_msk()
+    labels = [(today - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
+    born, died = dict.fromkeys(labels, 0), dict.fromkeys(labels, 0)
+
+    def _d(v: Any) -> date | None:
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(lifecycle.MSK).date() if v else None
+        except ValueError:
+            return None
+
+    items, lifetimes = [], []
+    for r in rows:
+        aid = int(r["account_id"])
+        life, tot = lives.get(aid) or {}, totals.get(aid) or {}
+        created, death = _d(r.get("created_at")), _d(life.get("died_at"))
+        if created and created.isoformat() in born:
+            born[created.isoformat()] += 1
+        if death and death.isoformat() in died:
+            died[death.isoformat()] += 1
+        lifetime = ((death or today) - created).days if created else None
+        if death and lifetime is not None:
+            lifetimes.append(lifetime)
+        state = life.get("state") or "active"
+        items.append({"account_id": aid, "project_id": r["project_id"], "project_name": projects[r["project_id"]].get("name"),
+                      "pool_login": r.get("pool_login"), "campaign_id": r.get("campaign_id"), "created_at": r.get("created_at"),
+                      "state": state, "state_label": lifecycle.STATES.get(state, state), "lifetime_days": lifetime,
+                      "died_at": life.get("died_at"), "death_reason": life.get("death_reason") or "",
+                      "stopped_at": life.get("stopped_at"), "balance_at_stop": life.get("balance_at_stop"),
+                      "refund_requested_at": life.get("refund_requested_at"), "refunded_at": life.get("refunded_at"),
+                      "refund_note": life.get("refund_note") or "", "replacement_job_id": life.get("replacement_job_id"),
+                      "replacement_note": life.get("replacement_note") or "", **tot})
+    lifetimes.sort()
+    cnt = {k: sum(1 for x in items if x["state"] == k) for k in lifecycle.STATES}
+    summary = {
+        "accounts": len(items), "alive": cnt["active"], "dead": cnt["dead"], "stopped": cnt["stopped"],
+        "refund_requested": cnt["refund_requested"], "refunded": cnt["refunded"], "closed": cnt["closed"],
+        "replaced": sum(1 for x in items if x["replacement_job_id"]),
+        "money_waiting": round(sum(x["balance_at_stop"] or 0 for x in items if x["state"] in ("stopped", "refund_requested")), 2),
+        "money_refunded": round(sum(x["balance_at_stop"] or 0 for x in items if x["state"] == "refunded"), 2),
+        "avg_lifetime_days": round(sum(lifetimes) / len(lifetimes), 1) if lifetimes else None,
+        "median_lifetime_days": lifetimes[len(lifetimes) // 2] if lifetimes else None,
+        "avg_age_alive_days": round(sum(x["lifetime_days"] or 0 for x in items if x["state"] == "active") / max(1, cnt["active"]), 1),
+    }
+    hist: dict[str, int] = {}
+    for lt in lifetimes:
+        b = "0–1" if lt <= 1 else "2–3" if lt <= 3 else "4–7" if lt <= 7 else "8–14" if lt <= 14 else "15+"
+        hist[b] = hist.get(b, 0) + 1
+    items.sort(key=lambda x: (x["state"] != "active", x.get("created_at") or ""), reverse=False)
+    return {"summary": summary, "items": items,
+            "daily": {"labels": labels, "born": [born[d] for d in labels], "died": [died[d] for d in labels]},
+            "lifetime_hist": {"labels": ["0–1", "2–3", "4–7", "8–14", "15+"],
+                              "values": [hist.get(k, 0) for k in ("0–1", "2–3", "4–7", "8–14", "15+")]},
+            "settings": {pid: lifecycle.get_settings(pid) for pid in projects},
+            "runs": lifecycle.last_runs(10), "hour_msk": LIFECYCLE_HOUR_MSK}
 
 
 @app.get("/api/projects/{project_id}/topup-retries")

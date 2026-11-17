@@ -627,6 +627,19 @@ class ClickRUClient:
         task_id = envelope.get("task_id") if isinstance(envelope, dict) else None
         return int(task_id) if task_id else None
 
+    async def refund_available(self, account_id: int) -> tuple[str, str]:
+        """GET /payments/refund_available → (AVAILABLE|NOT_AVAILABLE, сообщение).
+        Click.ru: возврат возможен минимум через 2 дня после остановки всех кампаний."""
+        response = await self._request("GET", "/payments/refund_available", params={"accountId": int(account_id)})
+        data = response.json()
+        env = data.get("response", data) if isinstance(data, dict) else {}
+        return str((env or {}).get("status") or ""), str((env or {}).get("message") or "")
+
+    async def refund(self, account_id: int) -> None:
+        """POST /payments/refund — заявка на возврат ВСЕГО остатка рекламного
+        аккаунта на баланс Click.ru (обработка до 7 рабочих дней). Деньги."""
+        await self._request("POST", "/payments/refund", json={"accountId": int(account_id)})
+
     async def add_money_status(self, task_id: int) -> str:
         """NEW | PROCESSING | ERROR | CANCELLED | SUCCESS."""
         response = await self._request("GET", "/payments/add_money/status", params={"task_id": int(task_id)})
