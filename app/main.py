@@ -27,6 +27,7 @@ from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozo
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from pydantic import BaseModel, Field
 from . import crm_stats
+from . import topup_retry
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -76,9 +77,14 @@ async def lifespan(_: FastAPI):
     worker = None
     if os.getenv("LK_WORKER", "1") != "0":
         worker = asyncio.create_task(lk.worker_loop(_lk_metrika_client))
+    retry_worker = None
+    if os.getenv("TOPUP_RETRY", "1") != "0":
+        retry_worker = asyncio.create_task(_topup_retry_loop())
     yield
     if worker:
         worker.cancel()
+    if retry_worker:
+        retry_worker.cancel()
     await _ozon_browser.close()
 
 
@@ -1701,8 +1707,12 @@ async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthU
         try:
             client = _resolve_clickru_client(row.get("connection_id"))
             login = await _resolve_client_login(client, item["account_id"])
+            if item["topup"]:
+                topup_retry.cancel_account(item["account_id"], "заменён ручным «Пнуть»")
             post = await _fund_and_start(client, item["account_id"], login, int(row["campaign_id"]), row.get("payer_id"),
                                          amount if item["topup"] else 0, True, is_epk)
+            _maybe_schedule_topup_retry(project_id, item["account_id"], int(row["campaign_id"]), row.get("connection_id"),
+                                        row.get("payer_id"), amount if item["topup"] else 0, True, is_epk, post)
             res.update(post)
         except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
             res.update(notes=[str(getattr(exc, "detail", None) or exc)[:300]], started=False)
@@ -1747,8 +1757,12 @@ async def fund_and_start_project(project_id: int, payload: dict[str, Any], _: Au
         try:
             client = _resolve_clickru_client(row.get("connection_id"))
             login = await _resolve_client_login(client, int(row["account_id"]))
+            if amount:
+                topup_retry.cancel_account(int(row["account_id"]), "заменён ручным «Пополнить и запустить»")
             post = await _fund_and_start(client, int(row["account_id"]), login, int(row["campaign_id"]),
                                          row.get("payer_id"), amount, start, is_epk)
+            _maybe_schedule_topup_retry(project_id, int(row["account_id"]), int(row["campaign_id"]), row.get("connection_id"),
+                                        row.get("payer_id"), amount, start, is_epk, post)
             res.update(post)
         except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
             res.update(notes=[str(getattr(exc, "detail", None) or exc)[:300]], started=False, topup_status="ERROR")
@@ -2308,6 +2322,107 @@ async def _ensure_marking(client: ClickRUClient, account_id: int, payer_id: int 
         return False, f"маркировка не настроена: {str(exc)[:200]}"
 
 
+def _maybe_schedule_topup_retry(project_id: int, account_id: int, campaign_id: int | None, connection_id: int | None,
+                                payer_id: int | None, amount: float | None, start: bool, is_epk: bool,
+                                post: dict[str, Any]) -> None:
+    """Отказ «Пополнение недоступно до …» → автоповтор (2026-11-17)."""
+    until = post.get("topup_retry_until")
+    if until is None or not amount or amount <= 0:
+        return
+    when = topup_retry.schedule(project_id, account_id, campaign_id, connection_id, payer_id, float(amount), start,
+                                is_epk, until, "; ".join(post.get("notes") or []))
+    post["topup_retry_at"] = when.isoformat()
+    post.setdefault("notes", []).append(f"Автоповтор пополнения в {topup_retry.msk_hhmm(when.isoformat())} МСК")
+    post.pop("topup_retry_until", None)
+
+
+TOPUP_RETRY_POLL_SECONDS = 60
+TOPUP_RETRY_PAUSE_SECONDS = 3.0
+
+
+async def _topup_retry_once() -> int:
+    """Один проход: созревшие повторы → пополнение (если баланс всё ещё 0) и запуск."""
+    done = 0
+    for r in topup_retry.due():
+        aid, pid = int(r["account_id"]), int(r["project_id"])
+        msg, note = "", ""
+        try:
+            client = _resolve_clickru_client(r.get("connection_id"))
+            acc = await client.account(aid)
+            state = acc.get("state")
+            if state != "ACTIVE":
+                topup_retry.finish(r["id"], "failed", f"аккаунт в состоянии {state}")
+                msg = f"Автоповтор пополнения {aid}: отменён — аккаунт {state}"
+            else:
+                try:
+                    bal = float(acc.get("balance") or 0)
+                except (TypeError, ValueError):
+                    bal = 0.0
+                login = acc.get("serviceLogin") or await _resolve_client_login(client, aid)
+                amount = 0 if bal > 0 else float(r["amount_rub"])
+                post = await _fund_and_start(client, aid, login, int(r["campaign_id"]), r.get("payer_id"),
+                                             amount, bool(r["start"]), bool(r["is_epk"]))
+                note = "; ".join(post.get("notes") or [])
+                until = post.get("topup_retry_until")
+                if until is not None:
+                    ok, when = topup_retry.reschedule(r["id"], until, note)
+                    msg = (f"Автоповтор пополнения {aid}: снова «недоступно» — перенесён на {topup_retry.msk_hhmm(when.isoformat())} МСК"
+                           if ok else f"Автоповтор пополнения {aid}: попытки кончились")
+                elif amount == 0:
+                    topup_retry.finish(r["id"], "done", "баланс уже не 0 — только запуск; " + note)
+                    msg = f"Автоповтор пополнения {aid}: уже пополнен вручную, запущено: {'да' if post.get('started') else 'нет'}"
+                elif post.get("topup_status") in ("SUCCESS", "SENT", "IN_PROGRESS", "NEW", "PROCESSING"):
+                    topup_retry.finish(r["id"], "done", note)
+                    msg = (f"Автоповтор пополнения {aid}: пополнено на {amount:g} ₽"
+                           + (" (в обработке)" if post.get("topup_status") != "SUCCESS" else "")
+                           + (", запущено" if post.get("started") else ", не запущено"))
+                else:
+                    ok, when = topup_retry.reschedule(r["id"], datetime.now(timezone.utc) + timedelta(minutes=3), note)
+                    msg = (f"Автоповтор пополнения {aid}: не прошло — повтор в {topup_retry.msk_hhmm(when.isoformat())} МСК"
+                           if ok else f"Автоповтор пополнения {aid}: попытки кончились")
+            _STATUS_CACHE.pop(aid, None)
+            done += 1
+        except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
+            note = str(getattr(exc, "detail", None) or exc)[:300]
+            ok, when = topup_retry.reschedule(r["id"], datetime.now(timezone.utc) + timedelta(minutes=3), note)
+            msg = (f"Автоповтор пополнения {aid}: ошибка Click.ru — повтор в {topup_retry.msk_hhmm(when.isoformat())} МСК"
+                   if ok else f"Автоповтор пополнения {aid}: попытки кончились")
+        if msg:
+            db.add_project_event(pid, "topup_retry", msg, note[:1500])
+        await asyncio.sleep(TOPUP_RETRY_PAUSE_SECONDS)
+    return done
+
+
+async def _topup_retry_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await _topup_retry_once()
+        except Exception as exc:  # pragma: no cover - обработчик не должен умирать
+            print(f"[topup-retry] {type(exc).__name__}: {exc}", flush=True)
+        await asyncio.sleep(TOPUP_RETRY_POLL_SECONDS)
+
+
+@app.get("/api/projects/{project_id}/topup-retries")
+async def project_topup_retries(project_id: int, _: AuthUser):
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    items = topup_retry.list_project(project_id)
+    for it in items:
+        it["retry_at_msk"] = topup_retry.msk_hhmm(it["retry_at"])
+    return {"pending": [x for x in items if x["status"] == "pending"], "recent": items[:20]}
+
+
+@app.post("/api/projects/{project_id}/topup-retries/cancel")
+async def cancel_project_topup_retries(project_id: int, _: AuthUser):
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    n = topup_retry.cancel_project(project_id, "отменено вручную в ЛК")
+    if n:
+        db.add_project_event(project_id, "topup_retry", f"Автоповтор пополнения отменён: {n}", "")
+    return {"cancelled": n}
+
+
 async def _fund_and_start(
     client: ClickRUClient, account_id: int, client_login: str, campaign_id: int,
     payer_id: int | None, amount_rub: float | None, start: bool, is_epk: bool,
@@ -2353,6 +2468,9 @@ async def _fund_and_start(
         except (ClickRUError, httpx.HTTPError) as exc:
             out["topup_status"] = "ERROR"
             out["notes"].append(f"Пополнение не выполнено: {str(exc)[:200]}")
+            until = topup_retry.parse_until(str(exc))
+            if until is not None:
+                out["topup_retry_until"] = until
     if start:
         try:
             sent = await client.moderate_campaign_ads(client_login, campaign_id, **({"api_version": "v501"} if is_epk else {}))
@@ -2756,6 +2874,8 @@ async def _run_bulk_job(
                     client, account_id, client_login, campaign_id, payload.payer_id,
                     payload.topup_amount_rub, payload.auto_start, is_epk,
                 )
+                _maybe_schedule_topup_retry(project_id, account_id, campaign_id, payload.connection_id, payload.payer_id,
+                                            payload.topup_amount_rub, payload.auto_start, is_epk, post)
                 if post["notes"]:
                     note = "; ".join(x for x in [note, *post["notes"]] if x)
                 db.append_bulk_job_item(job_id, BulkCampaignItemResult(
@@ -3102,6 +3222,12 @@ async def _account_status_live(row: dict[str, Any], force: bool = False,
         if res.get("code") not in ("live", "partial", "review"):
             res = explain_status(res, (click_acc or {}).get("balance"),
                                  _last_launch_item(int(row["project_id"]), account_id) if row.get("project_id") else None)
+            if res.get("code") == "no_money":
+                pend = topup_retry.pending_for_account(account_id)
+                if pend:
+                    at = topup_retry.msk_hhmm(pend["retry_at"])
+                    res = {**res, "label": f"Нет денег — автоповтор пополнения в {at} МСК",
+                           "detail": (res.get("detail") or "") + f" · автоповтор {pend['amount_rub']:g} ₽ в {at} МСК", "retry_at": pend["retry_at"]}
     except (ClickRUError, HTTPException, httpx.HTTPError) as exc:
         msg = str(getattr(exc, "detail", None) or exc)
         if "429" in msg:
