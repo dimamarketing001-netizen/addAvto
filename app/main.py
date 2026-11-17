@@ -2478,6 +2478,24 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
         daily = lifecycle.daily_for(ids_all, yday - timedelta(days=30))
         lives = lifecycle.lives_for(ids_all)
         plan: list[dict[str, Any]] = []
+        # Пополнение/пинок/запуск после начала вчерашних суток — вчерашние 0 показов
+        # ничего не значат (2026-11-17: 680497/680493 стояли без денег, их пнули 17.11 —
+        # план считал их «умершими» за 16.11). Такой аккаунт ждёт полные сутки.
+        y_start = datetime.combine(yday, datetime.min.time(), lifecycle.MSK).astimezone(timezone.utc)
+        fresh: set[int] = set()
+        for pid in projects:
+            for ev in db.list_project_events(pid)[:300]:
+                if ev.get("kind") not in ("kick", "fund_start", "topup_retry", "launch_resumed"):
+                    continue
+                try:
+                    at = datetime.fromisoformat(str(ev.get("created_at")).replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                if at >= y_start:
+                    import re as _re_ids
+                    fresh.update(int(x) for x in _re_ids.findall(r"(\d+)", f"{ev.get('title') or ''} {ev.get('detail') or ''}"))
         # 2) «умершие» → остановка + замена
         for pid, proj in projects.items():
             settings = lifecycle.get_settings(pid)
@@ -2488,7 +2506,7 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
                 life = lives.get(aid)
                 if life and life["state"] not in ("active", "dead"):
                     continue
-                if topup_retry.pending_for_account(aid):
+                if topup_retry.pending_for_account(aid) or aid in fresh:
                     continue
                 if (balances.get(aid) or {}).get("state") not in (None, "ACTIVE"):
                     reason = f"аккаунт Click.ru: {balances[aid]['state']}"

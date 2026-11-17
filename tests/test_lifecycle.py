@@ -88,3 +88,29 @@ def test_run_stop_replace_refund(monkeypatch, tmp_path):
     s = dash["summary"]
     assert s["accounts"] == 2 and s["alive"] == 1 and s["refunded"] == 1 and s["money_refunded"] == 500.0 and s["replaced"] == 1
     assert dash["items"][0]["state"] == "active" and dash["items"][0]["impressions"] == 120
+
+
+def test_recently_kicked_is_not_dead(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "life2.db")
+    yday = lifecycle.today_msk() - timedelta(days=1)
+
+    class C:
+        configured = True
+
+        async def stat(self, fields, d1, d2, ids, v2=False):
+            return []
+
+        async def accounts(self):
+            return [{"id": 201, "state": "ACTIVE", "balance": 1000}, {"id": 202, "state": "ACTIVE", "balance": 1000}]
+
+    monkeypatch.setattr(m, "_resolve_clickru_client", lambda _c: C())
+    with TestClient(m.app) as client:
+        p = _make_project(client, AUTH)
+        old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        for aid in (201, 202):
+            db.record_bulk_campaign(p["id"], f"pool-{aid}", aid, 7000 + aid, connection_id=None, payer_id=1)
+        with db.connect() as c:
+            c.execute("UPDATE bulk_campaigns SET created_at=?", (old,))
+        db.add_project_event(p["id"], "kick", "«Пнуть»: запущено 1 из 1", "201: Пополнено на 1220 ₽ с НДС")
+        r = client.post("/api/lifecycle/run", auth=AUTH, json={"dry_run": True}).json()
+    assert [x["account_id"] for x in r["dead"]] == [202]
