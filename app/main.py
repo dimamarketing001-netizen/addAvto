@@ -26,6 +26,7 @@ from .metrika_client import MetrikaAPIError, YandexMetrikaClient
 from .ozon_ad_creator import GeminiError, OzonBrowser, OzonParseError, build_ozon_sitelinks, process_ozon_url
 from .parsya_pool_client import ParsYaPoolClient, ParsYaPoolError
 from pydantic import BaseModel, Field
+from . import crm_stats
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -3146,6 +3147,108 @@ def _num(v: Any) -> float:
         return float(str(v).replace(",", ".").strip() or 0)
     except ValueError:
         return 0.0
+
+
+# ───────────── Б24: лиды / клиенты / договоры в отчёте рекламы (2026-11-17) ─────────────
+
+@app.get("/api/crm/sources")
+async def crm_sources(user: AuthUser):
+    """Источники Б24 из раздела «Конверсии» — для выбора в настройках запуска."""
+    return {"items": crm_stats.list_sources(user)}
+
+
+@app.get("/api/projects/{project_id}/crm-source")
+async def get_project_crm_source(project_id: int, user: AuthUser):
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    sid = crm_stats.get_project_source_id(project_id)
+    src = next((x for x in crm_stats.list_sources(user) if x["id"] == sid), None) if sid else None
+    return {"source_id": sid if src else None, "source": src}
+
+
+@app.put("/api/projects/{project_id}/crm-source")
+async def set_project_crm_source(project_id: int, payload: dict[str, Any], user: AuthUser):
+    """Тело: {"source_id": 2} или {"source_id": null} (отвязать). Только активные источники."""
+    if db.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    raw = payload.get("source_id")
+    if raw in (None, "", 0, "0"):
+        crm_stats.set_project_source_id(project_id, None)
+        db.add_project_event(project_id, "crm_source", "Источник лидов Б24 отвязан", "")
+        return {"source_id": None, "source": None}
+    try:
+        sid = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="source_id — число")
+    src = next((x for x in crm_stats.list_sources(user) if x["id"] == sid), None)
+    if src is None:
+        raise HTTPException(status_code=404, detail="Источник Б24 не найден")
+    if not src["enabled"]:
+        raise HTTPException(status_code=422, detail="Источник Б24 выключен — включите его в разделе «Конверсии»")
+    crm_stats.set_project_source_id(project_id, sid)
+    db.add_project_event(project_id, "crm_source", f"Источник лидов Б24: «{src['name']}»", "")
+    return {"source_id": sid, "source": src}
+
+
+@app.get("/api/ads-crm")
+async def ads_crm(
+    user: AuthUser,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    days: int | None = Query(default=None, ge=1, le=366),
+    project_ids: str | None = Query(default=None),
+    refresh: bool = Query(default=False),
+):
+    """Лиды, клиенты и договоры (воронка «Продажа») из Б24 по кампаниям
+    проектов — для отчёта рекламы. Период — как у /api/ads-dashboard."""
+    if days is not None or date_from is None or date_to is None:
+        date_to = datetime.now(timezone(timedelta(hours=3))).date()
+        date_from = date_to - timedelta(days=(days or 30) - 1)
+    wanted: set[int] | None = None
+    if project_ids and project_ids.strip():
+        try:
+            wanted = {int(x) for x in project_ids.split(",") if x.strip()}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="project_ids — числа через запятую") from exc
+    own = {x["id"]: x for x in crm_stats.list_sources(user)}
+    items: dict[str, dict[str, Any]] = {}
+    projects_out: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for proj in db.list_projects():
+        pid = proj["id"]
+        if wanted is not None and pid not in wanted:
+            continue
+        rows = [r for r in db.list_bulk_campaigns(pid) if r.get("account_id") and r.get("campaign_id")]
+        sid = crm_stats.get_project_source_id(pid)
+        info: dict[str, Any] = {"id": pid, "name": proj.get("name"), "source": own.get(sid) if sid else None}
+        projects_out.append(info)
+        if not rows or not sid or sid not in own:
+            continue
+        try:
+            created = [str(r.get("created_at") or "")[:10] for r in rows if r.get("created_at")]
+            try:
+                first_day = date.fromisoformat(min(created)) - timedelta(days=1) if created else None
+            except ValueError:
+                first_day = None
+            st = await asyncio.wait_for(
+                crm_stats.campaign_stats(sid, [r["campaign_id"] for r in rows], date_from, date_to, refresh,
+                                         not_before=first_day), 45)
+        except asyncio.TimeoutError:
+            info["error"] = "Б24 не ответил вовремя"
+            errors.append(f"{proj.get('name')}: Б24 не ответил вовремя")
+            continue
+        except crm_stats.CrmError as exc:
+            info["error"] = str(exc)[:200]
+            errors.append(f"{proj.get('name')}: {str(exc)[:200]}")
+            continue
+        info["funnel"] = st["funnel"]
+        for r in rows:
+            items[str(r["account_id"])] = {"project_id": pid, "campaign_id": r["campaign_id"],
+                                           **st["by_campaign"].get(str(int(r["campaign_id"])), {})}
+    totals = {k: sum(v.get(k, 0) for v in items.values()) for k in ("leads", "clients", "deals", "won")}
+    totals["won_sum"] = round(sum(v.get("won_sum", 0) for v in items.values()), 2)
+    return {"items": items, "totals": totals, "projects": projects_out, "errors": errors,
+            "date_from": date_from.isoformat(), "date_to": date_to.isoformat()}
 
 
 @app.get("/api/ads-dashboard")
