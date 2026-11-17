@@ -260,6 +260,13 @@ async def campaign_stats(source_id: int, campaign_ids: list[int | str], date_fro
     for cid in cids:
         by[cid]["clients"] = len(clients[cid])
         by[cid]["won_sum"] = round(by[cid]["won_sum"], 2)
+    for cid in cids:
+        days: dict[str, int] = {}
+        for lead in leads[cid]:
+            day = str(lead.get("DATE_CREATE") or "")[:10]
+            if day:
+                days[day] = days.get(day, 0) + 1
+        by[cid]["daily"] = days
     out = {"by_campaign": by, "funnel": {"id": funnel["id"], "name": funnel["name"]},
            "source": {"id": src["id"], "name": src["name"]}}
     _cache[key] = (time.time(), out)

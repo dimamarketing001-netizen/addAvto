@@ -10,13 +10,15 @@ from app.token_crypto import encrypt_secret
 from test_bulk_campaign_create import _configure_test_env, _make_project
 
 AUTH = ("test-admin", "test-password-long-enough")
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+TODAY = _dt.now(_tz(_td(hours=3))).date().isoformat()
 
 
 def _fake_b24(monkeypatch):
     leads = [
-        {"ID": "1", "UTM_CAMPAIGN": "rsya_7001", "CONTACT_ID": "50", "STATUS_ID": "CONVERTED"},
+        {"ID": "1", "UTM_CAMPAIGN": "rsya_7001", "CONTACT_ID": "50", "STATUS_ID": "CONVERTED", "DATE_CREATE": TODAY + "T10:00:00+03:00"},
         {"ID": "2", "UTM_CAMPAIGN": "7001", "CONTACT_ID": "0", "STATUS_ID": "NEW"},
-        {"ID": "3", "UTM_CAMPAIGN": "МК / Все города_7001", "CONTACT_ID": "51", "STATUS_ID": "NEW"},
+        {"ID": "3", "UTM_CAMPAIGN": "МК / Все города_7001", "CONTACT_ID": "51", "STATUS_ID": "NEW", "DATE_CREATE": TODAY + "T11:00:00+03:00"},
         {"ID": "4", "UTM_CAMPAIGN": "rsya_97001", "CONTACT_ID": "52", "STATUS_ID": "NEW"},  # чужая: 7001 лишь вхождение
         {"ID": "5", "UTM_CAMPAIGN": "rsya_7002", "CONTACT_ID": None, "STATUS_ID": "NEW"},
     ]
@@ -81,6 +83,8 @@ def test_campaign_stats_and_endpoints(monkeypatch, tmp_path):
     assert (b["leads"], b["clients"], b["deals"], b["won"]) == (1, 0, 1, 0)
     assert r["totals"] == {"leads": 4, "clients": 2, "deals": 3, "won": 1, "won_sum": 150000.0}
     assert r["projects"][0]["funnel"] == {"id": 6, "name": "Продажа"} and not r["errors"]
+    assert len(r["daily"]["labels"]) == 7 and r["daily"]["labels"][-1] == TODAY and r["daily"]["leads"][-1] == 2
+    assert sum(r["daily"]["leads"]) == 2
 
 
 def test_no_sales_funnel(monkeypatch, tmp_path):

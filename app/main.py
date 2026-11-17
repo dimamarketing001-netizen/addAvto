@@ -3411,7 +3411,20 @@ async def ads_crm(
                                            **st["by_campaign"].get(str(int(r["campaign_id"])), {})}
     totals = {k: sum(v.get(k, 0) for v in items.values()) for k in ("leads", "clients", "deals", "won")}
     totals["won_sum"] = round(sum(v.get("won_sum", 0) for v in items.values()), 2)
+    # лиды Б24 по дням — для диаграммы отчёта (2026-11-17: линия «Лиды» была из цели Метрики и лежала на нуле)
+    labels = [(date_from + timedelta(days=i)).isoformat() for i in range((date_to - date_from).days + 1)]
+    per_day = dict.fromkeys(labels, 0)
+    seen_campaigns: set[str] = set()
+    for v in items.values():
+        cid = str(v.get("campaign_id"))
+        if cid in seen_campaigns:
+            continue
+        seen_campaigns.add(cid)
+        for day, n in (v.get("daily") or {}).items():
+            if day in per_day:
+                per_day[day] += n
     return {"items": items, "totals": totals, "projects": projects_out, "errors": errors,
+            "daily": {"labels": labels, "leads": [per_day[d] for d in labels]},
             "date_from": date_from.isoformat(), "date_to": date_to.isoformat()}
 
 
