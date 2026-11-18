@@ -103,7 +103,7 @@ def test_bundle_site_with_integration(tmp_path, monkeypatch):
         page = client.get("/", headers=h)
         assert page.status_code == 200 and "__ymAll" in page.text and "111540304" not in page.text
         assert client.get("/css/style.css?v=3", headers=h).headers["content-type"].startswith("text/css")
-        assert client.get("/img/lawyer.webp", headers=h).status_code == 200
+        assert client.get("/img/lawyer.webp", headers=h).headers["content-type"] == "image/webp"
         assert client.get("/sps.html", headers=h).status_code == 200
         assert client.get("/manifest.json", headers=h).status_code == 404
         assert client.get("/api/projects", headers=h, auth=AUTH).status_code == 404

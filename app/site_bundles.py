@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).parent / "site_bundles"
+# в slim-образе нет /etc/mime.types — webp/woff2 иначе уходят как octet-stream
+for _ext, _type in ((".webp", "image/webp"), (".svg", "image/svg+xml"), (".woff2", "font/woff2"), (".woff", "font/woff"),
+                    (".js", "application/javascript"), (".css", "text/css"), (".pdf", "application/pdf")):
+    mimetypes.add_type(_type, _ext)
 TEXT_EXT = (".html", ".css", ".js", ".svg", ".txt")
 BRAND_FIELDS = ("brand", "legal_name", "inn", "ogrn", "address", "phone", "email", "worktime")
 _BAD = re.compile(r"[<>\"'`\\\r\n]")
