@@ -300,6 +300,9 @@ class CampaignPlan(BaseModel):
 class BulkCampaignCreateRequest(BaseModel):
     count: int = Field(ge=1, le=20)
     connection_id: int = Field(ge=1)
+    # Запуск «несколько доменов → несколько аккаунтов» (2026-11-18): домен
+    # i-го аккаунта (1 домен — 1 аккаунт). Пусто — все на домен проекта.
+    domains: list[str] = Field(default_factory=list, max_length=20)
     payer_id: int | None = Field(default=None, ge=1)
     creative_mode: CreativeMode = "shuffle"
     # Required (exactly `count` entries) when creative_mode is
@@ -351,6 +354,25 @@ class BulkCampaignCreateRequest(BaseModel):
                 f"креативов (по одному на аккаунт), получено {len(value)}"
             )
         return value
+
+    @field_validator("domains")
+    @classmethod
+    def validate_domains(cls, value: list[str], info) -> list[str]:
+        from urllib.parse import urlsplit
+        out: list[str] = []
+        for raw in value:
+            raw = (raw or "").strip().lower()
+            host = (urlsplit(raw if "://" in raw else "//" + raw).hostname or "").rstrip(".")
+            host = host[4:] if host.startswith("www.") else host
+            if not host or "." not in host:
+                raise ValueError(f"Неверный домен: {raw!r}")
+            out.append(host)
+        if len(set(out)) != len(out):
+            raise ValueError("Домены повторяются — один домен на один аккаунт")
+        count = info.data.get("count")
+        if out and count is not None and len(out) != count:
+            raise ValueError(f"Доменов {len(out)}, а аккаунтов {count} — нужно один домен на аккаунт")
+        return out
 
     @field_validator("ads_per_group")
     @classmethod

@@ -96,6 +96,10 @@ def init_db() -> None:
             db.execute("ALTER TABLE bulk_campaigns ADD COLUMN connection_id INTEGER")
         if "payer_id" not in bulk_columns:
             db.execute("ALTER TABLE bulk_campaigns ADD COLUMN payer_id INTEGER")
+        if "site_domain" not in bulk_columns:
+            # 2026-11-18: запуск «несколько доменов → несколько аккаунтов» —
+            # у аккаунта свой домен вместо домена проекта.
+            db.execute("ALTER TABLE bulk_campaigns ADD COLUMN site_domain TEXT")
         db.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -279,12 +283,13 @@ def record_bulk_campaign(
     campaign_id: int | None,
     connection_id: int | None = None,
     payer_id: int | None = None,
+    site_domain: str | None = None,
 ) -> None:
     with connect() as db:
         db.execute(
             "INSERT INTO bulk_campaigns(project_id, pool_login, account_id, campaign_id, "
-            "connection_id, payer_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (project_id, pool_login, account_id, campaign_id, connection_id, payer_id, _now()),
+            "connection_id, payer_id, site_domain, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (project_id, pool_login, account_id, campaign_id, connection_id, payer_id, site_domain or None, _now()),
         )
 
 

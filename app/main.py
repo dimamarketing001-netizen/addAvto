@@ -30,6 +30,7 @@ from . import crm_stats
 from . import topup_retry
 from . import lifecycle
 from . import ai_writer
+from . import sites
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -104,6 +105,90 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+_SITE_LEAD_HITS: dict[str, list[float]] = {}
+_SITE_IMG_RE = __import__("re").compile(r"^/img/([0-9a-f]{32}\.(?:jpg|png|gif))$")
+
+
+@app.middleware("http")
+async def site_host_middleware(request: Request, call_next):
+    """Домены сайтов (раздел «Сайты») отдаёт сам addAvto по Host. На таких
+    доменах доступны ТОЛЬКО страница, /lead, /img/*, /robots.txt — API и ЛК
+    там не видны (404)."""
+    host = request.headers.get("host") or ""
+    try:
+        site_id = sites.site_id_for_host(host)
+    except Exception:  # pragma: no cover - БД недоступна: обычная обработка
+        site_id = None
+    if site_id is None:
+        return await call_next(request)
+    return await _serve_site(request, site_id)
+
+
+async def _serve_site(request: Request, site_id: int):
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+    site = sites.get_site(site_id)
+    if site is None:
+        return PlainTextResponse("Not found", status_code=404)
+    path, method = request.url.path, request.method
+    if method in ("GET", "HEAD") and path in ("/", "/index.html"):
+        tpl = sites.get_template(site["template_id"]) if site.get("template_id") else None
+        if tpl is None:
+            return HTMLResponse("<!doctype html><meta charset=utf-8><title>Скоро</title><p style='font:18px sans-serif;padding:40px'>Сайт скоро откроется.</p>")
+        return HTMLResponse(sites.render(tpl["kind"], tpl["config"], site["domain"], site["metrika_ids"]))
+    if method in ("GET", "HEAD") and path == "/robots.txt":
+        return PlainTextResponse("User-agent: *\nAllow: /\n")
+    m = _SITE_IMG_RE.match(path)
+    if method in ("GET", "HEAD") and m:
+        try:
+            p = creative_images.path_of("local:" + m.group(1))
+        except Exception:
+            p = None
+        if p is not None and p.exists():
+            return FileResponse(p, headers={"Cache-Control": "public, max-age=86400"})
+        return PlainTextResponse("Not found", status_code=404)
+    if method == "POST" and path == "/lead":
+        ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "")
+        now = _time.time()
+        hits = [t for t in _SITE_LEAD_HITS.get(ip, []) if now - t < 600]
+        if len(hits) >= 5:
+            return JSONResponse({"ok": False, "error": "Слишком много заявок"}, status_code=429)
+        _SITE_LEAD_HITS[ip] = [*hits, now]
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False}, status_code=400)
+        if not isinstance(data, dict):
+            return JSONResponse({"ok": False}, status_code=400)
+        phone = "".join(ch for ch in str(data.get("phone") or "") if ch.isdigit() or ch == "+")[:20]
+        name = " ".join(str(data.get("name") or "").split())[:100]
+        if len([c for c in phone if c.isdigit()]) < 10:
+            return JSONResponse({"ok": False, "error": "Неверный телефон"}, status_code=422)
+        clean = {"answers": [a for a in (data.get("answers") or [])[:20] if isinstance(a, dict)],
+                 "utm": {k: str(v)[:250] for k, v in (data.get("utm") or {}).items() if isinstance(k, str)} if isinstance(data.get("utm"), dict) else {},
+                 "page": str(data.get("page") or "")[:500], "ref": str(data.get("ref") or "")[:500], "ip": ip}
+        lead_id = sites.add_lead(site_id, name, phone, clean)
+        await _push_site_lead(site, lead_id, name, phone, clean)
+        return JSONResponse({"ok": True})
+    return PlainTextResponse("Not found", status_code=404)
+
+
+async def _push_site_lead(site: dict[str, Any], lead_id: int, name: str, phone: str, data: dict[str, Any]) -> None:
+    """Лид в Б24 через вебхук источника проекта. Ошибка не теряет заявку —
+    она уже сохранена в site_leads (видна в разделе «Сайты»)."""
+    source_id = crm_stats.get_project_source_id(int(site["project_id"])) if site.get("project_id") else None
+    if not source_id:
+        sites.set_lead_b24(lead_id, "skipped", error="У проекта не выбран источник Б24")
+        return
+    try:
+        webhook = crm_stats._webhook(crm_stats._source(int(source_id)))
+        res = await crm_stats._call(webhook, "crm.lead.add", {"fields": sites.b24_lead_fields(site, name, phone, data),
+                                                              "params": {"REGISTER_SONET_EVENT": "Y"}})
+        b24_id = res.get("result")
+        sites.set_lead_b24(lead_id, "sent", int(b24_id) if str(b24_id).isdigit() else None)
+    except Exception as exc:  # noqa: BLE001 - сохраняем причину, заявку не теряем
+        sites.set_lead_b24(lead_id, "error", error=str(exc))
 
 
 def require_auth(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> str:
@@ -846,6 +931,122 @@ async def ai_image_variants(payload: AIImageVariantsIn, _: AuthUser):
     return {"refs": refs}
 
 
+class SiteTemplateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: str = Field(default="landing", pattern="^(landing|quiz)$")
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class SiteIn(BaseModel):
+    domain: str = Field(min_length=3, max_length=255)
+    template_id: int | None = None
+    project_id: int | None = None
+    status: str | None = Field(default=None, pattern="^(new|dns|ssl|live|error)$")
+    note: str | None = Field(default=None, max_length=500)
+
+
+class SitePreviewIn(BaseModel):
+    kind: str = Field(default="landing", pattern="^(landing|quiz)$")
+    config: dict[str, Any] = Field(default_factory=dict)
+    domain: str = Field(default="example.ru", max_length=255)
+
+
+class SiteAIFillIn(BaseModel):
+    kind: str = Field(default="landing", pattern="^(landing|quiz)$")
+    topic: str = Field(min_length=3, max_length=2000)
+    domain: str = Field(default="", max_length=255)
+
+
+@app.get("/api/site-templates")
+async def site_templates_list(_: AuthUser):
+    return {"items": sites.list_templates(), "kinds": sites.KINDS, "defaults": sites.DEFAULT_CONFIG}
+
+
+@app.post("/api/site-templates")
+async def site_template_create(payload: SiteTemplateIn, _: AuthUser):
+    return sites.save_template(None, payload.name.strip(), payload.kind, payload.config)
+
+
+@app.put("/api/site-templates/{template_id}")
+async def site_template_update(template_id: int, payload: SiteTemplateIn, _: AuthUser):
+    if sites.get_template(template_id) is None:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    return sites.save_template(template_id, payload.name.strip(), payload.kind, payload.config)
+
+
+@app.delete("/api/site-templates/{template_id}")
+async def site_template_delete(template_id: int, _: AuthUser):
+    try:
+        if not sites.delete_template(template_id):
+            raise HTTPException(status_code=404, detail="Шаблон не найден")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/site-templates/preview")
+async def site_template_preview(payload: SitePreviewIn, _: AuthUser):
+    """HTML страницы по конфигу (без сохранения) — превью в ЛК (iframe srcdoc).
+    Картинки local: отдаём data-URL, т.к. превью открыто не на домене сайта."""
+    cfg = dict(payload.config)
+    img = str(cfg.get("image") or "")
+    if img.startswith("local:"):
+        try:
+            cfg["image"] = creative_images.data_url(img)
+        except Exception:
+            cfg["image"] = ""
+    return {"html": sites.render(payload.kind, cfg, sites.norm_domain(payload.domain) or "example.ru")}
+
+
+@app.post("/api/site-templates/ai-fill")
+async def site_template_ai_fill(payload: SiteAIFillIn, _: AuthUser):
+    """ИИ заполняет конфиг шаблона по описанию оффера."""
+    if not ai_writer.configured():
+        raise HTTPException(status_code=503, detail="ИИ не настроен: AI_API_KEY не задан в .env сервера")
+    shape = ('{"title": "заголовок до 70 символов", "subtitle": "подзаголовок до 140", '
+             + ('"questions": [{"q": "вопрос", "options": ["3-5 коротких вариантов"]}] (4-5 вопросов, последний — про срочность), '
+                if payload.kind == "quiz" else '"bullets": ["4-5 преимуществ до 80 символов"], ')
+             + '"cta": "текст кнопки до 30", "thanks": "текст после отправки заявки"}')
+    prompt = (f"Сделай текст {'квиза' if payload.kind == 'quiz' else 'лендинга'} для сбора заявок из Яндекс Директа.\n"
+              f"Оффер / тематика: {payload.topic}\nСайт: {payload.domain or 'не указан'}\n"
+              f"Без выдуманных цифр, гарантий и превосходных степеней. Верни JSON строго вида: {shape}")
+    try:
+        cfg = ai_writer.parse_json(await ai_writer.complete(ai_writer.SYSTEM, prompt, max_tokens=3000))
+    except ai_writer.AIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    keep = ("title", "subtitle", "bullets", "questions", "cta", "thanks")
+    return {k: cfg[k] for k in keep if k in cfg}
+
+
+@app.get("/api/sites")
+async def sites_list(_: AuthUser):
+    return {"items": sites.list_sites(), "statuses": sites.SITE_STATUSES, "server_ip": os.getenv("SITES_SERVER_IP", "62.109.6.186")}
+
+
+@app.put("/api/sites")
+async def site_upsert(payload: SiteIn, _: AuthUser):
+    if payload.template_id and sites.get_template(payload.template_id) is None:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    if payload.project_id and db.get_project(payload.project_id) is None:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    try:
+        return sites.upsert_site(payload.domain, payload.template_id, payload.project_id, payload.status, payload.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/sites/{site_id}")
+async def site_delete(site_id: int, _: AuthUser):
+    if not sites.delete_site(site_id):
+        raise HTTPException(status_code=404, detail="Сайт не найден")
+    return {"ok": True}
+
+
+@app.get("/api/sites/leads")
+async def site_leads(_: AuthUser, site_id: int | None = None):
+    return {"items": sites.list_leads(site_id)}
+
+
 @app.post("/api/creative-images/import-urls")
 async def import_creative_images(payload: CreativeImageImportIn, _: AuthUser):
     """Картинки креативов по ссылкам (визард → «Из подборки», 2026-11-13):
@@ -1520,10 +1721,10 @@ async def sync_project_href(project_id: int, _: AuthUser):
     project = db.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
-    href = _ad_href(project)
     api_v = {"api_version": "v501"} if project.get("campaign_mode") == "single_epk" else {}
     results = []
     for row in db.list_bulk_campaigns(project_id):
+        href = _account_href(project, row.get("site_domain"))
         res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id"), "updated": 0}
         try:
             client = _resolve_clickru_client(row.get("connection_id"))
@@ -1638,9 +1839,9 @@ async def apply_ad_settings(project_id: int, payload: dict[str, Any], _: AuthUse
     if not button and not maps_off and not display_path and not pay_conv:
         raise HTTPException(status_code=422, detail="Нечего применять: кнопка, отображаемая ссылка, оплата за конверсии или выключение Карт (только ЕПК)")
     api_v = {"api_version": "v501"} if is_epk else {}
-    href = _ad_href(project)
     results = []
     for row in db.list_bulk_campaigns(project_id):
+        href = _account_href(project, row.get("site_domain"))
         res: dict[str, Any] = {"account_id": row.get("account_id"), "campaign_id": row.get("campaign_id"),
                                "ads_updated": 0, "maps_off": False, "pay_for_conversions": False}
         try:
@@ -2384,6 +2585,20 @@ async def _download_image_base64(url: str) -> str:
         response = await http_client.get(url)
         response.raise_for_status()
         return base64.b64encode(response.content).decode("ascii")
+
+
+def _swap_host(url: str, new_host: str | None) -> str:
+    """Тот же адрес (путь, UTM, якорь) на другом домене — для запуска
+    «несколько доменов»: у каждого аккаунта свой сайт."""
+    if not new_host:
+        return url
+    from urllib.parse import urlsplit, urlunsplit
+    u = urlsplit(url if "://" in url else "https://" + url)
+    return urlunsplit((u.scheme or "https", new_host, u.path or "/", u.query, u.fragment))
+
+
+def _account_href(project: dict[str, Any], site_domain: str | None) -> str:
+    return _swap_host(_ad_href(project), site_domain) if site_domain else _ad_href(project)
 
 
 def _sitelink_href(href: str, ad_href: str) -> str:
@@ -3142,6 +3357,9 @@ async def _run_bulk_job(
             # Номер аккаунта в ИСХОДНОМ запуске (при продолжении — не 0..N).
             orig_index = indexes[index] if indexes and index < len(indexes) else index
             existing_campaign_id: int | None = None
+            site_domain = payload.domains[orig_index] if payload.domains and orig_index < len(payload.domains) else None
+            account_host = site_domain or project_host
+            ad_href = _account_href(project, site_domain)
             try:
                 if reuse:
                     # Продолжение: аккаунт уже создан прошлым запуском
@@ -3178,7 +3396,10 @@ async def _run_bulk_job(
                 db.set_bulk_job_pending(job_id, {"pool_login": pool_login, "account_id": account_id, "index": orig_index})
 
                 client_login = await _resolve_client_login(client, account_id)
-                counter_id, goal_id = await _ensure_lead_goal_for_account(pool_login, project_host, project["name"])
+                counter_id, goal_id = await _ensure_lead_goal_for_account(pool_login, account_host, project["name"])
+                if site_domain:
+                    # наш сайт — встраиваем счётчик аккаунта, заявка шлёт цель lead
+                    sites.add_metrika_counter(site_domain, counter_id)
                 # Счётчик в Метрике пулового ID, кампания — в организации porg-…:
                 # даём организации доступ к счётчику, иначе её Директ не видит цель.
                 grant_note = await _grant_metrika_to_org(pool_login, counter_id, client_login)
@@ -3209,7 +3430,9 @@ async def _run_bulk_job(
                     sitelink_set_id = await client.create_sitelinks_set(
                         client_login,
                         [
-                            {"Title": sl["title"], "Href": _sitelink_href(sl["href"], _ad_href(project)),
+                            {"Title": sl["title"], "Href": _sitelink_href(_swap_host(sl["href"], site_domain)
+                                                                          if site_domain and _normalize_site(sl["href"]) == _normalize_site(project_host)
+                                                                          else sl["href"], ad_href),
                              **({"Description": sl["description"]} if sl.get("description") else {})}
                             for sl in this_sitelinks
                         ],
@@ -3336,13 +3559,13 @@ async def _run_bulk_job(
                     )
                     button = getattr(payload, "button_action", None)
                     try:
-                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, _ad_href(project),
+                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, ad_href,
                                                     button_action=button, **ad_kwargs)
                     except ClickRUError as btn_exc:
                         if not button:
                             raise
                         # кнопку Директ может не принять — объявление важнее
-                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, _ad_href(project), **ad_kwargs)
+                        await client.create_text_ad(client_login, ad_group_id, headline, ad_text, ad_href, **ad_kwargs)
                         note = ((note + "; ") if note else "") + f"Объявление без кнопки: {str(btn_exc)[:150]}"
                     ads_created += 1
                     if ad_index == 0:
@@ -3350,7 +3573,7 @@ async def _run_bulk_job(
 
                 db.record_bulk_campaign(
                     project_id, pool_login, account_id, campaign_id,
-                    connection_id=payload.connection_id, payer_id=payload.payer_id,
+                    connection_id=payload.connection_id, payer_id=payload.payer_id, site_domain=site_domain,
                 )
                 post = await _fund_and_start(
                     client, account_id, client_login, campaign_id, payload.payer_id,
