@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from . import crm_stats
 from . import topup_retry
 from . import lifecycle
+from . import ai_writer
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -669,6 +670,20 @@ def build_russia_geo(raw: list[dict[str, Any]]) -> dict[str, Any]:
     return {"items": items, "tree": tree}
 
 
+AUDIENCE_INTERESTS_FILE = os.path.join(os.path.dirname(__file__), "audience_interests_ru.json")
+
+
+@app.get("/api/audience-interests")
+async def audience_interests(_: AuthUser):
+    """Справочник «Интересы и привычки» Директа (AudienceInterests, 441
+    интерес, русские названия; выгружен 2026-11-18). Для визарда: дерево
+    key/name/parent; id для проекта = срок*10^11 + key."""
+    with open(AUDIENCE_INTERESTS_FILE, encoding="utf-8") as f:
+        items = json.load(f)
+    return {"items": items, "terms": [
+        {"id": 3, "label": "Любой"}, {"id": 2, "label": "Долгосрочный"}, {"id": 1, "label": "Краткосрочный"}]}
+
+
 @app.get("/api/geo-regions")
 async def get_geo_regions(_: AuthUser):
     """Яндекс-справочник регионов (Dictionaries.get GeoRegions) по России —
@@ -752,6 +767,83 @@ async def upload_creative_image(request: Request, _: AuthUser):
 
 class CreativeImageImportIn(BaseModel):
     urls: list[str] = Field(min_length=1, max_length=40)
+
+
+class AIGenerateIn(BaseModel):
+    domain: str = Field(default="", max_length=2048)
+    topic: str = Field(default="", max_length=4000)
+    mode: str = Field(default="new", pattern="^(new|rewrite)$")
+    fields: list[str] = Field(default_factory=list, max_length=6)
+    counts: dict[str, int] = Field(default_factory=dict)
+    examples: dict[str, Any] = Field(default_factory=dict)
+    extra: str = Field(default="", max_length=2000)
+    project_id: int | None = None
+
+
+class AIImageVariantsIn(BaseModel):
+    image: str = Field(min_length=5, max_length=15_000_000)
+    count: int = Field(default=3, ge=1, le=10)
+
+
+@app.get("/api/ai/status")
+async def ai_status(_: AuthUser):
+    return {"configured": ai_writer.configured(), "model": ai_writer._model(), "fields": list(ai_writer.FIELDS),
+            "limits": ai_writer.LIMITS, "image_generation": False}
+
+
+@app.post("/api/ai/generate")
+async def ai_generate(payload: AIGenerateIn, _: AuthUser):
+    """ИИ-тексты для визарда (2026-11-18): заголовки, тексты, уточнения,
+    быстрые ссылки, ключевые и минус-фразы — новые или рерайт. Ничего не
+    сохраняет: визард сам добавляет выбранное в поля проекта."""
+    if not ai_writer.configured():
+        raise HTTPException(status_code=503, detail="ИИ не настроен: AI_API_KEY не задан в .env сервера")
+    domain, examples = payload.domain.strip(), dict(payload.examples)
+    if payload.project_id:
+        project = db.get_project(payload.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Проект не найден")
+        domain = domain or project["domain"]
+        if not examples:
+            examples = {"headlines": project.get("headlines") or [], "ad_texts": project.get("ad_texts") or [],
+                        "callouts": project.get("callouts_pool") or [],
+                        "sitelinks": [s.get("title") for s in project.get("sitelinks_pool") or []],
+                        "keywords": (project.get("keywords") or "").splitlines()[:60],
+                        "negative_keywords": (project.get("negative_keywords") or "").splitlines()[:60]}
+    if not domain and not payload.topic and not any(examples.values()):
+        raise HTTPException(status_code=422, detail="Укажите домен, тематику или примеры текстов")
+    try:
+        result = await ai_writer.generate(payload.fields, domain, payload.topic, payload.mode, examples,
+                                          payload.counts, payload.extra)
+    except ai_writer.AIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if "sitelinks" in result:
+        from urllib.parse import urlsplit
+        _u = urlsplit(domain if "://" in domain else "https://" + domain) if domain else None
+        base = f"{_u.scheme}://{_u.netloc}" if _u and _u.netloc else ""
+        result["sitelinks"] = [{"title": s["title"], "description": s["description"],
+                                "href": (base.rstrip("/") + "/" + (f"#{s['anchor']}" if s["anchor"] else "")) if base else ""}
+                               for s in result["sitelinks"]]
+    return result
+
+
+@app.post("/api/ai/image-variants")
+async def ai_image_variants(payload: AIImageVariantsIn, _: AuthUser):
+    """«Рерайт» картинки = уникализация (у ИИ-прокси нет генерации картинок):
+    N вариантов с лёгкой обрезкой/зеркалом/цветом, подогнанных под Директ."""
+    try:
+        raw = base64.b64decode(await _download_image_base64(payload.image.strip()))
+    except (httpx.HTTPError, ValueError, creative_images.CreativeImageError) as exc:
+        raise HTTPException(status_code=422, detail=f"Не удалось получить картинку: {str(exc)[:200]}") from exc
+    refs: list[str] = []
+    try:
+        for variant in ai_writer.image_variants(raw, payload.count):
+            refs.append(creative_images.save_image(creative_images.fit_for_direct(variant)))
+    except creative_images.CreativeImageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # битый файл и т.п. из Pillow
+        raise HTTPException(status_code=422, detail=f"Не удалось обработать картинку: {str(exc)[:200]}") from exc
+    return {"refs": refs}
 
 
 @app.post("/api/creative-images/import-urls")
@@ -3174,6 +3266,7 @@ async def _run_bulk_job(
                             "SelectionCriteria": {"AdGroupIds": [ad_group_id]}, "FieldNames": ["Id"],
                         }}, **api_v)).get("result", {}).get("Keywords") or []
                         has_keywords = bool(kws)
+                new_group = ad_group_id is None
                 if ad_group_id is None:
                     ad_group_id = await client.create_adgroup(
                         client_login, campaign_id, project["name"], project["region_ids"],
@@ -3182,6 +3275,15 @@ async def _run_bulk_job(
                     )
                 if not has_keywords:
                     await client.add_keywords(client_login, ad_group_id, phrases, **api_v)
+                if new_group and project.get("interest_ids"):
+                    # «Интересы и привычки» — best-effort: без них кампания
+                    # всё равно рабочая (ключевые фразы уже добавлены).
+                    try:
+                        await client.add_audience_interests(
+                            client_login, ad_group_id, f"{project['name'][:60]} — интересы",
+                            project["interest_ids"], **api_v)
+                    except ClickRUError as exc:
+                        note = "; ".join(x for x in (note, f"Интересы не применены: {str(exc)[:200]}") if x)
 
                 # ads_per_group (wizard step 4, "структура объявлений"): >1
                 # only with creative_mode=shuffle (schema-enforced) — each

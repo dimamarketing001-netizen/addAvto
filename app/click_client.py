@@ -506,6 +506,31 @@ class ClickRUClient:
             raise ClickRUError("Не все ключевые фразы добавлены: " + "; ".join(failures))
         return ids
 
+    async def add_audience_interests(
+        self, client_login: str, ad_group_id: int, name: str, interest_ids: list[int], api_version: str = "v5",
+    ) -> int:
+        """«Интересы и привычки»: условие подбора аудитории типа AUDIENCE
+        (RetargetingLists.add, любой из интересов) + AudienceTargets.add на
+        группу. interest_ids — срок*10^11+InterestKey (см. ProjectIn).
+        Возвращает id условия."""
+        body = {"method": "add", "params": {"RetargetingLists": [{
+            "Type": "AUDIENCE", "Name": name[:250] or "Интересы",
+            "Rules": [{"Operator": "ANY", "Arguments": [{"ExternalId": int(i)} for i in interest_ids]}],
+        }]}}
+        data = await self.direct_api(client_login, "retargetinglists", body)
+        first = ((data.get("result") or {}).get("AddResults") or [{}])[0]
+        if first.get("Errors") or not first.get("Id"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first.get("Errors") or []) or str(data)[:200]
+            raise ClickRUError(f"Не удалось создать условие «Интересы»: {errors}")
+        list_id = int(first["Id"])
+        data = await self.direct_api(client_login, "audiencetargets", {"method": "add", "params": {
+            "AudienceTargets": [{"AdGroupId": int(ad_group_id), "RetargetingListId": list_id}]}}, api_version=api_version)
+        first = ((data.get("result") or {}).get("AddResults") or [{}])[0]
+        if first.get("Errors"):
+            errors = "; ".join(f"{e.get('Message')} ({e.get('Details')})" for e in first["Errors"])
+            raise ClickRUError(f"Интересы не привязаны к группе: {errors}")
+        return list_id
+
     async def create_text_ad(
         self,
         client_login: str,

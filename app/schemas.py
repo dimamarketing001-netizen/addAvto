@@ -181,6 +181,11 @@ class ProjectIn(BaseModel):
     negative_keywords: str = Field(default="", max_length=30000)
     image_urls: list[str] = Field(default_factory=list, max_length=20)
     region_ids: list[int] = Field(default_factory=list, max_length=300)
+    # «Интересы и привычки» Директа (2026-11-18): ExternalId для условия
+    # подбора аудитории — срок * 10^11 + InterestKey из справочника
+    # AudienceInterests (1 — краткосрочный, 2 — долгосрочный, 3 — любой;
+    # проверено живым RetargetingLists.add). Пусто — без интересов.
+    interest_ids: list[int] = Field(default_factory=list, max_length=50)
 
     # Creative pools for bulk campaign generation (POST /campaigns/bulk-create):
     # each generated campaign picks ONE random headline + ad_text + image,
@@ -252,6 +257,14 @@ class ProjectIn(BaseModel):
             parsed = HttpUrl(item)
             cleaned.append(str(parsed))
         return cleaned
+
+    @field_validator("interest_ids")
+    @classmethod
+    def valid_interest_ids(cls, value: list[int]) -> list[int]:
+        for item in value:
+            if item // 10**11 not in (1, 2, 3) or item % 10**11 <= 0:
+                raise ValueError(f"Неверный id интереса: {item}")
+        return list(dict.fromkeys(value))
 
     @field_validator("region_ids")
     @classmethod
