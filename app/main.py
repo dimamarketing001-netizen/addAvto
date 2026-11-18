@@ -1686,6 +1686,31 @@ async def kick_stuck_accounts(project_id: int, payload: dict[str, Any], _: AuthU
             plan.append({"account_id": aid, "campaign_id": r.get("campaign_id"),
                          "pool_login": r.get("pool_login"), "status": st, **st["kick"], "topup": False})
     planned = {x["account_id"] for x in plan}
+    # «Умершие» по дневной проверке (0 показов) — тоже пинаем: статус Директа
+    # мог не прийти из-за лимита Click.ru (2026-11-18: черновик 680476 не брался).
+    dead_lives = lifecycle.lives_for([int(r["account_id"]) for r in rows])
+    for r in rows:
+        aid = int(r["account_id"])
+        if aid in planned or (dead_lives.get(aid) or {}).get("state") != "dead":
+            continue
+        st = sts.get(aid) or {}
+        if st.get("code") in ("live", "partial", "review", "banned", "no_access", "archived"):
+            continue
+        bal = balances.get(aid) or {}
+        if bal.get("state") not in (None, "ACTIVE"):
+            continue
+        try:
+            zero = bal.get("balance") is not None and float(bal["balance"]) <= 0
+        except (TypeError, ValueError):
+            zero = False
+        status = {**st, "code": st.get("code") if st.get("code") not in (None, "unknown", "error") else ("no_money" if zero else "stopped"),
+                  "label": st.get("label") if st.get("code") not in (None, "unknown", "error") else
+                  ("Нет денег на аккаунте — показы не идут" if zero else "0 показов — не запущен"),
+                  "detail": ((dead_lives[aid].get("death_reason") or "") +
+                             ("" if st.get("code") not in (None, "unknown", "error") else " · статус Директа сейчас не проверен")).strip(" ·")}
+        plan.append({"account_id": aid, "campaign_id": r.get("campaign_id"), "pool_login": r.get("pool_login"),
+                     "status": status, "topup": zero, "start": True})
+        planned.add(aid)
     unchecked = sum(1 for r in suspect if int(r["account_id"]) not in planned
                     and (sts.get(int(r["account_id"])) or {}).get("code") in ("unknown", "error"))
     need_topup = sum(1 for x in plan if x["topup"])
@@ -2496,6 +2521,18 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
                 if at >= y_start:
                     import re as _re_ids
                     fresh.update(int(x) for x in _re_ids.findall(r"(\d+)", f"{ev.get('title') or ''} {ev.get('detail') or ''}"))
+        # «Умершая» пометка без остановки снимается, если аккаунт ожил: вчера были
+        # показы или его пополняли/пинали/запускали (2026-11-18: 680493/680497
+        # висели «умершими», хотя кампании шли).
+        for aid, life in list(lives.items()):
+            if life["state"] != "dead" or life["project_id"] not in projects:
+                continue
+            y = (daily.get(aid) or {}).get(yday.isoformat()) or {}
+            if aid in fresh or int(y.get("impressions") or 0) > 0:
+                if not dry_run:
+                    lifecycle.set_life(aid, life["project_id"], state="active", died_at=None, death_reason="",
+                                       replacement_note="ожил: " + ("пополнен/запущен" if aid in fresh else "есть показы"))
+                lives[aid] = {**life, "state": "active"}
         # 2) «умершие» → остановка + замена
         for pid, proj in projects.items():
             settings = lifecycle.get_settings(pid)

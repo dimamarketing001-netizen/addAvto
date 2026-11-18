@@ -114,3 +114,33 @@ def test_recently_kicked_is_not_dead(monkeypatch, tmp_path):
         db.add_project_event(p["id"], "kick", "«Пнуть»: запущено 1 из 1", "201: Пополнено на 1220 ₽ с НДС")
         r = client.post("/api/lifecycle/run", auth=AUTH, json={"dry_run": True}).json()
     assert [x["account_id"] for x in r["dead"]] == [202]
+
+
+
+def test_dead_revives_and_kick_takes_dead(monkeypatch, tmp_path):
+    _configure_test_env(monkeypatch, tmp_path / "life3.db")
+    yday = lifecycle.today_msk() - timedelta(days=1)
+
+    class C:
+        configured = True
+
+        async def stat(self, fields, d1, d2, ids, v2=False):
+            return [{"accountId": "301", "date": yday.isoformat(), "impressions": "50", "clicks": "1", "loss": "9"}]
+
+        async def accounts(self):
+            return [{"id": 301, "state": "ACTIVE", "balance": 900}, {"id": 302, "state": "ACTIVE", "balance": 1000}]
+
+    async def unknown(rows, refresh=False, budget=None):
+        return {int(r["account_id"]): {"code": "unknown", "label": "?", "detail": "", "ads": {}} for r in rows}
+
+    monkeypatch.setattr(m, "_resolve_clickru_client", lambda _c: C())
+    monkeypatch.setattr(m, "_statuses_for", unknown)
+    with TestClient(m.app) as client:
+        p = _make_project(client, AUTH)
+        for aid in (301, 302):
+            db.record_bulk_campaign(p["id"], f"pool-{aid}", aid, 7000 + aid, connection_id=None, payer_id=1)
+            lifecycle.set_life(aid, p["id"], state="dead", died_at="2026-11-17T06:00:00+00:00", death_reason="0 показов")
+        client.post("/api/lifecycle/run", auth=AUTH, json={"dry_run": False})
+        assert lifecycle.get_life(301)["state"] == "active"  # вчера были показы
+        plan = client.post(f"/api/projects/{p['id']}/kick", auth=AUTH, json={"dry_run": True}).json()
+    assert [x["account_id"] for x in plan["items"]] == [302] and plan["items"][0]["topup"] is False
