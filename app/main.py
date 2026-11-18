@@ -31,6 +31,8 @@ from . import topup_retry
 from . import lifecycle
 from . import ai_writer
 from . import sites
+from . import site_bundles
+from . import lead_integrations
 from .schemas import (
     BUTTON_ACTIONS,
     check_display_url_path,
@@ -132,8 +134,25 @@ async def _serve_site(request: Request, site_id: int):
     if site is None:
         return PlainTextResponse("Not found", status_code=404)
     path, method = request.url.path, request.method
+    tpl = sites.get_template(site["template_id"]) if site.get("template_id") else None
+    bundle_id = (tpl or {}).get("config", {}).get("bundle") if (tpl or {}).get("kind") == "bundle" else None
+    if bundle_id and method in ("GET", "HEAD") and path not in ("/robots.txt", "/lead"):
+        rel = site_bundles.resolve(bundle_id, path)
+        if rel is None:
+            return PlainTextResponse("Not found", status_code=404)
+        ref = site_bundles.image_override(site_bundles.get(bundle_id) or {}, rel, tpl["config"])
+        if ref:
+            try:
+                p = creative_images.path_of(ref)
+            except Exception:
+                p = None
+            if p is not None and p.exists():
+                return FileResponse(p, headers={"Cache-Control": "public, max-age=3600"})
+        from fastapi.responses import Response
+        body, ctype = site_bundles.render_file(bundle_id, rel, tpl["config"], site["domain"], site["metrika_ids"])
+        return Response(body, media_type=ctype.split(";")[0], headers={
+            "Content-Type": ctype, "Cache-Control": "no-cache" if rel.endswith(".html") else "public, max-age=600"})
     if method in ("GET", "HEAD") and path in ("/", "/index.html"):
-        tpl = sites.get_template(site["template_id"]) if site.get("template_id") else None
         if tpl is None:
             return HTMLResponse("<!doctype html><meta charset=utf-8><title>Скоро</title><p style='font:18px sans-serif;padding:40px'>Сайт скоро откроется.</p>")
         return HTMLResponse(sites.render(tpl["kind"], tpl["config"], site["domain"], site["metrika_ids"]))
@@ -161,22 +180,45 @@ async def _serve_site(request: Request, site_id: int):
             return JSONResponse({"ok": False}, status_code=400)
         if not isinstance(data, dict):
             return JSONResponse({"ok": False}, status_code=400)
-        phone = "".join(ch for ch in str(data.get("phone") or "") if ch.isdigit() or ch == "+")[:20]
-        name = " ".join(str(data.get("name") or "").split())[:100]
+        lead = site_bundles.normalize(bundle_id, data)
+        raw_ans = data.get("answers") if isinstance(data.get("answers"), dict) else {}
+        if not lead.get("name"):
+            lead["name"] = " ".join(str(raw_ans.get("name") or "").split())[:100]
+        phone_raw = data.get("phone") or raw_ans.get("phone") or ""
+        phone = "".join(ch for ch in str(phone_raw) if ch.isdigit() or ch == "+")[:20]
         if len([c for c in phone if c.isdigit()]) < 10:
             return JSONResponse({"ok": False, "error": "Неверный телефон"}, status_code=422)
-        clean = {"answers": [a for a in (data.get("answers") or [])[:20] if isinstance(a, dict)],
-                 "utm": {k: str(v)[:250] for k, v in (data.get("utm") or {}).items() if isinstance(k, str)} if isinstance(data.get("utm"), dict) else {},
-                 "page": str(data.get("page") or "")[:500], "ref": str(data.get("ref") or "")[:500], "ip": ip}
-        lead_id = sites.add_lead(site_id, name, phone, clean)
-        await _push_site_lead(site, lead_id, name, phone, clean)
+        name = lead.pop("name", "")
+        lead.pop("phone", None)
+        lead["ip"] = ip
+        lead["template_id"] = (tpl or {}).get("id")
+        lead_id = sites.add_lead(site_id, name, phone, lead)
+        if lead.get("spam"):
+            sites.set_lead_b24(lead_id, "spam", error="Заполнено скрытое поле (бот)")
+        else:
+            await _push_site_lead(site, lead_id, name, phone, lead)
         return JSONResponse({"ok": True})
     return PlainTextResponse("Not found", status_code=404)
 
 
 async def _push_site_lead(site: dict[str, Any], lead_id: int, name: str, phone: str, data: dict[str, Any]) -> None:
-    """Лид в Б24 через вебхук источника проекта. Ошибка не теряет заявку —
-    она уже сохранена в site_leads (видна в разделе «Сайты»)."""
+    """Лид в CRM. Если в шаблоне сайта выбрана интеграция (раздел
+    «Интеграции»: МЮ / ЮДЛ / простой Б24) — по её логике; иначе простой лид
+    через вебхук источника Б24 проекта. Ошибка не теряет заявку — она уже в
+    site_leads (видна в разделе «Сайты», можно «Отправить повторно»)."""
+    tpl = sites.get_template(site["template_id"]) if site.get("template_id") else None
+    integ_id = (tpl or {}).get("config", {}).get("integration_id")
+    if integ_id:
+        integ = lead_integrations.get(int(integ_id))
+        if integ is None:
+            sites.set_lead_b24(lead_id, "error", error="Интеграция шаблона удалена — выберите другую")
+            return
+        try:
+            b24_id = await lead_integrations.push(integ, {**data, "name": name, "phone": phone}, site["domain"])
+            sites.set_lead_b24(lead_id, "sent", b24_id, error="")
+        except Exception as exc:  # noqa: BLE001
+            sites.set_lead_b24(lead_id, "error", error=f"{integ['name']}: {exc}")
+        return
     source_id = crm_stats.get_project_source_id(int(site["project_id"])) if site.get("project_id") else None
     if not source_id:
         sites.set_lead_b24(lead_id, "skipped", error="У проекта не выбран источник Б24")
@@ -933,7 +975,7 @@ async def ai_image_variants(payload: AIImageVariantsIn, _: AuthUser):
 
 class SiteTemplateIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    kind: str = Field(default="landing", pattern="^(landing|quiz)$")
+    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle)$")
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -946,7 +988,7 @@ class SiteIn(BaseModel):
 
 
 class SitePreviewIn(BaseModel):
-    kind: str = Field(default="landing", pattern="^(landing|quiz)$")
+    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle)$")
     config: dict[str, Any] = Field(default_factory=dict)
     domain: str = Field(default="example.ru", max_length=255)
 
@@ -957,13 +999,24 @@ class SiteAIFillIn(BaseModel):
     domain: str = Field(default="", max_length=255)
 
 
+def _check_template(payload: "SiteTemplateIn") -> None:
+    cfg = payload.config or {}
+    if payload.kind == "bundle" and not site_bundles.get(str(cfg.get("bundle") or "")):
+        raise HTTPException(status_code=422, detail="Не выбрана страница-образец (bundle)")
+    iid = cfg.get("integration_id")
+    if iid not in (None, "", 0) and (not str(iid).isdigit() or lead_integrations.get(int(iid)) is None):
+        raise HTTPException(status_code=422, detail="Интеграция не найдена")
+
+
 @app.get("/api/site-templates")
 async def site_templates_list(_: AuthUser):
-    return {"items": sites.list_templates(), "kinds": sites.KINDS, "defaults": sites.DEFAULT_CONFIG}
+    return {"items": sites.list_templates(), "kinds": sites.KINDS, "defaults": sites.DEFAULT_CONFIG,
+            "bundles": site_bundles.public_list(), "brand_fields": sites.BRAND_FIELDS}
 
 
 @app.post("/api/site-templates")
 async def site_template_create(payload: SiteTemplateIn, _: AuthUser):
+    _check_template(payload)
     return sites.save_template(None, payload.name.strip(), payload.kind, payload.config)
 
 
@@ -971,6 +1024,7 @@ async def site_template_create(payload: SiteTemplateIn, _: AuthUser):
 async def site_template_update(template_id: int, payload: SiteTemplateIn, _: AuthUser):
     if sites.get_template(template_id) is None:
         raise HTTPException(status_code=404, detail="Шаблон не найден")
+    _check_template(payload)
     return sites.save_template(template_id, payload.name.strip(), payload.kind, payload.config)
 
 
@@ -989,6 +1043,12 @@ async def site_template_preview(payload: SitePreviewIn, _: AuthUser):
     """HTML страницы по конфигу (без сохранения) — превью в ЛК (iframe srcdoc).
     Картинки local: отдаём data-URL, т.к. превью открыто не на домене сайта."""
     cfg = dict(payload.config)
+    if payload.kind == "bundle":
+        bid = str(cfg.get("bundle") or "")
+        if not site_bundles.get(bid):
+            raise HTTPException(status_code=422, detail="Не выбрана страница-образец")
+        return {"html": site_bundles.preview_html(bid, cfg, sites.norm_domain(payload.domain) or "example.ru",
+                                                  creative_images.data_url)}
     img = str(cfg.get("image") or "")
     if img.startswith("local:"):
         try:
@@ -1045,6 +1105,116 @@ async def site_delete(site_id: int, _: AuthUser):
 @app.get("/api/sites/leads")
 async def site_leads(_: AuthUser, site_id: int | None = None):
     return {"items": sites.list_leads(site_id)}
+
+
+@app.post("/api/sites/leads/{lead_id}/resend")
+async def site_lead_resend(lead_id: int, _: AuthUser):
+    """Отправить заявку в CRM ещё раз (после правки интеграции / прав вебхука)."""
+    row = sites.get_lead(lead_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    site = sites.get_site(row["site_id"])
+    if site is None:
+        raise HTTPException(status_code=404, detail="Сайт заявки удалён")
+    if row.get("b24_status") == "sent" and row.get("b24_lead_id"):
+        raise HTTPException(status_code=409, detail=f"Уже в CRM: лид {row['b24_lead_id']}")
+    await _push_site_lead(site, lead_id, row["name"], row["phone"], row["data"])
+    return sites.get_lead(lead_id)
+
+
+# ───────── Интеграции заявок (МЮ / ЮДЛ / простой Б24) ─────────
+class LeadIntegrationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: str = Field(pattern="^(mu|ydl|b24)$")
+    source_id: int | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class LeadIntegrationPreviewIn(BaseModel):
+    lead: dict[str, Any] | None = None
+    lead_id: int | None = None
+    domain: str = Field(default="example.ru", max_length=255)
+
+
+def _integration_users(iid: int) -> list[str]:
+    return [t["name"] for t in sites.list_templates() if str((t.get("config") or {}).get("integration_id") or "") == str(iid)]
+
+
+@app.get("/api/lead-integrations")
+async def lead_integrations_list(_: AuthUser):
+    items = lead_integrations.list_all()
+    for it in items:
+        it["templates"] = _integration_users(it["id"])
+    return {"items": items, "kinds": lead_integrations.KINDS, "defaults": lead_integrations.DEFAULTS,
+            "b24_sources": lead_integrations.b24_sources(), "sample_lead": lead_integrations.SAMPLE_LEAD}
+
+
+@app.get("/api/lead-integrations/meta")
+async def lead_integrations_meta(source_id: int, kind: str, _: AuthUser):
+    """Списки портала Б24 для настроек (типы лида, отделы, источники, UF-поля)."""
+    if kind not in lead_integrations.KINDS:
+        raise HTTPException(status_code=422, detail="Неизвестный тип")
+    try:
+        return await lead_integrations.meta(source_id, kind)
+    except crm_stats.CrmError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/lead-integrations")
+async def lead_integration_create(payload: LeadIntegrationIn, _: AuthUser):
+    return lead_integrations.save(None, payload.name.strip(), payload.kind, payload.source_id, payload.settings)
+
+
+@app.put("/api/lead-integrations/{iid}")
+async def lead_integration_update(iid: int, payload: LeadIntegrationIn, _: AuthUser):
+    if lead_integrations.get(iid) is None:
+        raise HTTPException(status_code=404, detail="Интеграция не найдена")
+    return lead_integrations.save(iid, payload.name.strip(), payload.kind, payload.source_id, payload.settings)
+
+
+@app.delete("/api/lead-integrations/{iid}")
+async def lead_integration_delete(iid: int, _: AuthUser):
+    try:
+        if not lead_integrations.delete(iid, _integration_users(iid)):
+            raise HTTPException(status_code=404, detail="Интеграция не найдена")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+def _preview_lead(payload: LeadIntegrationPreviewIn) -> tuple[dict[str, Any], str]:
+    if payload.lead_id:
+        row = sites.get_lead(payload.lead_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Заявка не найдена")
+        site = sites.get_site(row["site_id"]) or {}
+        return {**row["data"], "name": row["name"], "phone": row["phone"]}, site.get("domain") or payload.domain
+    return {**lead_integrations.SAMPLE_LEAD, **(payload.lead or {})}, payload.domain
+
+
+@app.post("/api/lead-integrations/{iid}/preview")
+async def lead_integration_preview(iid: int, payload: LeadIntegrationPreviewIn, _: AuthUser):
+    """Какие поля уйдут в Б24 — без отправки."""
+    integ = lead_integrations.get(iid)
+    if integ is None:
+        raise HTTPException(status_code=404, detail="Интеграция не найдена")
+    lead, domain = _preview_lead(payload)
+    return {"fields": await lead_integrations.prepare(integ, lead, domain), "lead": lead}
+
+
+@app.post("/api/lead-integrations/{iid}/test")
+async def lead_integration_test(iid: int, payload: LeadIntegrationPreviewIn, _: AuthUser):
+    """Реальный тестовый лид в Б24 (имя «ТЕСТ ParsYa», телефон 70000000000)."""
+    integ = lead_integrations.get(iid)
+    if integ is None:
+        raise HTTPException(status_code=404, detail="Интеграция не найдена")
+    lead, domain = _preview_lead(LeadIntegrationPreviewIn(lead=payload.lead, domain=payload.domain))
+    lead.update(name="ТЕСТ ParsYa — удалить", phone="70000000000")
+    try:
+        b24_id = await lead_integrations.push(integ, lead, domain)
+    except crm_stats.CrmError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "b24_lead_id": b24_id}
 
 
 @app.post("/api/creative-images/import-urls")

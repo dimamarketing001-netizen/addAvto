@@ -22,7 +22,9 @@ from typing import Any
 
 from . import db
 
-KINDS = {"landing": "Лендинг", "quiz": "Квиз"}
+KINDS = {"landing": "Лендинг", "quiz": "Квиз", "bundle": "Копия страницы (квиз МЮ)"}
+BRAND_FIELDS = {"brand": "Бренд", "legal_name": "Юрлицо", "inn": "ИНН", "ogrn": "ОГРН", "address": "Адрес",
+                "phone": "Телефон", "email": "Email", "worktime": "Часы работы"}
 SITE_STATUSES = {"new": "Не размещён", "dns": "Ждём DNS", "ssl": "Выпускаем SSL", "live": "Работает", "error": "Ошибка"}
 
 
@@ -200,6 +202,16 @@ def set_lead_b24(lead_id: int, status: str, b24_id: int | None = None, error: st
         c.execute("UPDATE site_leads SET b24_status=?, b24_lead_id=?, error=? WHERE id=?", (status, b24_id, error[:500], lead_id))
 
 
+def get_lead(lead_id: int) -> dict[str, Any] | None:
+    with _conn() as c:
+        r = c.execute("SELECT * FROM site_leads WHERE id=?", (lead_id,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["data"] = json.loads(d.get("data") or "{}")
+    return d
+
+
 def list_leads(site_id: int | None = None, limit: int = 200) -> list[dict[str, Any]]:
     q = "SELECT l.*, s.domain FROM site_leads l JOIN sites s ON s.id=l.site_id"
     args: tuple = ()
@@ -292,7 +304,11 @@ def render(kind: str, config: dict[str, Any], domain: str = "", metrika_ids: lis
         bullets = "".join(f"<li>{_e(b)}</li>" for b in (cfg.get("bullets") or []) if b)
         body = f'<ul class="bul">{bullets}</ul>{form}'
     hero_img = f'<img class="hero" src="{_e(img)}" alt="">' if img else ""
-    company = _e(cfg.get("company"))
+    legal = [x for x in (cfg.get("legal_name") or cfg.get("company"),
+                         f"ИНН {cfg['inn']}" if cfg.get("inn") else "", f"ОГРН {cfg['ogrn']}" if cfg.get("ogrn") else "",
+                         cfg.get("address"), cfg.get("email"), cfg.get("worktime")) if x]
+    company = " · ".join(_e(x) for x in legal)
+    brand = _e(cfg.get("brand")) or _e(domain)
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_e(cfg.get("title"))}</title><meta name="description" content="{_e(cfg.get("subtitle"))}">
 <style>:root{{--c:{color}}}*{{box-sizing:border-box}}body{{margin:0;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#111;background:#f6f7fb}}
@@ -308,7 +324,7 @@ button{{cursor:pointer;font:inherit}}.form button,.opt{{padding:15px;border:0;bo
 .bar{{height:6px;background:#e5e7eb;border-radius:3px;margin-bottom:16px}}.bar i{{display:block;height:100%;width:0;background:var(--c);border-radius:3px;transition:width .2s}}
 .qn{{color:#6b7280;font-size:13px}}.opts{{display:grid;gap:8px}}.opt{{background:#fff;color:#111;border:2px solid #e5e7eb;text-align:left;font-weight:600}}.opt:hover{{border-color:var(--c)}}
 .msg{{font-size:14px}}footer{{text-align:center;color:#9ca3af;font-size:12px;padding:20px}}</style>{metrika}</head>
-<body><header><b>{_e(domain)}</b>{head_phone}</header><main><h1>{_e(cfg.get("title"))}</h1><p class="sub">{_e(cfg.get("subtitle"))}</p>{hero_img}{body}</main>
+<body><header><b>{brand}</b>{head_phone}</header><main><h1>{_e(cfg.get("title"))}</h1><p class="sub">{_e(cfg.get("subtitle"))}</p>{hero_img}{body}</main>
 <footer>{company}</footer>
 <script>(function(){{var ans=[],steps=[].slice.call(document.querySelectorAll('.step')),pb=document.getElementById('pb');
 function show(i){{steps.forEach(function(s){{s.hidden=+s.dataset.i!==i}});if(pb)pb.style.width=(100*i/Math.max(1,steps.length-1))+'%'}}

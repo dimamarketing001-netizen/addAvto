@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5">
+<meta name="theme-color" content="#2E4ECE">
+<title>Спасибо! Ваш персональный анализ | Кредитная Амнистия</title>
+<meta name="description" content="Ваш персональный анализ. Юрист позвонит в течение 15 минут.">
+<meta name="robots" content="noindex, nofollow">
+
+<link rel="icon" type="image/svg+xml" href="/кредитная-амнистия/favicon.svg">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap&subset=cyrillic" rel="stylesheet">
+<link rel="stylesheet" href="/кредитная-амнистия/css/style.css?v=3">
+<link rel="stylesheet" href="/кредитная-амнистия/css/sps.css?v=3">
+</head>
+<body class="sps-body">
+
+<header class="header">
+  <div class="container header__inner">
+    <a href="/кредитная-амнистия/" class="logo">
+      <img src="/кредитная-амнистия/img/logo.svg" alt="Гос Долги" width="180" height="40">
+    </a>
+    <a href="tel:88005056797" class="header__phone">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      <span>8 (800) 505-67-97</span>
+    </a>
+  </div>
+</header>
+
+<main class="sps">
+  <div class="container sps__wrap">
+
+    <!-- HERO успеха -->
+    <div class="sps__hero">
+      <div class="sps__hero-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+      </div>
+      <h1 class="sps__hero-title">Спасибо, <span id="userName">Гость</span>!</h1>
+      <p class="sps__hero-text">
+        Мы получили ваши ответы. <strong>Юрист позвонит в течение 15 минут</strong> с персональным планом списания долгов
+      </p>
+      <div class="sps__hero-timer">
+        <span class="sps__hero-timer-icon">⏰</span>
+        <span id="timerText">Ожидайте звонок</span>
+      </div>
+    </div>
+
+    <!-- Персональный анализ -->
+    <div class="sps__card sps__verdict-card" id="verdictCard">
+      <div class="sps__badge sps__badge--green">🎯 Ваш прогноз</div>
+      <div class="sps__verdict" id="verdictBlock">
+        <!-- Заполняется JS -->
+      </div>
+    </div>
+
+    <!-- Что именно проанализировали -->
+    <div class="sps__card">
+      <div class="sps__badge">📋 Персональный анализ ситуации</div>
+      <h2 class="sps__card-title">Что мы выяснили о вашей ситуации</h2>
+      <div class="sps__analysis" id="analysisBlock">
+        <!-- Заполняется JS -->
+      </div>
+    </div>
+
+    <!-- Что дальше -->
+    <div class="sps__card sps__card--steps">
+      <div class="sps__badge">🚀 Что дальше</div>
+      <h2 class="sps__card-title">3 простых шага до списания долгов</h2>
+      <div class="sps__steps">
+        <div class="sps__step">
+          <div class="sps__step-num">1</div>
+          <div class="sps__step-body">
+            <strong>Звонок юриста</strong>
+            <span>В течение 15 минут наш юрист позвонит и подробно расскажет о вашей ситуации</span>
+          </div>
+        </div>
+        <div class="sps__step">
+          <div class="sps__step-num">2</div>
+          <div class="sps__step-body">
+            <strong>Бесплатная консультация</strong>
+            <span>Разберём документы, составим стратегию, ответим на все вопросы</span>
+          </div>
+        </div>
+        <div class="sps__step">
+          <div class="sps__step-num">3</div>
+          <div class="sps__step-body">
+            <strong>Процедура списания</strong>
+            <span>Ведём дело "под ключ" — вы просто ждёте результата (4-6 месяцев)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Подарки -->
+    <div class="sps__card sps__gifts">
+      <div class="sps__badge sps__badge--gold">🎁 Ваши 2 бонуса</div>
+      <h2 class="sps__card-title">Отправлены вместе с результатом</h2>
+      <div class="sps__gifts-grid">
+        <div class="sps__gift">
+          <div class="sps__gift-icon">📚</div>
+          <div class="sps__gift-body">
+            <strong>«Банкротство без страха: 47 вопросов»</strong>
+            <span>Мини-книга: что будет с жильём, работой, ипотекой. Реальные истории клиентов и жизнь после процедуры</span>
+          </div>
+        </div>
+        <div class="sps__gift">
+          <div class="sps__gift-icon">🏛️</div>
+          <div class="sps__gift-body">
+            <strong>«Как списать долги через МФЦ бесплатно»</strong>
+            <span>Пошаговый гид · Образец заявления · Список документов · Кому подходит внесудебная процедура (для долгов до 500 000 ₽)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Персональный номер для сохранения -->
+    <div class="sps__card sps__save-card" id="saveContactCard" hidden>
+      <div class="sps__badge sps__badge--red">📞 ВАЖНО! СОХРАНИТЕ НОМЕР</div>
+      <h2 class="sps__card-title">Сохраните наш номер в контактах</h2>
+      <p class="sps__save-text">
+        Автоответчики телефона <strong>блокируют звонки с неизвестных номеров</strong>.
+        Чтобы мы точно смогли до вас дозвониться — <strong>добавьте этот номер в контакты</strong>:
+      </p>
+
+      <div class="sps__save-phone" id="savePhoneBlock">
+        <a href="#" class="sps__save-phone-num" id="saveContactPhone">+7 (___) ___-__-__</a>
+        <a href="#" class="sps__save-phone-add" id="saveContactBtn" download="Юрист_Мой_Юрист.vcf">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+          Сохранить контакт
+        </a>
+      </div>
+
+      <p class="sps__save-hint">💡 На телефоне — просто нажмите кнопку выше, откроется добавление контакта</p>
+    </div>
+
+    <!-- Кнопки действий -->
+    <div class="sps__actions">
+      <a href="/кредитная-амнистия/" class="btn btn--ghost">← На главную</a>
+    </div>
+    <!-- Соц. доказательство -->
+    <div class="sps__stats">
+      <div class="sps__stat">
+        <div class="sps__stat-num">1200+</div>
+        <div class="sps__stat-label">успешных дел</div>
+      </div>
+      <div class="sps__stat">
+        <div class="sps__stat-num">₽5.8 млрд</div>
+        <div class="sps__stat-label">списанных долгов</div>
+      </div>
+      <div class="sps__stat">
+        <div class="sps__stat-num">9 лет</div>
+        <div class="sps__stat-label">на рынке</div>
+      </div>
+      <div class="sps__stat">
+        <div class="sps__stat-num">97%</div>
+        <div class="sps__stat-label">довольных клиентов</div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="container footer__inner">
+    <div class="footer__col">
+      <img src="/кредитная-амнистия/img/logo.svg" alt="Гос Долги" class="footer__logo" width="180" height="40">
+      <p class="footer__text">
+        <strong>ООО «Мой юрист»</strong><br>
+        <a href="tel:88005056797">8 (800) 505-67-97</a>
+      </p>
+    </div>
+    <div class="footer__col">
+      <p class="footer__meta">
+        ОГРН: 1256600007234<br>
+        ИНН: 6658577091
+      </p>
+    </div>
+    <div class="footer__col">
+      <p class="footer__disc">
+        Согласие на обработку персональных данных получено согласно 152-ФЗ
+      </p>
+    </div>
+  </div>
+</footer>
+
+<script src="/кредитная-амнистия/js/sps.js?v=3" defer></script>
+</body>
+</html>
