@@ -258,6 +258,10 @@ def normalize(bundle_id: str | None, data: dict[str, Any]) -> dict[str, Any]:
     else:
         out["answers"] = [{"q": _s(a.get("q"), 200), "a": _s(a.get("a"), 300)}
                           for a in (data.get("answers") or [])[:20] if isinstance(a, dict)]
+        out["region"] = _s(data.get("region"), 120)
+        out["city"] = _s(data.get("city"), 120)
+        out["method"] = _s(data.get("method"), 60)
+        out["quiz_title"] = _s(data.get("quiz_title"), 160)
     # квизы передают только стандартные utm_* — остальные метки (utm_product,
     # utm_manager, utm_account, utm_campaign_type, yclid…) берём из адреса страницы
     try:

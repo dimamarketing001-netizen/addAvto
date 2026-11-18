@@ -22,7 +22,7 @@ from typing import Any
 
 from . import db
 
-KINDS = {"landing": "Лендинг", "quiz": "Квиз", "bundle": "Копия страницы (квиз МЮ)"}
+KINDS = {"landing": "Лендинг", "quiz": "Квиз", "bundle": "Копия страницы (квиз МЮ)", "design": "Квиз-лендинг (10 дизайнов)"}
 BRAND_FIELDS = {"brand": "Бренд", "legal_name": "Юрлицо", "inn": "ИНН", "ogrn": "ОГРН", "address": "Адрес",
                 "phone": "Телефон", "email": "Email", "worktime": "Часы работы"}
 SITE_STATUSES = {"new": "Не размещён", "dns": "Ждём DNS", "ssl": "Выпускаем SSL", "live": "Работает", "error": "Ошибка"}
@@ -270,6 +270,9 @@ def _img_src(ref: str) -> str:
 
 
 def render(kind: str, config: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None) -> str:
+    if kind == "design":
+        from . import site_designs
+        return site_designs.render(config, domain, metrika_ids)
     cfg = {**DEFAULT_CONFIG.get(kind, DEFAULT_CONFIG["landing"]), **(config or {})}
     color = cfg.get("color") or "#2563eb"
     if not (isinstance(color, str) and color.startswith("#") and len(color) in (4, 7)):

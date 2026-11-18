@@ -158,6 +158,9 @@ async def _serve_site(request: Request, site_id: int):
         return HTMLResponse(sites.render(tpl["kind"], tpl["config"], site["domain"], site["metrika_ids"]))
     if method in ("GET", "HEAD") and path == "/robots.txt":
         return PlainTextResponse("User-agent: *\nAllow: /\n")
+    if method in ("GET", "HEAD") and path in ("/privacy", "/privacy.html") and tpl is not None:
+        from . import site_designs
+        return HTMLResponse(site_designs.privacy(tpl["config"], site["domain"]))
     m = _SITE_IMG_RE.match(path)
     if method in ("GET", "HEAD") and m:
         try:
@@ -975,7 +978,7 @@ async def ai_image_variants(payload: AIImageVariantsIn, _: AuthUser):
 
 class SiteTemplateIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle)$")
+    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle|design)$")
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -988,7 +991,7 @@ class SiteIn(BaseModel):
 
 
 class SitePreviewIn(BaseModel):
-    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle)$")
+    kind: str = Field(default="landing", pattern="^(landing|quiz|bundle|design)$")
     config: dict[str, Any] = Field(default_factory=dict)
     domain: str = Field(default="example.ru", max_length=255)
 
@@ -1010,8 +1013,10 @@ def _check_template(payload: "SiteTemplateIn") -> None:
 
 @app.get("/api/site-templates")
 async def site_templates_list(_: AuthUser):
+    from . import site_designs
     return {"items": sites.list_templates(), "kinds": sites.KINDS, "defaults": sites.DEFAULT_CONFIG,
-            "bundles": site_bundles.public_list(), "brand_fields": sites.BRAND_FIELDS}
+            "bundles": site_bundles.public_list(), "brand_fields": sites.BRAND_FIELDS,
+            "designs": site_designs.DESIGNS, "directions": site_designs.DIRECTIONS}
 
 
 @app.post("/api/site-templates")
