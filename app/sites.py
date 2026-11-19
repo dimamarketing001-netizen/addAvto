@@ -269,10 +269,11 @@ def _img_src(ref: str) -> str:
     return ref if ref.startswith(("https://", "http://")) else ""
 
 
-def render(kind: str, config: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None) -> str:
+def render(kind: str, config: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None,
+           service: str | None = None) -> str:
     if kind == "design":
         from . import site_designs
-        return site_designs.render(config, domain, metrika_ids)
+        return site_designs.render(config, domain, metrika_ids, service)
     cfg = {**DEFAULT_CONFIG.get(kind, DEFAULT_CONFIG["landing"]), **(config or {})}
     color = cfg.get("color") or "#2563eb"
     if not (isinstance(color, str) and color.startswith("#") and len(color) in (4, 7)):

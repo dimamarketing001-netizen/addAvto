@@ -15,6 +15,14 @@
   official   — спокойная анкета с выпадающими списками в одной форме
   bold       — яркий промо, 3 быстрых шага пилюлями + липкая кнопка звонка
 
+2026-11-19 — юр. направления (legal_designs.py, ещё 15 дизайнов) и разбивка на
+подуслуги как у Яндекс Услуг: config.services = [{id, t, d, title, subtitle,
+subs, steps}] — первый шаг квиза «С каким вопросом?», дальше вопросы выбранной
+подуслуги + общие steps. ?s=<id> в адресе (группа объявлений) — заголовок
+подуслуги и первый шаг уже выбран. config.widget — интерактив до квиза
+(срок по дате, чек-лист, чипсы, калькулятор из двух ползунков, стадии);
+form_booking / form_messenger — запись на время и «куда ответить» в форме.
+
 Заявка: POST /lead {name, phone, city, answers:[{q,a}], quiz_title, utm, page,
 ref, yandex_client_id} — нормализуется site_bundles.normalize (generic) и
 уходит интеграцией шаблона (МЮ / ЮДЛ / Б24). Метрика — счётчики аккаунтов
@@ -91,7 +99,41 @@ def _ctx(cfg: dict[str, Any]) -> dict[str, Any]:
     c["steps"] = [s for s in _list(c.get("steps")) if isinstance(s, dict) and s.get("q") and _list(s.get("options"))]
     for s in c["steps"]:
         s["options"] = [o if isinstance(o, dict) else {"t": str(o)} for o in s["options"] if o][:6]
+    svcs = []
+    for n, sv in enumerate(_list(c.get("services"))):
+        if not isinstance(sv, dict) or not sv.get("t"):
+            continue
+        sv = dict(sv)
+        sv["id"] = "".join(ch for ch in str(sv.get("id") or f"s{n + 1}").lower() if ch.isalnum() or ch in "-_")[:40] or f"s{n + 1}"
+        sv["steps"] = [s for s in _list(sv.get("steps")) if isinstance(s, dict) and s.get("q") and _list(s.get("options"))][:4]
+        for s in sv["steps"]:
+            s["options"] = [o if isinstance(o, dict) else {"t": str(o)} for o in s["options"] if o][:6]
+        sv["subs"] = [str(x) for x in _list(sv.get("subs")) if x][:14]
+        svcs.append(sv)
+    c["services"] = svcs[:14]
     return c
+
+
+def apply_service(c: dict[str, Any], service: str | None) -> int:
+    """?s=<id>: заголовок/подзаголовок подуслуги; индекс для предвыбора первого шага (-1 — нет)."""
+    sid = (service or "").strip().lower()
+    for k, sv in enumerate(c.get("services") or []):
+        if sid and sv["id"] == sid:
+            for key in ("title", "subtitle", "badge"):
+                if sv.get(key):
+                    c[key] = sv[key]
+            return k
+    return -1
+
+
+def svc_list(c: dict[str, Any], cls: str = "svc", btn: str = "Разобрать мою ситуацию", subs: bool = False) -> str:
+    """Подуслуги ссылками ?s=id (без JS — перезагрузка с заголовком подуслуги; с JS — выбор в квизе)."""
+    out = []
+    for k, s in enumerate(c.get("services") or []):
+        sub = ("<ul>" + "".join(f"<li>{_e(x)}</li>" for x in s.get("subs") or []) + "</ul>") if subs and s.get("subs") else ""
+        out.append(f'<a class="svc-i" href="?s={_e(s["id"])}" data-svc="{k}"><b>{_e(s["t"])}</b>'
+                   + (f'<span>{_e(s.get("d"))}</span>' if s.get("d") else "") + sub + f'<em>{_e(btn)} →</em></a>')
+    return f'<div class="{cls}">' + "".join(out) + "</div>" if out else ""
 
 
 # ───────────────────────── общие блоки ─────────────────────────
@@ -384,7 +426,10 @@ CSS = {
 
 # ───────────────────────── JS ─────────────────────────
 JS = r"""(function(){
-var D=JSON.parse(document.getElementById('qd').textContent),A=[];
+var D=JSON.parse(document.getElementById('qd').textContent),A=[],X={};
+var SV=D.services||[],BASE=(D.steps||[]).slice(),SVQ=SV.length?{q:D.service_q||'С каким вопросом обращаетесь?',hint:D.service_hint||'',options:SV.map(function(s){return{t:s.t,d:s.d||''}}),svc:1}:null;
+function setSvc(k){if(!SVQ)return;D.svc=SV[k]||null;var a=[SVQ].concat(D.svc?(D.svc.steps||[]):[],BASE);D.steps.length=0;a.forEach(function(x){D.steps.push(x)})}
+if(SVQ){setSvc(D.preset);if(D.svc)A[0]={q:SVQ.q,a:D.svc.t}}
 function $(s,r){return (r||document).querySelector(s)}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function goal(g){try{window.__ymAll&&window.__ymAll('reachGoal',g)}catch(e){}}
@@ -395,13 +440,18 @@ function mask(inp){inp.addEventListener('input',function(){var d=digits(inp.valu
 var started=false;function start(){if(!started){started=true;goal('quiz_start')}}
 function cid(cb){var done=false;function f(v){if(!done){done=true;cb(v||'')}}setTimeout(f,700);try{if(window.__ymAll&&(window.__YM_IDS||[]).length)window.__ymAll('getClientID',f);else f('')}catch(e){f('')}}
 function send(c,ok,fail){cid(function(id){fetch('/lead',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:c.name||'',phone:c.phone,city:c.city||'',
- answers:A.filter(Boolean),quiz_title:D.quiz_title,utm:utm(),page:location.href,ref:document.referrer,yandex_client_id:id})})
+ answers:A.filter(Boolean).concat(Object.keys(X).map(function(k){return X[k]})),quiz_title:(D.quiz_title||'')+(D.svc?' → '+D.svc.t:''),service:D.svc?D.svc.t:'',method:X.ms?X.ms.a:'',
+ utm:utm(),page:location.href,ref:document.referrer,yandex_client_id:id})})
  .then(function(r){if(!r.ok)throw 0;goal('lead_submit');ok()}).catch(fail)})}
 var CITIES='<datalist id="dl-cities">'+D.cities.map(function(c){return '<option value="'+esc(c)+'">'}).join('')+'</datalist>';
+function days(){var o='',d=new Date(),n=0;while(n<6){d.setDate(d.getDate()+1);var w=d.getDay();if(w===0||w===6)continue;n++;o+='<option>'+d.toLocaleDateString('ru-RU',{weekday:'short',day:'numeric',month:'long'})+'</option>'}return o}
+function extraHtml(){return (D.form_booking?'<div class="lf-row"><label>День консультации<select name="bday">'+days()+'</select></label><label>Время<select name="btime">'+
+  ['10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00'].map(function(t){return '<option>'+t+'</option>'}).join('')+'</select></label></div>':'')+
+ (D.form_messenger?'<div class="lf-ms"><span>'+esc(D.form_messenger_label||'Куда ответить')+'</span><div>'+['Звонок','WhatsApp','Telegram','MAX'].map(function(m,k){return '<label><input type="radio" name="ms" value="'+m+'"'+(k?'':' checked')+'><span>'+m+'</span></label>'}).join('')+'</div></div>':'')}
 function formHtml(){return '<form class="lf" novalidate>'+
  '<label>Имя<input name="name" autocomplete="name" placeholder="Как к вам обращаться"></label>'+
  '<label>Телефон<input name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+7 (___) ___-__-__"></label>'+
- '<label>Город<input name="city" list="dl-cities" autocomplete="address-level2" placeholder="Например, Екатеринбург"></label>'+CITIES+
+ '<label>Город<input name="city" list="dl-cities" autocomplete="address-level2" placeholder="Например, Екатеринбург"></label>'+CITIES+extraHtml()+
  '<label class="lf-ok"><input type="checkbox" name="ok" checked><span>Согласен(на) на обработку персональных данных, <a href="/privacy" target="_blank">политика</a></span></label>'+
  '<button type="submit" class="btn">'+esc(D.form_cta)+'</button><p class="lf-msg"></p>'+(D.form_note?'<p class="lf-note">'+esc(D.form_note)+'</p>':'')+'</form>'}
 function thanks(){return '<div class="thx"><b>Заявка принята</b><p>'+esc(D.thanks)+'</p>'+(D.phone?'<p>Если удобнее — позвоните: <a href="tel:'+esc(D.phone_href)+'">'+esc(D.phone)+'</a></p>':'')+'</div>'}
@@ -410,25 +460,28 @@ function wireForm(f,done){var ph=f.querySelector('[name=phone]'),m=f.querySelect
   if(digits(ph.value).length!==11){m.textContent='Проверьте номер телефона';ph.parentNode.classList.add('err');ph.focus();return}
   if(!f.querySelector('[name=ok]').checked){m.textContent='Нужно согласие на обработку данных';return}
   if(f.dataset.need&&!f.dataset.ready){m.textContent='Ответьте, пожалуйста, на вопросы анкеты';return}
+  var bd=f.querySelector('[name=bday]'),ms=f.querySelector('[name=ms]:checked');
+  if(bd)X.booking={q:'Удобное время консультации',a:bd.value+', '+f.querySelector('[name=btime]').value};if(ms)X.ms={q:'Удобный способ связи',a:ms.value};
   b.disabled=true;b.textContent='Отправляем…';start();
   send({name:f.querySelector('[name=name]').value.trim(),phone:ph.value,city:f.querySelector('[name=city]').value.trim()},function(){done()},
    function(){b.disabled=false;b.textContent=D.form_cta;m.textContent='Не отправилось — попробуйте ещё раз или позвоните нам'})})}
 function optsHtml(s,letters){return s.options.map(function(o,k){return '<button type="button" class="qz-opt" data-k="'+k+'"><span class="qz-mark">'+(letters?String.fromCharCode(65+k):'')+'</span><span><span class="qz-t">'+esc(o.t)+'</span>'+(o.d?'<span class="qz-d">'+esc(o.d)+'</span>':'')+'</span></button>'}).join('')}
 /* пошаговый квиз (плитки, список, да/нет, пилюли, на весь экран) */
-function runSteps(root){var i=0,S=D.steps,body=$('.qz-body',root),bar=$('.qz-bar i',root),cnt=$('.qz-count',root),back=$('.qz-back',root),letters=root.hasAttribute('data-letters');
+function runSteps(root){var i=D.svc?1:0,S=D.steps,body=$('.qz-body',root),bar=$('.qz-bar i',root),cnt=$('.qz-count',root),back=$('.qz-back',root),letters=root.hasAttribute('data-letters');
  root._keys=function(e){var k=e.key.toUpperCase(),n='ABCDEF'.indexOf(k);if(n<0)n='123456'.indexOf(k);var b=body.querySelectorAll('.qz-opt')[n];if(b&&!/INPUT|TEXTAREA/.test((document.activeElement||{}).tagName||''))b.click()};
  function render(){if(i>=S.length)return fin();var s=S[i];cnt.textContent='Вопрос '+(i+1)+' из '+S.length;bar.style.width=(100*i/(S.length+1))+'%';back.hidden=i===0;
   body.innerHTML='<h3 class="qz-q">'+esc(s.q)+'</h3>'+(s.hint?'<p class="qz-hint">'+esc(s.hint)+'</p>':'')+'<div class="qz-opts">'+optsHtml(s,letters)+'</div>'+(s.multi?'<button type="button" class="btn qz-next">Далее</button>':'');
   var sel=[];body.querySelectorAll('.qz-opt').forEach(function(b){b.onclick=function(){start();var o=s.options[+b.dataset.k];
    if(s.multi){b.classList.toggle('on');var x=sel.indexOf(o.t);x<0?sel.push(o.t):sel.splice(x,1);return}
-   b.classList.add('on');A[i]={q:s.q,a:o.t};setTimeout(function(){i++;goal('quiz_step_'+i);render()},230)}});
+   if(s.svc){setSvc(+b.dataset.k);A.length=0}b.classList.add('on');A[i]={q:s.q,a:o.t};setTimeout(function(){i++;goal('quiz_step_'+i);render()},230)}});
   var nx=$('.qz-next',body);if(nx)nx.onclick=function(){if(!sel.length)return;A[i]={q:s.q,a:sel.join('; ')};i++;goal('quiz_step_'+i);render()}}
  function fin(){bar.style.width='92%';cnt.textContent='Последний шаг';back.hidden=!S.length;
   body.innerHTML='<h3 class="qz-q">'+esc(D.result_title)+'</h3><p class="qz-hint">'+esc(D.result_text)+'</p>'+formHtml();
   wireForm($('form',body),function(){body.innerHTML=thanks();back.hidden=true;cnt.textContent='';bar.style.width='100%'})}
- back.onclick=function(){if(i>0){i--;A.length=i;render()}};render()}
+ back.onclick=function(){if(i>0){i--;A.length=i;render()}};
+ root._jump=function(k){if(!SVQ)return;setSvc(k);A.length=0;A[0]={q:SVQ.q,a:D.svc.t};i=1;render()};render()}
 /* чат с юристом */
-function runChat(root){var log=$('.ch-log',root),foot=$('.ch-foot',root),i=0,C={};
+function runChat(root){var log=$('.ch-log',root),foot=$('.ch-foot',root),i=D.svc?1:0,C={};
  function sc(){log.scrollTop=log.scrollHeight}
  function bot(h,cb){var t=document.createElement('div');t.className='ch-msg bot typing';t.innerHTML='<i></i><i></i><i></i>';log.appendChild(t);sc();
   setTimeout(function(){t.className='ch-msg bot';t.innerHTML=h;sc();cb&&cb()},Math.min(1400,500+h.length*6))}
@@ -436,7 +489,7 @@ function runChat(root){var log=$('.ch-log',root),foot=$('.ch-foot',root),i=0,C={
  function ask(){if(i>=D.steps.length)return askName();var s=D.steps[i];
   bot(esc(s.q)+(s.hint?'<small>'+esc(s.hint)+'</small>':''),function(){
    foot.innerHTML='<div class="ch-chips">'+s.options.map(function(o,k){return '<button type="button" data-k="'+k+'">'+esc(o.t)+'</button>'}).join('')+'</div>';
-   foot.querySelectorAll('button').forEach(function(b){b.onclick=function(){start();var o=s.options[+b.dataset.k];A[i]={q:s.q,a:o.t};foot.innerHTML='';me(o.t);i++;goal('quiz_step_'+i);ask()}})})}
+   foot.querySelectorAll('button').forEach(function(b){b.onclick=function(){start();var o=s.options[+b.dataset.k];if(s.svc){setSvc(+b.dataset.k);A.length=0}A[i]={q:s.q,a:o.t};foot.innerHTML='';me(o.t);i++;goal('quiz_step_'+i);ask()}})})}
  function input(ph,tel,cb){foot.innerHTML='<form class="ch-in"><input '+(tel?'type="tel" inputmode="tel" autocomplete="tel"':'autocomplete="'+(ph==='Город'?'address-level2" list="dl-cities':'name')+'"')+' placeholder="'+esc(ph)+'"><button type="submit" aria-label="Отправить">➤</button></form>'
    +(ph==='Город'?CITIES:'')+(tel?'<label class="ch-ok"><input type="checkbox" checked><span>согласен(на) на обработку персональных данных, <a href="/privacy" target="_blank">политика</a></span></label>':'');
   var f=$('form',foot),inp=$('input',f);if(tel)mask(inp);try{inp.focus({preventScroll:true})}catch(e){}
@@ -449,21 +502,24 @@ function runChat(root){var log=$('.ch-log',root),foot=$('.ch-foot',root),i=0,C={
   send(C,function(){foot.innerHTML='';bot(esc(D.thanks))},function(){foot.innerHTML='';bot('Не получилось отправить.'+(D.phone?' Позвоните нам: <a href="tel:'+esc(D.phone_href)+'">'+esc(D.phone)+'</a>':''));askPhone()})})})}
  bot(esc(D.chat_greeting||D.title),function(){setTimeout(ask,350)})}
 /* все вопросы сразу: радиокнопки (статья) или выпадающие списки (анкета) */
-function runAll(root,kind){var h='';D.steps.forEach(function(s,i){
+function runAll(root,kind){root.innerHTML='<div class="all-q"></div>'+formHtml();var box=$('.all-q',root),f=$('form',root);f.dataset.need='1';
+ function draw(){var h='';D.steps.forEach(function(s,i){
   if(kind==='select'){h+='<label class="sel">'+esc(s.q)+(s.hint?' <small>'+esc(s.hint)+'</small>':'')+'<select data-i="'+i+'"><option value="">— выберите —</option>'+s.options.map(function(o,k){return '<option value="'+k+'">'+esc(o.t)+'</option>'}).join('')+'</select></label>'}
   else{h+='<fieldset data-i="'+i+'"><legend>'+(i+1)+'. '+esc(s.q)+'</legend>'+s.options.map(function(o,k){return '<label class="rd"><input type="radio" name="q'+i+'" value="'+k+'"> '+esc(o.t)+'</label>'}).join('')+'</fieldset>'}});
- root.innerHTML='<div class="all-q">'+h+'</div>'+formHtml();var f=$('form',root);f.dataset.need='1';
- function upd(){var n=0;D.steps.forEach(function(s,i){var v=kind==='select'?(root.querySelector('select[data-i="'+i+'"]')||{}).value:((root.querySelector('input[name="q'+i+'"]:checked')||{}).value);
+  box.innerHTML=h;if(D.svc){var k=SV.indexOf(D.svc),el=kind==='select'?box.querySelector('select[data-i="0"]'):box.querySelector('input[name="q0"][value="'+k+'"]');if(el){if(kind==='select')el.value=k;else el.checked=true}}}
+ root._pick=function(k){setSvc(k);draw();upd()};
+ function upd(e){var t=e&&e.target;if(SVQ&&t&&(t.getAttribute('data-i')==='0'||t.name==='q0')){setSvc(t.value===''?-1:+t.value);draw()}
+  var n=0;A.length=D.steps.length;D.steps.forEach(function(s,i){var v=kind==='select'?(root.querySelector('select[data-i="'+i+'"]')||{}).value:((root.querySelector('input[name="q'+i+'"]:checked')||{}).value);
   if(v!==undefined&&v!==''){A[i]={q:s.q,a:s.options[+v].t};n++}else A[i]=null});f.dataset.ready=n===D.steps.length?'1':'';if(n)start()}
- root.addEventListener('change',upd);wireForm(f,function(){root.innerHTML=thanks()})}
+ draw();if(D.svc)upd();box.addEventListener('change',upd);wireForm(f,function(){root.innerHTML=thanks()})}
 /* калькулятор */
 function runCalc(root){var sl=D.slider||{},r=$('input[type=range]',root),out=$('output',root),mm=root.querySelectorAll('.cc-mm span'),st=$('.cc-steps',root),res=$('.cc-res',root);
  var min=+sl.min||0,max=+sl.max||100,step=+sl.step||1,def=+sl.default||Math.round((min+max)/2/step)*step;r.min=min;r.max=max;r.step=step;r.value=def;
  function fmt(v){return Number(v).toLocaleString('ru-RU')+(sl.unit?' '+sl.unit:'')}mm[0].textContent=fmt(min);mm[1].textContent=fmt(max);
  function show(){out.textContent=fmt(r.value)}r.addEventListener('input',function(){start();show()});show();
  var S=D.steps.slice(0,3);st.innerHTML=S.map(function(s,i){return '<fieldset><legend>'+esc(s.q)+'</legend><div class="cc-pills">'+s.options.map(function(o,k){return '<button type="button" data-i="'+i+'" data-k="'+k+'">'+esc(o.t)+'</button>'}).join('')+'</div></fieldset>'}).join('');
- st.querySelectorAll('button').forEach(function(b){b.onclick=function(){start();var i=+b.dataset.i;st.querySelectorAll('button[data-i="'+i+'"]').forEach(function(x){x.classList.remove('on')});b.classList.add('on');A[i+1]={q:S[i].q,a:S[i].options[+b.dataset.k].t}}});
- $('.cc-go',root).onclick=function(){start();A[0]={q:sl.label||'Значение',a:fmt(r.value)};var v=+r.value,p=Math.round(100*(v-min)/Math.max(1,max-min)),note='';
+ st.querySelectorAll('button').forEach(function(b){b.onclick=function(){start();var i=+b.dataset.i;st.querySelectorAll('button[data-i="'+i+'"]').forEach(function(x){x.classList.remove('on')});b.classList.add('on');if(S[i].svc)D.svc=SV[+b.dataset.k]||null;A[i]={q:S[i].q,a:S[i].options[+b.dataset.k].t}}});
+ $('.cc-go',root).onclick=function(){start();X.calc={q:sl.label||'Значение',a:fmt(r.value)};var v=+r.value,p=Math.round(100*(v-min)/Math.max(1,max-min)),note='';
   if(D.direction==='bfl'){note=v<=1000000?'Сумма в пределах внесудебной процедуры через МФЦ (до 1 млн ₽ — если исполнительное производство окончено). Подходит ли она вам — проверит юрист.':'Для такой суммы обычно подходит судебная процедура банкротства по ФЗ-127.'}
   res.hidden=false;res.innerHTML='<div class="cc-big">'+esc(sl.label||'Значение')+': '+esc(fmt(v))+'</div><div class="cc-meter"><i style="width:'+Math.max(6,p)+'%"></i></div>'+(note?'<p>'+esc(note)+'</p>':'')+
    '<p><b>'+esc(D.result_title)+'</b><br>'+esc(D.result_text)+'</p>'+formHtml();goal('quiz_step_calc');
@@ -476,13 +532,53 @@ var ov=$('.fl-ov');if(ov){var q=$('[data-qz]',ov),inited=false;
  document.querySelectorAll('.fl-start').forEach(function(b){b.onclick=function(){ov.hidden=false;document.body.style.overflow='hidden';if(!inited){inited=true;runSteps(q)}start()}});
  $('.fl-x',ov).onclick=function(){ov.hidden=true;document.body.style.overflow=''};
  document.addEventListener('keydown',function(e){if(ov.hidden)return;if(e.key==='Escape'){$('.fl-x',ov).click();return}q._keys&&q._keys(e)})}
+/* выбор подуслуги из списка на странице (без перезагрузки) */
+function quizEl(){var q=[].slice.call(document.querySelectorAll('[data-qz],[data-all],[data-chat],[data-calc]')).filter(function(x){return !x.closest('.fl-ov')});return q[0]}
+function toQuiz(){var q=quizEl();if(q)q.scrollIntoView({behavior:'smooth',block:'start'})}
+document.querySelectorAll('[data-svc]').forEach(function(a){a.addEventListener('click',function(e){var k=+a.getAttribute('data-svc'),q=quizEl();
+ if(!q||!(q._jump||q._pick))return;e.preventDefault();start();(q._jump||q._pick)(k);
+ document.querySelectorAll('[data-svc]').forEach(function(x){x.classList.toggle('on',x===a)});
+ var t=D.svc_titles&&D.svc_titles[k];if(t){var h=$('.h-title');if(h&&t[0])h.textContent=t[0];var p=$('.h-sub');if(p&&t[1])p.textContent=t[1]}
+ goal('service_'+(SV[k]||{}).id);toQuiz()})});
+/* виджет до квиза: срок по дате, чек-лист, чипсы, два ползунка, стадии */
+function money(v,u){return Number(v).toLocaleString('ru-RU')+(u?' '+u:'')}
+function runWidget(el){var w=D.widget||{},t=w.type,h='';
+ if(t==='deadline')h='<label class="w-l">'+esc(w.label)+'<input type="date" class="w-date"></label><button type="button" class="btn w-go">'+esc(w.cta||'Проверить')+'</button>';
+ if(t==='checklist')h='<div class="w-list">'+w.items.map(function(x,k){return '<label class="w-ck"><input type="checkbox" value="'+k+'"><span>'+esc(x)+'</span></label>'}).join('')+'</div><button type="button" class="btn w-go">'+esc(w.cta||'Проверить')+'</button>';
+ if(t==='chips')h='<div class="w-chips">'+w.items.map(function(x,k){return '<button type="button" data-k="'+k+'">'+esc(x)+'</button>'}).join('')+'</div><button type="button" class="btn w-go">'+esc(w.cta||'Далее')+'</button>';
+ if(t==='sliders')h=[w.a,w.b].map(function(s,k){return '<label class="w-sl">'+esc(s.label)+'<output></output><input type="range" data-s="'+k+'" min="'+s.min+'" max="'+s.max+'" step="'+s.step+'" value="'+s.default+'"></label>'}).join('')+'<button type="button" class="btn w-go">'+esc(w.cta||'Рассчитать')+'</button>';
+ if(t==='stages')h='<ol class="w-st">'+w.items.map(function(x,k){return '<li><button type="button" data-k="'+k+'"><b>'+esc(x.t)+'</b>'+(x.d?'<span>'+esc(x.d)+'</span>':'')+'</button></li>'}).join('')+'</ol>';
+ el.innerHTML=(w.title?'<h3 class="w-t">'+esc(w.title)+'</h3>':'')+(w.text?'<p class="w-p">'+esc(w.text)+'</p>':'')+h+'<div class="w-res" hidden></div>';
+ var res=$('.w-res',el),go=$('.w-go',el);
+ function out(html){res.innerHTML=html+'<button type="button" class="btn w-next">'+esc(w.next||'Получить консультацию')+'</button>';res.hidden=false;start();goal('widget');
+  $('.w-next',res).onclick=toQuiz}
+ if(t==='deadline'){var di=$('.w-date',el);di.max=new Date().toISOString().slice(0,10);go.onclick=function(){if(!di.value){di.focus();return}
+  var d0=new Date(di.value+'T00:00:00'),lim=new Date(d0);if(w.months)lim.setMonth(lim.getMonth()+w.months);if(w.days)lim.setDate(lim.getDate()+w.days);
+  var now=new Date();now.setHours(0,0,0,0);var left=Math.round((lim-now)/864e5),ds=lim.toLocaleDateString('ru-RU'),txt=(left>=0?w.ok:w.late).replace('{n}',Math.abs(left)).replace('{date}',ds);
+  X.w={q:w.label,a:d0.toLocaleDateString('ru-RU')+' — '+(left>=0?'осталось дней: '+left:'срок пропущен на '+(-left)+' дн.')};out('<p class="w-big'+(left>=0?'':' late')+'">'+esc(txt)+'</p>')}}
+ if(t==='checklist')go.onclick=function(){var on=[].slice.call(el.querySelectorAll('.w-ck input:checked')),n=on.length;
+  X.w={q:w.title,a:n+' из '+w.items.length+(n?': '+on.map(function(x){return w.items[+x.value]}).join('; '):'')};
+  out('<p class="w-big">'+esc(w.score.replace('{n}',n).replace('{m}',w.items.length))+'</p><p>'+esc(n>=w.good?w.hi:w.lo)+'</p>')};
+ if(t==='chips'){var sel=[];el.querySelectorAll('.w-chips button').forEach(function(b){b.onclick=function(){start();b.classList.toggle('on');var x=w.items[+b.dataset.k],i=sel.indexOf(x);i<0?sel.push(x):sel.splice(i,1);
+   X.w={q:w.title,a:sel.join(', ')};if(!sel.length)delete X.w}});
+  go.onclick=function(){if(!sel.length){toQuiz();return}out('<p>'+esc((w.res||'').replace('{n}',sel.length))+'</p>')}}
+ if(t==='sliders'){var R=el.querySelectorAll('input[type=range]'),O=el.querySelectorAll('.w-sl output'),S2=[w.a,w.b];
+  function sh(){R.forEach(function(r,k){O[k].textContent=money(r.value,S2[k].unit)})}R.forEach(function(r){r.addEventListener('input',function(){start();sh()})});sh();
+  go.onclick=function(){var a=+R[0].value,b=+R[1].value,v=w.op==='mul'?a*b:Math.max(0,b-a);
+   X.w={q:w.title,a:S2[0].label+': '+money(a,S2[0].unit)+'; '+S2[1].label+': '+money(b,S2[1].unit)};
+   out('<p class="w-big">'+esc(w.res_label)+': '+esc(money(v,w.unit||'₽'))+'</p><p>'+esc(w.note||'')+'</p>')}}
+ if(t==='stages')el.querySelectorAll('.w-st button').forEach(function(b){b.onclick=function(){var x=w.items[+b.dataset.k];
+  el.querySelectorAll('.w-st button').forEach(function(y){y.classList.toggle('on',y===b)});X.w={q:w.title,a:x.t};out('<p>'+esc(x.r||w.res||'')+'</p>')}})}
+var wd=$('[data-w]');if(wd&&D.widget&&D.widget.type)runWidget(wd);
 var nq=$('[data-qz][data-letters]');if(nq&&!nq.closest('.fl-ov'))document.addEventListener('keydown',function(e){nq._keys&&nq._keys(e)});
 })();"""
 
 
-def render(cfg: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None) -> str:
+def render(cfg: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None, service: str | None = None) -> str:
     c = _ctx(cfg)
     design = c.get("design") if c.get("design") in DESIGNS else "tiles"
+    titles = [[s.get("title") or "", s.get("subtitle") or ""] for s in c["services"]]
+    preset = apply_service(c, service)
     body = LAYOUT[design](c)
     data = {"steps": c["steps"], "slider": c.get("slider") if isinstance(c.get("slider"), dict) else None,
             "direction": c.get("direction") or "", "quiz_title": c.get("quiz_title") or c.get("name") or c.get("title") or "",
@@ -490,7 +586,12 @@ def render(cfg: dict[str, Any], domain: str = "", metrika_ids: list[int] | None 
             "form_cta": c.get("form_cta") or c.get("cta") or "Отправить", "form_note": c.get("form_note") or "",
             "thanks": c.get("thanks") or "Спасибо! Юрист свяжется с вами в ближайшее время.",
             "chat_greeting": c.get("chat_greeting") or "", "title": c.get("title") or "",
-            "phone": c.get("phone") or "", "phone_href": c.get("phone_href") or "", "cities": CITIES}
+            "phone": c.get("phone") or "", "phone_href": c.get("phone_href") or "", "cities": CITIES,
+            "services": [{"id": s["id"], "t": s["t"], "d": s.get("d") or "", "steps": s["steps"]} for s in c["services"]],
+            "svc_titles": titles, "preset": preset, "service_q": c.get("service_q") or "", "service_hint": c.get("service_hint") or "",
+            "widget": c.get("widget") if isinstance(c.get("widget"), dict) else None,
+            "form_booking": bool(c.get("form_booking")), "form_messenger": bool(c.get("form_messenger")),
+            "form_messenger_label": c.get("form_messenger_label") or ""}
     js_data = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     title = _e(c.get("title") or c.get("brand") or domain)
     return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -518,3 +619,7 @@ def privacy(cfg: dict[str, Any], domain: str = "") -> str:
             'Срок хранения — до достижения целей обработки или отзыва согласия.</p>'
             f'<h2>Ваши права</h2><p>Вы можете запросить сведения об обработке, уточнение или удаление данных и отозвать согласие, написав{" на " + mail if mail else " оператору"}'
             f'{" или позвонив по телефону " + _e(c["phone"]) if c.get("phone") else ""}.</p></body></html>')
+
+
+# юр. направления (2026-11-19): ещё 15 дизайнов — app/legal_designs.py
+from . import legal_designs  # noqa: E402,F401  (регистрирует себя в DESIGNS/LAYOUT/CSS/FONTS)

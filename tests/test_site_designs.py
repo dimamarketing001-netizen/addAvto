@@ -17,7 +17,7 @@ CFG = {"title": "Списать долги <законно>", "subtitle": "По�
 
 
 def test_all_designs_render():
-    assert len(sd.DESIGNS) == 10
+    assert len(sd.DESIGNS) == 25
     for name in sd.DESIGNS:
         html = sd.render({**CFG, "design": name, "direction": "bfl"}, "x.ru", [77])
         assert "Списать долги &lt;законно&gt;" in html and "__YM_IDS=[77]" in html and f'class="d-{name}"' in html

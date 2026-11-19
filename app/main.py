@@ -155,7 +155,8 @@ async def _serve_site(request: Request, site_id: int):
     if method in ("GET", "HEAD") and path in ("/", "/index.html"):
         if tpl is None:
             return HTMLResponse("<!doctype html><meta charset=utf-8><title>Скоро</title><p style='font:18px sans-serif;padding:40px'>Сайт скоро откроется.</p>")
-        return HTMLResponse(sites.render(tpl["kind"], tpl["config"], site["domain"], site["metrika_ids"]))
+        return HTMLResponse(sites.render(tpl["kind"], tpl["config"], site["domain"], site["metrika_ids"],
+                                         service=request.query_params.get("s")))
     if method in ("GET", "HEAD") and path == "/robots.txt":
         return PlainTextResponse("User-agent: *\nAllow: /\n")
     if method in ("GET", "HEAD") and path in ("/privacy", "/privacy.html") and tpl is not None:
