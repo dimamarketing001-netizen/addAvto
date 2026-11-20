@@ -48,6 +48,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                        "utm_account": "UF_UTM_ACCOUNT", "utm_campaign_type": "UF_UTM_CAMPAIGN_TYPE"}},
     "b24": {"title_prefix": "Заявка с сайта", "b24_source": ""},
 }
+for _d in DEFAULTS.values():
+    _d["title_service"] = True  # «Направление → услуга» в заголовке лида (юр. квизы с подуслугами)
 
 SAMPLE_LEAD: dict[str, Any] = {
     "name": "Иван", "phone": "+7 (900) 123-45-67", "region": "Свердловская область", "city": "Екатеринбург",
@@ -177,6 +179,18 @@ def route_source(city: str, region: str, sources: list[tuple[str, str]]) -> str 
     return None
 
 
+def case_lines(lead: dict[str, Any]) -> list[str]:
+    """Блок «что за обращение» для менеджера: направление / услуга / запрос."""
+    rows = [("Направление", lead.get("niche")), ("Услуга", lead.get("service")), ("Запрос", lead.get("request"))]
+    rows = [f"{k}: {v}" for k, v in rows if v]
+    return ["═══ ОБРАЩЕНИЕ ═══", *rows] if rows else []
+
+
+def case_title(lead: dict[str, Any]) -> str:
+    """«Семейные споры → Развод» (или только одно из двух)."""
+    return " → ".join(x for x in (lead.get("niche"), lead.get("service")) if x)[:150]
+
+
 def build(integ: dict[str, Any], lead: dict[str, Any], domain: str = "",
           sources: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     kind, s = integ["kind"], integ["settings"]
@@ -185,13 +199,17 @@ def build(integ: dict[str, Any], lead: dict[str, Any], domain: str = "",
     name, city, region = lead.get("name") or "", lead.get("city") or "", lead.get("region") or ""
     answers = [a for a in lead.get("answers") or [] if isinstance(a, dict)]
     prefix = (s.get("title_prefix") or "").strip()
+    case = case_lines(lead)
+    ctitle = case_title(lead) if s.get("title_service", True) else ""
     if kind == "mu":
-        f["TITLE"] = f"{prefix} | {name or 'Без имени'}" if prefix else (name or "Заявка с сайта")
+        f["TITLE"] = " | ".join(x for x in (prefix, ctitle, name or "Без имени") if x) if (prefix or ctitle) else (name or "Заявка с сайта")
         if s.get("b24_source"):
             f["SOURCE_ID"] = s["b24_source"]
         f["SOURCE_DESCRIPTION"] = f"По региону из формы: {region}" if region else (lead.get("page") or domain)[:500]
         quiz = s.get("quiz_title") or lead.get("quiz_title") or domain
         lines = [f"Name: {name}", f"city: {city}", f"region: {region}", f"0__: Заявка с квиза «{quiz}»"]
+        if case:
+            lines += ["", *case, ""]
         if lead.get("quality"):
             lines.append(f"Оценка лида: {lead['quality']} (найдено оснований: {lead.get('score') or 0})")
         lines.append(f"Регион: {', '.join(x for x in (city, region) if x)}")
@@ -214,7 +232,7 @@ def build(integ: dict[str, Any], lead: dict[str, Any], domain: str = "",
             f[fl["city"]] = city
     elif kind == "ydl":
         d = phone_digits(lead.get("phone", ""))
-        f["TITLE"] = " | ".join(x for x in (prefix, city or region or "—", f"{name} {_mask(d)}".strip()) if x)
+        f["TITLE"] = " | ".join(x for x in (prefix, ctitle, city or region or "—", f"{name} {_mask(d)}".strip()) if x)
         src = route_source(city, region, sources or []) if s.get("source_by_city") else None
         src = src or s.get("b24_source")
         if src:
@@ -230,7 +248,7 @@ def build(integ: dict[str, Any], lead: dict[str, Any], domain: str = "",
         extra = [x for x in (f"Регион: {region}" if region else "", f"Способ связи: {lead.get('method')}" if lead.get("method") else "",
                              f"Квиз: {lead.get('quiz_title')}" if lead.get("quiz_title") else "") if x]
         if fl.get("comment"):
-            f[fl["comment"]] = "\n\n".join(qa + (["\n".join(extra)] if extra else []))
+            f[fl["comment"]] = "\n\n".join((["\n".join(case)] if case else []) + qa + (["\n".join(extra)] if extra else []))
         if fl.get("hot") and s.get("hot"):
             f[fl["hot"]] = "1"
         if fl.get("work") and s.get("work"):
@@ -244,11 +262,11 @@ def build(integ: dict[str, Any], lead: dict[str, Any], domain: str = "",
             if fl.get(key) and val:
                 f[fl[key]] = str(val)[:250]
     else:
-        f["TITLE"] = f"{prefix or 'Заявка с сайта'} {domain}".strip()
+        f["TITLE"] = " | ".join(x for x in (f"{prefix or 'Заявка с сайта'} {domain}".strip(), ctitle) if x)
         if s.get("b24_source"):
             f["SOURCE_ID"] = s["b24_source"]
         f["SOURCE_DESCRIPTION"] = (lead.get("page") or f"https://{domain}/")[:1000]
-        lines = [f"{a.get('q')}: {a.get('a')}" for a in answers]
+        lines = (case + [""] if case else []) + [f"{a.get('q')}: {a.get('a')}" for a in answers]
         lines += [x for x in (f"Регион: {region}" if region else "", f"Город: {city}" if city else "") if x]
         f["COMMENTS"] = "\n".join(lines)
     return f

@@ -119,3 +119,31 @@ def test_bundle_site_with_integration(tmp_path, monkeypatch):
         lead = client.get("/api/sites/leads", auth=AUTH).json()["items"][0]
         assert lead["b24_status"] == "sent" and lead["b24_lead_id"] == 4242
         assert client.post(f"/api/sites/leads/{lead['id']}/resend", auth=AUTH).status_code == 409
+
+
+def test_case_niche_service_in_title_and_comments():
+    lead = {"name": "Анна", "phone": "+79001234567", "city": "Екатеринбург", "answers": [{"q": "Q", "a": "A"}],
+            "niche": "Семейные споры", "service": "Развод и брак", "request": "Есть общие дети"}
+    mu = {"kind": "mu", "settings": {**li.DEFAULTS["mu"], "title_prefix": "Юр.Услуга"}}
+    f = li.build(mu, lead, "x.ru")
+    assert f["TITLE"] == "Юр.Услуга | Семейные споры → Развод и брак | Анна"
+    assert "Направление: Семейные споры\nУслуга: Развод и брак\nЗапрос: Есть общие дети" in f["COMMENTS"]
+    f_old = li.build({"kind": "mu", "settings": {"title_prefix": "Юр.Услуга"}}, lead, "x.ru")  # старые настройки — тоже с услугой
+    assert "Развод и брак" in f_old["TITLE"]
+    off = li.build({"kind": "mu", "settings": {"title_prefix": "Юр.Услуга", "title_service": False}}, lead, "x.ru")
+    assert off["TITLE"] == "Юр.Услуга | Анна" and "Услуга: Развод и брак" in off["COMMENTS"]
+    y = li.build({"kind": "ydl", "settings": li.DEFAULTS["ydl"]}, lead, "x.ru", [])
+    assert "Семейные споры → Развод и брак" in y["TITLE"] and y["UF_CRM_1651049909485"].startswith("═══ ОБРАЩЕНИЕ ═══")
+    b = li.build({"kind": "b24", "settings": li.DEFAULTS["b24"]}, lead, "x.ru")
+    assert b["TITLE"].endswith("Семейные споры → Развод и брак") and b["COMMENTS"].startswith("═══ ОБРАЩЕНИЕ ═══")
+    plain = li.build(mu, {k: v for k, v in lead.items() if k not in ("niche", "service", "request")}, "x.ru")
+    assert plain["TITLE"] == "Юр.Услуга | Анна" and "ОБРАЩЕНИЕ" not in plain["COMMENTS"]
+
+
+def test_normalize_keeps_case_fields_and_niche_rendered():
+    from app import site_designs
+    n = sb.normalize(None, {"name": "A", "phone": "1", "niche": "Семейные споры", "service": "Развод", "request": "Да"})
+    assert (n["niche"], n["service"], n["request"]) == ("Семейные споры", "Развод", "Да")
+    html = site_designs.render({"design": "accordion", "title": "T", "quiz_title": "Юр. услуги: Семейные споры",
+                                "steps": [], "services": [{"id": "r", "t": "Развод"}]}, "x.ru", [])
+    assert "\"niche\": \"Семейные споры\"" in html and "request:" in html

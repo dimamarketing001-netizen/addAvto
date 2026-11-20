@@ -440,7 +440,7 @@ function mask(inp){inp.addEventListener('input',function(){var d=digits(inp.valu
 var started=false;function start(){if(!started){started=true;goal('quiz_start')}}
 function cid(cb){var done=false;function f(v){if(!done){done=true;cb(v||'')}}setTimeout(f,700);try{if(window.__ymAll&&(window.__YM_IDS||[]).length)window.__ymAll('getClientID',f);else f('')}catch(e){f('')}}
 function send(c,ok,fail){cid(function(id){fetch('/lead',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:c.name||'',phone:c.phone,city:c.city||'',
- answers:A.filter(Boolean).concat(Object.keys(X).map(function(k){return X[k]})),quiz_title:(D.quiz_title||'')+(D.svc?' → '+D.svc.t:''),service:D.svc?D.svc.t:'',method:X.ms?X.ms.a:'',
+ answers:A.filter(Boolean).concat(Object.keys(X).map(function(k){return X[k]})),quiz_title:(D.quiz_title||'')+(D.svc?' → '+D.svc.t:''),niche:D.niche||'',service:D.svc?D.svc.t:'',request:(function(){var q=D.svc&&D.svc.steps&&D.svc.steps[0]?D.svc.steps[0].q:'';var r=q?A.filter(function(x){return x&&x.q===q})[0]:null;return r?String(r.a):''})(),method:X.ms?X.ms.a:'',
  utm:utm(),page:location.href,ref:document.referrer,yandex_client_id:id})})
  .then(function(r){if(!r.ok)throw 0;goal('lead_submit');ok()}).catch(fail)})}
 var CITIES='<datalist id="dl-cities">'+D.cities.map(function(c){return '<option value="'+esc(c)+'">'}).join('')+'</datalist>';
@@ -574,6 +574,15 @@ var nq=$('[data-qz][data-letters]');if(nq&&!nq.closest('.fl-ov'))document.addEve
 })();"""
 
 
+def niche_of(c: dict[str, Any]) -> str:
+    """Направление для CRM: config.niche, иначе из quiz_title «Юр. услуги: Семейные споры» → «Семейные споры»."""
+    n = str(c.get("niche") or "").strip()
+    if not n and c.get("services"):
+        q = str(c.get("quiz_title") or "").strip()
+        n = q.split(":", 1)[1].strip() if ":" in q else q
+    return n[:120]
+
+
 def render(cfg: dict[str, Any], domain: str = "", metrika_ids: list[int] | None = None, service: str | None = None) -> str:
     c = _ctx(cfg)
     design = c.get("design") if c.get("design") in DESIGNS else "tiles"
@@ -582,6 +591,7 @@ def render(cfg: dict[str, Any], domain: str = "", metrika_ids: list[int] | None 
     body = LAYOUT[design](c)
     data = {"steps": c["steps"], "slider": c.get("slider") if isinstance(c.get("slider"), dict) else None,
             "direction": c.get("direction") or "", "quiz_title": c.get("quiz_title") or c.get("name") or c.get("title") or "",
+            "niche": niche_of(c),
             "result_title": c.get("result_title") or "Почти готово", "result_text": c.get("result_text") or "",
             "form_cta": c.get("form_cta") or c.get("cta") or "Отправить", "form_note": c.get("form_note") or "",
             "thanks": c.get("thanks") or "Спасибо! Юрист свяжется с вами в ближайшее время.",
