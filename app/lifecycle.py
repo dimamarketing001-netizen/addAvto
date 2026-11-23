@@ -3,7 +3,10 @@
 Раз в день (main._lifecycle_loop, утро МСК):
   1. показы/клики/расход за последние дни по всем аккаунтам проектов —
      Click.ru /stat (1 запрос на подключение) → account_daily;
-  2. «умер» = вчера 0 показов, аккаунту ≥ MIN_AGE_DAYS, не ждёт пополнения.
+  2. «умер» = вчера 0 показов, аккаунту ≥ MIN_AGE_DAYS, не ждёт пополнения;
+     или «угас» (2026-11-23): 2 последних полных дня в среднем < FADE_RATIO от
+     пика показов и < FADE_MAX_IMP в день, с первого показа ≥ FADE_MIN_AGE дней
+     (анализ 85 аккаунтов: пик на 2-й день, нормальное плато 25–45% от пика).
      Если у проекта включена автозамена — кампания останавливается
      (без этого Click.ru не даёт вернуть деньги) и заводится новый аккаунт с
      теми же настройками и креативами (запуск из параметров последнего);
@@ -24,10 +27,14 @@ MSK = timezone(timedelta(hours=3))
 MIN_AGE_DAYS = 2           # моложе — ещё могут идти модерация и раскачка
 REFUND_WAIT_DAYS = 2       # Click.ru: «возврат возможен минимум через 2 дня после остановки»
 DEFAULT_MAX_PER_DAY = 5    # замен в день на проект
+FADE_RATIO = 0.10          # «угас»: среднее за 2 дня < 10% от пикового дня…
+FADE_MAX_IMP = 150         # …и меньше 150 показов в день
+FADE_MIN_AGE = 4           # дней с первого показа (раньше — раскачка)
+STAT_DAYS = 14             # сколько дней статистики обновлять за прогон (нужен пик)
 
 STATES = {
     "active": "Работает",
-    "dead": "0 показов — ждёт замены",
+    "dead": "Нет показов — ждёт замены",
     "stopped": "Остановлен, ждёт возврата денег",
     "refund_requested": "Заявка на возврат подана",
     "refunded": "Деньги возвращены",
@@ -197,11 +204,29 @@ def is_dead(daily: dict[str, dict[str, Any]], created_at: str | None, yesterday:
     if y is None:
         return False, ""  # нет данных за вчера — не решаем
     if int(y.get("impressions") or 0) > 0:
-        return False, ""
+        return is_faded(daily, yesterday)
     ever = [d for d, v in daily.items() if int(v.get("impressions") or 0) > 0]
     reason = (f"0 показов за {yesterday.strftime('%d.%m')}, последние показы {max(ever)[8:10]}.{max(ever)[5:7]}"
               if ever else f"0 показов за {yesterday.strftime('%d.%m')} и ни одного показа с запуска")
     return True, reason
+
+
+def is_faded(daily: dict[str, dict[str, Any]], yesterday: date) -> tuple[bool, str]:
+    """«Угас»: Директ почти перестал давать показы. Дни без строки = 0 показов
+    (Click.ru не отдаёт строк за дни без показов)."""
+    imp = {d: int(v.get("impressions") or 0) for d, v in daily.items() if d <= yesterday.isoformat()}
+    first = min((d for d, v in imp.items() if v > 0), default=None)
+    if first is None:
+        return False, ""
+    start = date.fromisoformat(first)
+    life = [imp.get((start + timedelta(days=i)).isoformat(), 0) for i in range((yesterday - start).days + 1)]
+    if len(life) < FADE_MIN_AGE:
+        return False, ""
+    peak, last2 = max(life), sum(life[-2:]) / 2
+    if peak and last2 < peak * FADE_RATIO and last2 < FADE_MAX_IMP:
+        return True, (f"угас: в среднем {round(last2)} показов в день за 2 дня до {yesterday.strftime('%d.%m')} — "
+                      f"{round(last2 / peak * 100)}% от пика {peak}")
+    return False, ""
 
 
 def log_run(trigger: str, summary: str, started: datetime) -> None:

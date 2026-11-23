@@ -20,6 +20,20 @@ def test_is_dead_rules():
     assert not lifecycle.is_dead({"2026-11-16": {"impressions": 0}}, "2026-11-16T08:00:00+00:00", y)[0]  # молодой
 
 
+def test_fade_rule():
+    y = date(2026, 11, 22)
+    old = "2026-11-10T08:00:00+00:00"
+    s = lambda vals: {(y - timedelta(days=len(vals) - 1 - i)).isoformat(): {"impressions": v} for i, v in enumerate(vals)}
+    ok, why = lifecycle.is_dead(s([30, 900, 400, 300, 60, 40]), old, y)        # 50/день = 6% от пика 900
+    assert ok and "угас" in why and "6%" in why
+    assert not lifecycle.is_dead(s([30, 900, 400, 300, 250, 200]), old, y)[0]  # плато 25% — норма
+    assert not lifecycle.is_dead(s([30, 9000, 4000, 1000, 600, 500]), old, y)[0]  # 6% от пика, но 550/день ≥ 150
+    assert not lifecycle.is_dead(s([900, 50, 40]), old, y)[0]                  # 3 дня с первого показа — раскачка
+    # пропущенные дни = 0 показов
+    d = {"2026-11-17": {"impressions": 800}, "2026-11-18": {"impressions": 500}, "2026-11-22": {"impressions": 10}}
+    assert lifecycle.is_dead(d, old, y)[0]
+
+
 def test_run_stop_replace_refund(monkeypatch, tmp_path):
     _configure_test_env(monkeypatch, tmp_path / "life.db")
     yday = lifecycle.today_msk() - timedelta(days=1)

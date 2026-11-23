@@ -2961,12 +2961,12 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
             by_conn.setdefault(r.get("connection_id"), []).append(int(r["account_id"]))
         errors: list[str] = []
         balances: dict[int, dict[str, Any]] = {}
-        # 1) статистика за 3 дня + балансы (1+1 запрос на подключение)
+        # 1) статистика за STAT_DAYS дней (нужен пик для правила «угас») + балансы
         for conn_id, ids in by_conn.items():
             client = _resolve_clickru_client(conn_id)
             try:
                 st = await asyncio.wait_for(client.stat(["accountId", "date", "impressions", "clicks", "loss"],
-                                                        yday - timedelta(days=2), yday, ids), 60)
+                                                        yday - timedelta(days=lifecycle.STAT_DAYS - 1), yday, ids), 60)
                 lifecycle.upsert_daily([(int(_num(x.get("accountId"))), str(x.get("date") or "")[:10],
                                          int(_num(x.get("impressions"))), int(_num(x.get("clicks"))), _num(x.get("loss")))
                                         for x in st if x.get("accountId") and x.get("date")])
@@ -3032,7 +3032,7 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
                     reason = f"аккаунт Click.ru: {balances[aid]['state']}"
                     ok = True
                 elif life and life["state"] == "dead":
-                    ok, reason = True, life.get("death_reason") or "0 показов"
+                    ok, reason = True, life.get("death_reason") or "нет показов"
                 else:
                     ok, reason = lifecycle.is_dead(daily.get(aid, {}), r.get("created_at"), yday)
                 if ok:
