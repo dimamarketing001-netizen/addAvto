@@ -3039,13 +3039,12 @@ async def _lifecycle_run(trigger: str = "schedule", dry_run: bool = False,
                     dead.append((r, reason))
             if not dead:
                 continue
-            limit = max(0, settings["max_per_day"] - lifecycle.replacements_today(pid)) if settings["enabled"] else 0
-            to_replace = dead[:limit]
+            # дневного лимита нет (2026-11-23): заменяются все умершие/угасшие
+            to_replace = dead if settings["enabled"] else []
             running = any(j["status"] == "running" for j in db.list_bulk_jobs(pid))
             for r, reason in dead:
                 act = ("остановить и заменить" if (r, reason) in to_replace and not running
-                       else "ждёт: идёт запуск" if (r, reason) in to_replace else
-                       "автозамена выключена" if not settings["enabled"] else "лимит замен на сегодня")
+                       else "ждёт: идёт запуск" if (r, reason) in to_replace else "автозамена выключена")
                 plan.append({"project_id": pid, "project_name": proj.get("name"), "account_id": int(r["account_id"]),
                              "campaign_id": r.get("campaign_id"), "pool_login": r.get("pool_login"), "reason": reason,
                              "action": act, "balance": (balances.get(int(r["account_id"])) or {}).get("balance")})
@@ -3189,15 +3188,10 @@ async def get_autoreplace(project_id: int, _: AuthUser):
 async def put_autoreplace(project_id: int, payload: dict[str, Any], _: AuthUser):
     if db.get_project(project_id) is None:
         raise HTTPException(status_code=404, detail="Проект не найден")
-    try:
-        mx = int(payload.get("max_per_day") or lifecycle.DEFAULT_MAX_PER_DAY)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="max_per_day — число")
-    if not 1 <= mx <= 50:
-        raise HTTPException(status_code=422, detail="Замен в день — от 1 до 50")
-    out = lifecycle.set_settings(project_id, bool(payload.get("enabled")), mx)
+    # max_per_day больше не используется (лимита нет), колонка в БД осталась
+    out = lifecycle.set_settings(project_id, bool(payload.get("enabled")), lifecycle.DEFAULT_MAX_PER_DAY)
     db.add_project_event(project_id, "autoreplace",
-                         f"Автозамена {'включена' if out['enabled'] else 'выключена'} (до {out['max_per_day']} в день)", "")
+                         f"Автозамена {'включена' if out['enabled'] else 'выключена'}", "")
     return out
 
 
