@@ -27,7 +27,10 @@ def test_fade_rule():
     ok, why = lifecycle.is_dead(s([30, 900, 400, 300, 60, 40]), old, y)        # 50/день = 6% от пика 900
     assert ok and "угас" in why and "6%" in why
     assert not lifecycle.is_dead(s([30, 900, 400, 300, 250, 200]), old, y)[0]  # плато 25% — норма
-    assert not lifecycle.is_dead(s([30, 9000, 4000, 1000, 600, 500]), old, y)[0]  # 6% от пика, но 550/день ≥ 150
+    assert not lifecycle.is_dead(s([30, 9000, 4000, 1000, 600, 500]), old, y)[0]  # 6% от пика, но 550/день ≥ 200
+    assert lifecycle.is_dead(s([30, 900, 400, 300, 160, 150]), old, y)[0]      # 17% от пика и 155/день — грубее порог (20%/200)
+    assert not lifecycle.is_dead(s([30, 900, 400, 300, 210, 200]), old, y)[0]  # 23% от пика — ещё плато
+    assert not lifecycle.is_dead(s([30, 2000, 900, 600, 250, 230]), old, y)[0]  # 12% от пика, но 240/день ≥ 200
     assert not lifecycle.is_dead(s([900, 50, 40]), old, y)[0]                  # 3 дня с первого показа — раскачка
     # пропущенные дни = 0 показов
     d = {"2026-11-17": {"impressions": 800}, "2026-11-18": {"impressions": 500}, "2026-11-22": {"impressions": 10}}
