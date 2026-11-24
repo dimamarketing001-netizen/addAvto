@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import random
+import re
 import secrets
 import time as _time
 from contextlib import asynccontextmanager
@@ -111,6 +112,33 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 _SITE_LEAD_HITS: dict[str, list[float]] = {}
 _SITE_IMG_RE = __import__("re").compile(r"^/img/([0-9a-f]{32}\.(?:jpg|png|gif))$")
+
+
+# Директ принимает в минус-фразах только буквы, цифры, пробел, кавычки,
+# [] и операторы - + ! (2026-11-24: список «Т-Банк, Платинум, …» одной
+# строкой через запятую ронял создание группы на всех аккаунтах проекта).
+_NEG_SPLIT_RE = re.compile(r"[\n\r,;]+")
+_NEG_BAD_RE = re.compile(r"[^\w\s\"\[\]+!-]|_")
+
+
+def _split_negative_keywords(text: str | None) -> list[str]:
+    """Минус-фразы из поля проекта: по строкам, запятым и «;», без ведущего
+    «-», без недопустимых символов, дефис внутри слова → пробел (для Директа
+    «т-банк» и «т банк» одно и то же), до 7 слов, без повторов."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _NEG_SPLIT_RE.split(text or ""):
+        v = _NEG_BAD_RE.sub(" ", raw).strip()
+        v = v.lstrip("-").strip()
+        v = re.sub(r"(?<=\w)-(?=\w)", " ", v)
+        v = " ".join(w for w in v.split() if w.strip("-+!\"[]"))
+        if not v or len(v.split()) > 7:
+            continue
+        key = v.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
 
 
 @app.middleware("http")
@@ -940,7 +968,7 @@ async def ai_generate(payload: AIGenerateIn, _: AuthUser):
                         "callouts": project.get("callouts_pool") or [],
                         "sitelinks": [s.get("title") for s in project.get("sitelinks_pool") or []],
                         "keywords": (project.get("keywords") or "").splitlines()[:60],
-                        "negative_keywords": (project.get("negative_keywords") or "").splitlines()[:60]}
+                        "negative_keywords": _split_negative_keywords(project.get("negative_keywords"))[:60]}
     if not domain and not payload.topic and not any(examples.values()):
         raise HTTPException(status_code=422, detail="Укажите домен, тематику или примеры текстов")
     try:
@@ -3515,7 +3543,7 @@ async def _run_bulk_job(
     sitelinks_pool = project.get("sitelinks_pool") or []
     callouts_pool = project.get("callouts_pool") or []
     image_urls = project.get("image_urls") or []
-    negative_keywords = [line.strip() for line in project.get("negative_keywords", "").splitlines() if line.strip()]
+    negative_keywords = _split_negative_keywords(project.get("negative_keywords"))
 
     try:
         for index in range(payload.count):
